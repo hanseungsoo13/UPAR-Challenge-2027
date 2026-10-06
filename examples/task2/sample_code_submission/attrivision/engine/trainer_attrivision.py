@@ -1,0 +1,573 @@
+"""Fine-tuning loop for the AttriVision CLIP baseline."""
+from __future__ import annotations
+
+import json
+import math
+import time
+from pathlib import Path
+from typing import Any
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+
+from upar.config import REPOSITORY_ROOT, choose_device, set_seed
+from upar.data import find_annotation_file, read_gt_csv
+from upar.retrieval import autocast
+
+from ..checkpoint import resume_training, save_best, save_last
+from ..datasets.attribute_prompts import CategoryPromptMapper, prompts_for_attributes
+from ..datasets.upar_abpr import (
+    AttriVisionDataset,
+    PromptBatch,
+    PromptCollator,
+    UniquePromptBatchSampler,
+    semantic_label_matrix,
+)
+from ..losses.focal_clip_loss import FocalCLIPLoss
+from ..losses.task2_hybrid_loss import Task2HybridLoss
+from ..models.attrivision import AttriVision
+from ..tracking import RunLogger
+from ..transforms import build_eval_transform, build_train_transform
+from .evaluator_abpr import evaluate_binary_head, evaluate_native52
+
+
+def _grad_scaler(enabled: bool) -> Any:
+    try:
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    except (AttributeError, TypeError):
+        return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def build_scheduler(optimizer: torch.optim.Optimizer, steps_per_epoch: int,
+                    epochs: int, warmup_epochs: int,
+                    learning_rate: float, min_learning_rate: float
+                    ) -> torch.optim.lr_scheduler.LambdaLR:
+    """Build a step-wise linear-warmup and cosine-decay schedule."""
+    total_steps = max(1, steps_per_epoch * epochs)
+    warmup_steps = min(warmup_epochs * steps_per_epoch, total_steps - 1)
+    min_ratio = min_learning_rate / learning_rate
+
+    def lr_scale(step: int) -> float:
+        if warmup_steps > 0 and step < warmup_steps:
+            return max(step + 1, 1) / warmup_steps
+        cosine_steps = max(total_steps - warmup_steps, 1)
+        progress = min(max((step - warmup_steps) / cosine_steps, 0.0), 1.0)
+        return min_ratio + 0.5 * (1.0 - min_ratio) * (1.0 + math.cos(math.pi * progress))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_scale)
+
+
+def _finish_epoch_totals(totals: dict[str, float], device: torch.device) -> dict[str, float]:
+    samples = totals.pop("samples")
+    batches = totals.pop("batches")
+    denominator = max(samples, 1.0)
+    result = {key: value / denominator for key, value in totals.items()}
+    result["train_batches"] = batches
+    result["average_batch_size"] = samples / max(batches, 1.0)
+    if device.type == "cuda":
+        gib = 1024 ** 3
+        result["cuda_peak_allocated_gib"] = torch.cuda.max_memory_allocated(device) / gib
+        result["cuda_peak_reserved_gib"] = torch.cuda.max_memory_reserved(device) / gib
+    return result
+
+
+def train_one_epoch_paper(
+    model: AttriVision, loader: DataLoader, optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    criterion: FocalCLIPLoss, scaler: Any, device: torch.device,
+    amp: bool, grad_clip: float, binary_criterion: nn.Module | None = None,
+    attr_weight: float = 1.0, diagnostics: bool = False,
+) -> dict[str, float]:
+    model.train()
+    totals = {"loss": 0.0, "fce": 0.0, "bce": 0.0, "i2t": 0.0, "t2i": 0.0, "samples": 0.0, "batches": 0.0}
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    for batch_index, batch in enumerate(loader):
+        if not isinstance(batch, PromptBatch):
+            raise TypeError("PromptCollator must return PromptBatch")
+        images = batch.images.to(device, non_blocking=True)
+        labels = batch.labels.to(device, non_blocking=True)
+        semantic_labels = batch.semantic_labels.to(device, non_blocking=True)
+        tokens = batch.tokens.to(device, non_blocking=True)
+        selected = batch.selected_semantics.to(device, non_blocking=True)
+        text_owners = batch.text_owners.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        with autocast(device, amp):
+            image_features, text_features, logits = model(images, tokens)
+            result = criterion(logits, semantic_labels, selected, text_owners)
+            bce = attr_weight * binary_criterion(model.binary_logits_from_features(image_features), labels.float()) if binary_criterion is not None else image_features.new_zeros(())
+            total = result.loss + bce
+        if diagnostics and batch_index == 0:
+            positive_mask = criterion.positive_mask(
+                logits, semantic_labels, selected, text_owners,
+            )
+            per_image = positive_mask.sum(dim=1).detach().cpu().tolist()
+            per_text = positive_mask.sum(dim=0).detach().cpu().tolist()
+            owner_counts = torch.bincount(text_owners, minlength=len(images)).cpu().tolist()
+            print("AttriVision first-batch diagnostic", flush=True)
+            print(f"batch image count = {len(images)}", flush=True)
+            print(f"text count = {len(tokens)}", flush=True)
+            print(f"texts per image = {owner_counts}", flush=True)
+            print(f"image feature shape = {list(image_features.shape)}", flush=True)
+            print(f"text feature shape = {list(text_features.shape)}", flush=True)
+            print(f"similarity matrix shape = {list(logits.shape)}", flush=True)
+            print(f"positive count per image = {per_image}", flush=True)
+            print(f"positive count per text = {per_text}", flush=True)
+        scaler.scale(total).backward()
+        scaler.unscale_(optimizer)
+        if grad_clip > 0:
+            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+        scheduler.step()
+        count = len(images)
+        totals["loss"] += float(total.detach()) * count
+        totals["fce"] += float(result.loss.detach()) * count
+        totals["bce"] += float(bce.detach()) * count
+        totals["i2t"] += float(result.i2t.detach()) * count
+        totals["t2i"] += float(result.t2i.detach()) * count
+        totals["samples"] += count
+        totals["batches"] += 1
+    return _finish_epoch_totals(totals, device)
+
+
+@torch.inference_mode()
+def evaluate_paper_fce(
+    model: AttriVision, loader: DataLoader, criterion: FocalCLIPLoss,
+    device: torch.device, amp: bool,
+) -> dict[str, float]:
+    """Measure FCE on a deterministic validation prompt selection."""
+    model.eval()
+    totals = {"fce_loss": 0.0, "i2t_loss": 0.0, "t2i_loss": 0.0}
+    samples = 0
+    for batch in loader:
+        if not isinstance(batch, PromptBatch):
+            raise TypeError("PromptCollator must return PromptBatch")
+        images = batch.images.to(device, non_blocking=True)
+        tokens = batch.tokens.to(device, non_blocking=True)
+        semantic_labels = batch.semantic_labels.to(device, non_blocking=True)
+        selected = batch.selected_semantics.to(device, non_blocking=True)
+        text_owners = batch.text_owners.to(device, non_blocking=True)
+        with autocast(device, amp):
+            _, _, logits = model(images, tokens)
+            result = criterion(logits, semantic_labels, selected, text_owners)
+        count = len(images)
+        totals["fce_loss"] += float(result.loss) * count
+        totals["i2t_loss"] += float(result.i2t) * count
+        totals["t2i_loss"] += float(result.t2i) * count
+        samples += count
+    return {key: value / max(samples, 1) for key, value in totals.items()}
+
+
+def train_one_epoch_hybrid(
+    model: AttriVision, loader: DataLoader, optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    criterion: Task2HybridLoss, scaler: Any, device: torch.device,
+    amp: bool, grad_clip: float, prototype_tokens: torch.Tensor,
+    mapper: CategoryPromptMapper | None, binary_criterion: nn.Module | None = None, attr_weight: float = 1.0,
+) -> dict[str, float]:
+    model.train()
+    totals = {
+        "loss": 0.0, "fce": 0.0, "bce": 0.0, "prototype": 0.0, "set": 0.0,
+        "i2t": 0.0, "t2i": 0.0, "samples": 0.0, "batches": 0.0,
+    }
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    for images, labels in loader:
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        semantic_labels = mapper.encode(labels) if mapper is not None else labels.bool()
+        optimizer.zero_grad(set_to_none=True)
+        with autocast(device, amp):
+            image_features = model.encode_image(images)
+            text_features = model.encode_text(prototype_tokens)
+            output = criterion(
+                image_features, text_features, semantic_labels, model.logit_scale,
+            )
+            bce = attr_weight * binary_criterion(model.binary_logits_from_features(image_features), labels.float()) if binary_criterion is not None else image_features.new_zeros(())
+            total = output.loss + bce
+        scaler.scale(total).backward()
+        scaler.unscale_(optimizer)
+        if grad_clip > 0:
+            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+        scheduler.step()
+        count = len(images)
+        totals["loss"] += float(total.detach()) * count
+        totals["fce"] += float(output.loss.detach()) * count
+        totals["bce"] += float(bce.detach()) * count
+        totals["prototype"] += float(output.prototype.detach()) * count
+        totals["set"] += float(output.set_contrastive.detach()) * count
+        totals["i2t"] += float(output.i2t.detach()) * count
+        totals["t2i"] += float(output.t2i.detach()) * count
+        totals["samples"] += count
+        totals["batches"] += 1
+    return _finish_epoch_totals(totals, device)
+
+
+def train_one_epoch_binary(
+    model: AttriVision, loader: DataLoader, optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler, criterion: nn.Module,
+    scaler: Any, device: torch.device, amp: bool, grad_clip: float, attr_weight: float = 1.0,
+) -> dict[str, float]:
+    model.train()
+    totals = {"loss": 0.0, "fce": 0.0, "bce": 0.0, "i2t": 0.0, "t2i": 0.0, "samples": 0.0, "batches": 0.0}
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    for images, labels in loader:
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        with autocast(device, amp):
+            loss = attr_weight * criterion(model.binary_logits(images), labels.float())
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        if grad_clip > 0:
+            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        scaler.step(optimizer); scaler.update(); scheduler.step()
+        count = len(images)
+        totals["loss"] += float(loss.detach()) * count
+        totals["bce"] += float(loss.detach()) * count
+        totals["samples"] += count; totals["batches"] += 1
+    return _finish_epoch_totals(totals, device)
+
+
+def _optimizer_groups(model: nn.Module, weight_decay: float) -> list[dict[str, Any]]:
+    """Apply AdamW decay only to matrix/kernel weights, as in standard CLIP tuning."""
+    decay: list[nn.Parameter] = []
+    no_decay: list[nn.Parameter] = []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if parameter.ndim < 2 or name.endswith("logit_scale"):
+            no_decay.append(parameter)
+        else:
+            decay.append(parameter)
+    return [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+
+
+def train(args: Any) -> Path:
+    set_seed(args.seed, args.deterministic)
+    device = choose_device(args.device)
+    data_root = Path(args.data_root).resolve()
+    train_gt = find_annotation_file(data_root, "train")
+    table = read_gt_csv(train_gt)
+    model = AttriVision(
+        pretrained=None if args.no_pretrained or args.resume or args.init_checkpoint else args.pretrained_tag,
+        model_name=args.clip_model,
+    ).to(device)
+    if args.init_checkpoint:
+        init_payload = torch.load(args.init_checkpoint, map_location=device, weights_only=False)
+        init_state = {
+            key: value for key, value in init_payload["model_state_dict"].items()
+            if not key.startswith("binary_head.")
+        }
+        missing, unexpected = model.load_state_dict(init_state, strict=False)
+        if set(missing) - {"binary_head.weight", "binary_head.bias"} or unexpected:
+            raise ValueError(f"Invalid init checkpoint mismatch: missing={missing}, unexpected={unexpected}")
+    dataset = AttriVisionDataset(
+        table,
+        [data_root, train_gt.parent, REPOSITORY_ROOT],
+        build_train_transform(
+            args.image_size, args.rotation, getattr(args, "augmentation", "current"),
+        ),
+        args.max_train_samples,
+    )
+    collator = None
+    sampler = None
+    loader_options: dict[str, Any] = {}
+    semantic_labels = semantic_label_matrix(
+        torch.from_numpy(dataset.labels.copy()), table.attribute_names, args.prompt_mode,
+    )
+    mapper = (
+        CategoryPromptMapper(table.attribute_names)
+        if args.prompt_mode == "category_complete" else None
+    )
+    prototype_prompts = mapper.prompts if mapper is not None else prompts_for_attributes(table.attribute_names)
+    prototype_tokens = model.tokenize(prototype_prompts).to(device) if args.use_fce else None
+    if args.use_fce and args.training_objective == "paper_fce":
+        collator = PromptCollator(
+            table.attribute_names, model.tokenizer, args.text_sampling, args.multi_attributes,
+            args.prompt_mode, args.unique_prompts,
+        )
+    if args.use_fce and args.training_objective == "paper_fce" and args.unique_prompts:
+        prompts_per_image = 1 if args.text_sampling == "single" else args.multi_attributes
+        sampler = UniquePromptBatchSampler(
+            semantic_labels, args.batch_size, prompts_per_image, args.seed,
+        )
+        collator.semantic_frequencies = sampler.frequencies
+        loader_options["batch_sampler"] = sampler
+    else:
+        loader_options.update({
+            "batch_size": args.batch_size,
+            "shuffle": True,
+            "generator": torch.Generator().manual_seed(args.seed),
+            "drop_last": len(dataset) >= args.batch_size,
+        })
+    loader = DataLoader(
+        dataset,
+        num_workers=args.num_workers,
+        pin_memory=device.type == "cuda",
+        persistent_workers=args.num_workers > 0,
+        collate_fn=collator,
+        **loader_options,
+    )
+    validation_fce_loader = None
+    if args.use_fce and args.training_objective == "paper_fce":
+        val_gt = find_annotation_file(data_root, "val")
+        val_table = read_gt_csv(val_gt)
+        val_dataset = AttriVisionDataset(
+            val_table, [data_root, val_gt.parent, REPOSITORY_ROOT],
+            build_eval_transform(args.image_size), args.max_val_samples,
+        )
+        validation_fce_loader = DataLoader(
+            val_dataset, batch_size=args.eval_batch_size, shuffle=False,
+            num_workers=args.num_workers, pin_memory=device.type == "cuda",
+            persistent_workers=args.num_workers > 0,
+            collate_fn=PromptCollator(
+                val_table.attribute_names, model.tokenizer, args.text_sampling,
+                args.multi_attributes, args.prompt_mode, False, stochastic=False,
+            ),
+        )
+    criterion: FocalCLIPLoss | Task2HybridLoss | None
+    if args.use_fce and args.training_objective == "task2_hybrid":
+        criterion = Task2HybridLoss(
+            semantic_labels.float().mean(dim=0), args.focal_alpha, args.focal_gamma,
+            args.balance_max_weight, args.prototype_loss_weight, args.set_loss_weight,
+        ).to(device)
+    elif args.use_fce:
+        criterion = FocalCLIPLoss(
+            args.loss, args.contrastive_target, args.focal_alpha, args.focal_gamma,
+        )
+    positive_rates = torch.from_numpy(dataset.labels).float().mean(dim=0).clamp_min(1e-6)
+    pos_weight = ((1.0 - positive_rates) / positive_rates).to(device)
+    binary_criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    training_config = {
+        "model_name": args.clip_model,
+        "training_objective": args.training_objective,
+        "prompt_mode": args.prompt_mode,
+        "text_sampling": args.text_sampling,
+        "multi_attributes": args.multi_attributes,
+        "unique_prompts": args.unique_prompts,
+        "loss": args.loss,
+        "contrastive_target": args.contrastive_target,
+        "focal_alpha": args.focal_alpha,
+        "focal_gamma": args.focal_gamma,
+        "prototype_loss_weight": args.prototype_loss_weight,
+        "set_loss_weight": args.set_loss_weight,
+        "balance_max_weight": args.balance_max_weight,
+        "use_fce": args.use_fce,
+        "lambda_attr": args.lambda_attr,
+        "augmentation": getattr(args, "augmentation", "current"),
+        "positive_rates": positive_rates.tolist(),
+    }
+    optimizer = torch.optim.AdamW(
+        _optimizer_groups(model, args.weight_decay), lr=args.learning_rate,
+    )
+    scheduler = build_scheduler(
+        optimizer, len(loader), args.epochs, args.warmup_epochs,
+        args.learning_rate, args.min_learning_rate,
+    )
+    scaler = _grad_scaler(args.amp and device.type == "cuda")
+    output_dir = Path(args.output_dir)
+    best_path = output_dir / "checkpoint_best.pth"
+    last_path = output_dir / "checkpoint_last.pth"
+    logger = RunLogger(
+        output_dir, resume=bool(args.resume),
+        csv_filename=getattr(args, "training_log_filename", "metrics.csv"),
+    )
+    best_map = -math.inf
+    best_epoch = 0
+    stale = 0
+    start_epoch = 1
+
+    if args.resume:
+        payload = resume_training(args.resume, model, optimizer, scheduler, scaler, device)
+        if payload.get("model_name") != args.clip_model:
+            raise ValueError(
+                f"Resume model mismatch: checkpoint={payload.get('model_name')}, "
+                f"requested={args.clip_model}"
+            )
+        if payload["attribute_names"] != table.attribute_names:
+            raise ValueError("Resume checkpoint attribute order differs from training annotations")
+        if payload.get("prompt_mode", "binary_positive") != args.prompt_mode:
+            raise ValueError("Resume checkpoint prompt mode differs from --prompt-mode")
+        if payload.get("training_config") != training_config:
+            raise ValueError("Resume checkpoint training objective differs from current arguments")
+        state = payload["training_state"]
+        best_map = float(state["best_map"])
+        best_epoch = int(state["best_epoch"])
+        stale = int(state["stale_evaluations"])
+        start_epoch = int(payload["epoch"]) + 1
+        if sampler is not None:
+            sampler.epoch = start_epoch - 1
+        if not best_path.is_file():
+            raise FileNotFoundError(
+                f"Best checkpoint is missing: {best_path}. Resume with its original output directory."
+            )
+
+    logger.log(json.dumps({**vars(args), "resolved_device": str(device)}, indent=2, default=str))
+    logger.log(
+        f"Initialization checkpoint: {args.init_checkpoint if args.init_checkpoint else 'pretrained/default'}; "
+        f"binary_head={'newly_initialized' if args.init_checkpoint else 'newly_initialized'}; "
+        f"use_fce={args.use_fce}, lambda_attr={args.lambda_attr:g}"
+    )
+    logger.log(f"Training samples={len(dataset)}, attributes={len(table.attribute_names)}")
+    total_parameters = sum(parameter.numel() for parameter in model.parameters())
+    trainable_parameters = sum(
+        parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+    )
+    clip_parameters = sum(parameter.numel() for parameter in model.clip.parameters())
+    visual_parameters = sum(parameter.numel() for parameter in model.clip.visual.parameters())
+    text_parameters = clip_parameters - visual_parameters
+    binary_head_parameters = sum(parameter.numel() for parameter in model.binary_head.parameters())
+    optimizer_parameter_ids = {
+        id(parameter) for group in optimizer.param_groups for parameter in group["params"]
+    }
+    binary_head_in_optimizer = all(
+        id(parameter) in optimizer_parameter_ids for parameter in model.binary_head.parameters()
+    )
+    if not binary_head_in_optimizer:
+        raise RuntimeError("binary_head parameters are missing from the optimizer")
+    logger.log(
+        f"Parameters: trainable={trainable_parameters:,}/{total_parameters:,}, "
+        f"clip={clip_parameters:,}, visual={visual_parameters:,}, "
+        f"text_and_scale={text_parameters:,}, binary_head={binary_head_parameters:,}, "
+        f"binary_head_in_optimizer={binary_head_in_optimizer}; "
+        f"optimizer_tensors={sum(len(group['params']) for group in optimizer.param_groups)}"
+    )
+    if sampler is not None:
+        logger.log(
+            f"Paper-style unique-prompt batches enabled: requested_batch={args.batch_size}, "
+            f"first_epoch_batches={len(sampler)}"
+        )
+    if args.training_objective == "task2_hybrid":
+        logger.log(
+            f"Task2 hybrid objective: semantic_prototypes={semantic_labels.shape[1]}, "
+            f"prototype_weight={args.prototype_loss_weight:g}, "
+            f"set_weight={args.set_loss_weight:g}, "
+            f"balance_cap={args.balance_max_weight:g}"
+        )
+    try:
+        for epoch in range(start_epoch, args.epochs + 1):
+            started = time.time()
+            if not args.use_fce:
+                losses = train_one_epoch_binary(
+                    model, loader, optimizer, scheduler, binary_criterion, scaler,
+                    device, args.amp, args.grad_clip, args.lambda_attr,
+                )
+            elif args.training_objective == "task2_hybrid":
+                assert isinstance(criterion, Task2HybridLoss)
+                losses = train_one_epoch_hybrid(
+                    model, loader, optimizer, scheduler, criterion, scaler, device,
+                    args.amp, args.grad_clip, prototype_tokens, mapper,
+                    binary_criterion if args.lambda_attr > 0 else None, args.lambda_attr,
+                )
+            else:
+                assert isinstance(criterion, FocalCLIPLoss)
+                losses = train_one_epoch_paper(
+                    model, loader, optimizer, scheduler, criterion, scaler, device,
+                    args.amp, args.grad_clip,
+                    binary_criterion if args.lambda_attr > 0 else None, args.lambda_attr,
+                    diagnostics=(
+                        bool(getattr(args, "batch_diagnostics", False))
+                        and epoch == start_epoch
+                    ),
+                )
+            metrics: dict[str, float] = {}
+            should_stop = False
+            if epoch % args.retrieval_interval == 0 or epoch == args.epochs:
+                if getattr(args, "validation_protocol", "binary_head") == "native52":
+                    metrics = evaluate_native52(
+                        model, table.attribute_names, data_root,
+                        build_eval_transform(args.image_size), device,
+                        args.eval_batch_size, args.num_workers, args.amp,
+                        args.max_val_samples, args.attribute_temperature,
+                    )
+                else:
+                    metrics = evaluate_binary_head(
+                        model, table.attribute_names, data_root,
+                        build_eval_transform(args.image_size), device,
+                        args.eval_batch_size, args.num_workers, args.amp,
+                        args.max_val_samples,
+                    )
+                if validation_fce_loader is not None:
+                    assert isinstance(criterion, FocalCLIPLoss)
+                    metrics.update(evaluate_paper_fce(
+                        model, validation_fce_loader, criterion, device, args.amp,
+                    ))
+                if metrics["map"] > best_map:
+                    best_map = metrics["map"]
+                    best_epoch = epoch
+                    stale = 0
+                    save_best(
+                        best_path, model, table.attribute_names, epoch,
+                        {**losses, **metrics}, args.prompt_mode, training_config,
+                    )
+                    logger.log(f"Saved new best checkpoint: {best_path}")
+                else:
+                    stale += 1
+                    should_stop = (
+                        epoch >= args.minimum_training_epochs
+                        and stale >= args.early_stopping_patience
+                    )
+
+            elapsed = time.time() - started
+            lr = float(optimizer.param_groups[0]["lr"])
+            logger.log(
+                f"Epoch {epoch:03d}/{args.epochs}: total={losses['loss']:.6f}, "
+                f"fce={losses.get('fce', 0.0):.6f}, bce={losses.get('bce', 0.0):.6f}, "
+                + (f"prototype={losses['prototype']:.6f}, set={losses['set']:.6f}, "
+                   if args.training_objective == "task2_hybrid" else "")
+                + f"i2t={losses['i2t']:.6f}, t2i={losses['t2i']:.6f}, lr={lr:.3e}"
+                + (f", AUROC={metrics['macro_auroc']:.4f}, AP={metrics['macro_ap']:.4f}, "
+                   f"F1={metrics.get('instance_f1', metrics.get('macro_f1', float('nan'))):.4f}, "
+                   f"BitErr={metrics.get('mean_hamming_error', float('nan')):.3f}, "
+                   f"Exact={100 * metrics.get('exact_match', float('nan')):.2f}%, "
+                   f"Rank-1={100 * metrics['rank1']:.2f}%, "
+                   f"Rank-5={100 * metrics['rank5']:.2f}%, Rank-10={100 * metrics['rank10']:.2f}%, "
+                   f"mAP={100 * metrics['map']:.2f}%, SemTop1={100 * metrics['semantic_top1']:.2f}%"
+                   if metrics else "")
+                + (f", batch_avg={losses['average_batch_size']:.1f}, "
+                   f"VRAM={losses['cuda_peak_allocated_gib']:.2f}/"
+                   f"{losses['cuda_peak_reserved_gib']:.2f} GiB" if device.type == "cuda" else "")
+                + f" ({elapsed:.1f}s)"
+            )
+            row = {
+                "epoch": epoch, "total_loss": losses["loss"],
+                "i2t_loss": metrics.get("i2t_loss", losses["i2t"]),
+                "t2i_loss": metrics.get("t2i_loss", losses["t2i"]),
+                "fce_loss": metrics.get("fce_loss", losses.get("fce", 0.0)),
+                "bce_loss": losses.get("bce", 0.0), "learning_rate": lr,
+                "prototype_loss": losses.get("prototype", ""),
+                "set_loss": losses.get("set", ""),
+                "best_map": best_map, "best_epoch": best_epoch,
+                "stale_evaluations": stale, "elapsed_seconds": elapsed,
+                "train_batches": losses["train_batches"],
+                "average_batch_size": losses["average_batch_size"],
+                "cuda_peak_allocated_gib": losses.get("cuda_peak_allocated_gib", ""),
+                "cuda_peak_reserved_gib": losses.get("cuda_peak_reserved_gib", ""),
+                **metrics,
+            }
+            logger.metrics(row)
+            save_last(
+                last_path, model, table.attribute_names, epoch, {**losses, **metrics},
+                optimizer, scheduler, scaler, best_map, best_epoch, stale,
+                args.prompt_mode, training_config,
+            )
+            if should_stop:
+                logger.log(
+                    f"Early stopping at epoch {epoch}; best mAP={100 * best_map:.2f}% "
+                    f"at epoch {best_epoch}."
+                )
+                break
+    finally:
+        logger.close()
+    if not best_path.is_file():
+        raise RuntimeError("Training completed without a validation-selected checkpoint")
+    return best_path

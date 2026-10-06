@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+
+# Local datasets and experiment artifacts. Annotation CSV files remain tracked.
+data/Market1501/
+data/PA100k/
+data/PETA/
+data/*.zip
+outputs/
+submissions/
+
+# Model and training artifacts outside the standard output directories.
+*.pth
+*.pt
+train.log
+metrics.csv
+
+# Local outputs and submission artifacts
+output/
+outputs/
+submission/
+submissions/
+
+# Local dataset archives
+/data/*.zip

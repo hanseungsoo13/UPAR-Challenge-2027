@@ -58,7 +58,7 @@ def prepare_market(dataset_path):
     market_1501_zipfile = dataset_path / "market_1501.zip"
     url = "https://drive.google.com/file/d/0B8-rUzbwVRk0c054eEozWG9COHM/view?resourcekey=0-8nyl7K9_x37HlQm34MmrYQ"
     print("Download Market 1501 dataset")
-    gdown.download(url, output=str(market_1501_zipfile), quiet=False, use_cookies=False, fuzzy=True)
+    gdown.download(url, output=str(market_1501_zipfile), quiet=False, use_cookies=False)
     print("Extract Market 1501 dataset")
     extract_zip(market_1501_zipfile, dataset_path)
     Path(dataset_path / "Market-1501-v15.09.15").rename(market_1501_path)

@@ -78,6 +78,44 @@ Current release counts:
 | Train | 97,669 | 7,204 | 10,000 | 79,001 | 8,668 |
 | Validation | 33,407 | 3,462 | 16,458 | 9,986 | 6,963 |
 
+## Task 2 baseline training
+
+구현 및 사용법 전체 문서는
+[`examples/task2/sample_code_submission/README.md`](examples/task2/sample_code_submission/README.md)를
+참고한다.
+
+The default run trains for at most 100 epochs and stops after 12 validation
+checks without an mAP improvement:
+
+```bash
+python examples/task2/sample_code_submission/run.py \
+  --mode train_eval \
+  --output-dir outputs/task2_baseline
+```
+
+Each output directory contains:
+
+- `train.log`: terminal-style training messages.
+- `metrics.csv`: one summary row per completed epoch.
+- `best.pth`: the best validation-mAP model for evaluation and submission.
+- `last.pth`: the latest model plus optimizer, scheduler, AMP scaler, EMA, RNG,
+  and early-stopping state.
+
+Resume an interrupted run in the same output directory with:
+
+```bash
+python examples/task2/sample_code_submission/run.py \
+  --mode train_eval \
+  --output-dir outputs/task2_baseline \
+  --epochs 100 \
+  --resume
+```
+
+`--epochs` is the total target epoch, not the number of additional epochs.
+An explicit resume checkpoint can be supplied as `--resume path/to/last.pth`;
+keep `--output-dir` pointed at the directory containing its matching
+`best.pth`.
+
 ## Dataset Sources
 We build on an extension of the UPAR dataset.
 The challenge training dataset consists of the harmonization of three public datasets (PA100K, PETA, and Market1501-Attributes) and a private test set.
