@@ -13,7 +13,9 @@ from torch.utils.data import Dataset, Sampler
 
 from upar.data import AnnotationTable, resolve_image_path
 
-from .attribute_prompts import CategoryPromptMapper, prompts_for_attributes
+from .attribute_prompts import (
+    CategoryPromptMapper, PaperAttributePromptMapper, prompts_for_attributes,
+)
 
 
 class AttriVisionDataset(Dataset):
@@ -53,6 +55,8 @@ def semantic_label_matrix(
         return CategoryPromptMapper(attribute_names).encode(labels)
     if prompt_mode == "binary_positive":
         return labels > 0.5
+    if prompt_mode == "paper_binary":
+        return PaperAttributePromptMapper(attribute_names).encode(labels)
     raise ValueError(f"Unknown prompt mode: {prompt_mode}")
 
 
@@ -147,10 +151,18 @@ class PromptCollator:
             raise ValueError("text_sampling must be 'single' or 'multi'")
         if multi_attributes <= 0:
             raise ValueError("multi_attributes must be positive")
-        if prompt_mode not in {"category_complete", "binary_positive"}:
+        if prompt_mode not in {"category_complete", "binary_positive", "paper_binary"}:
             raise ValueError("prompt_mode must be 'category_complete' or 'binary_positive'")
-        self.mapper = CategoryPromptMapper(attribute_names) if prompt_mode == "category_complete" else None
-        self.prompts = self.mapper.prompts if self.mapper is not None else prompts_for_attributes(attribute_names)
+        if prompt_mode == "category_complete":
+            self.mapper = CategoryPromptMapper(attribute_names)
+        elif prompt_mode == "paper_binary":
+            self.mapper = PaperAttributePromptMapper(attribute_names)
+        else:
+            self.mapper = None
+        self.prompts = (
+            self.mapper.prompts
+            if self.mapper is not None else prompts_for_attributes(attribute_names)
+        )
         self.tokenizer = tokenizer
         self.text_sampling = text_sampling
         self.multi_attributes = multi_attributes

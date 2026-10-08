@@ -95,6 +95,40 @@ def prompts_for_attributes(attribute_names: Sequence[str]) -> list[str]:
     return [ATTRIBUTE_PROMPTS[name] for name in attribute_names]
 
 
+class PaperAttributePromptMapper:
+    """Map each official binary attribute to its positive/negative prompt.
+
+    The paper describes one natural-language state for both presence and
+    absence of every attribute.  This deliberately keeps the official 40-bit
+    vocabulary instead of introducing mutually-exclusive category states.
+    State order is ``negative, positive`` for every attribute.
+    """
+
+    def __init__(self, attribute_names: Sequence[str]) -> None:
+        negative, positive = prompt_pairs_for_attributes(attribute_names)
+        self.attribute_names = list(attribute_names)
+        self.prompts = [text for pair in zip(negative, positive) for text in pair]
+        self.keys = [
+            key
+            for name in self.attribute_names
+            for key in (f"{name}=0", f"{name}=1")
+        ]
+
+    def encode(self, labels: torch.Tensor) -> torch.Tensor:
+        if labels.ndim != 2 or labels.shape[1] != len(self.attribute_names):
+            raise ValueError(
+                f"Expected labels [B,{len(self.attribute_names)}], got {tuple(labels.shape)}"
+            )
+        binary = labels > 0.5
+        semantic = torch.zeros(
+            labels.shape[0], len(self.prompts), dtype=torch.bool, device=labels.device,
+        )
+        columns = torch.arange(len(self.attribute_names), device=labels.device)
+        semantic[:, 2 * columns] = ~binary
+        semantic[:, 2 * columns + 1] = binary
+        return semantic
+
+
 def prompt_pairs_for_attributes(attribute_names: Sequence[str]) -> tuple[list[str], list[str]]:
     """Return negative and positive prompts in the requested attribute order."""
     missing_positive = [name for name in attribute_names if name not in ATTRIBUTE_PROMPTS]
@@ -221,6 +255,20 @@ class CategoryPromptMapper:
         self.prompts = [CATEGORY_PROMPTS[key] for key in keys]
         self._attribute_index = attribute_index
         self._semantic_index = {key: index for index, key in enumerate(keys)}
+
+    def category_indices(self) -> list[list[int]]:
+        """Return the canonical 12-category partition of the 52 state indices."""
+        groups: list[list[int]] = []
+        for _, _, state_keys, fallback_key in self._MULTI_GROUPS:
+            groups.append([self._semantic_index[key] for key in (*state_keys, fallback_key)])
+        for _, positive_key, negative_key in self._BINARY_GROUPS:
+            groups.append([
+                self._semantic_index[positive_key], self._semantic_index[negative_key],
+            ])
+        covered = [index for group in groups for index in group]
+        if len(groups) != 12 or len(covered) != 52 or len(set(covered)) != 52:
+            raise RuntimeError("Category groups must partition all 52 semantic states")
+        return groups
 
     def encode(self, labels: torch.Tensor) -> torch.Tensor:
         if labels.ndim != 2 or labels.shape[1] != len(self.attribute_names):

@@ -60,21 +60,43 @@ def submission_checkpoint(checkpoint: Path, retrieval_scoring: str = "cosine_set
     if metadata["architecture"] != "attrivision_openclip_vit_b_32":
         return None, metadata
     from attrivision.datasets.attribute_prompts import (
-        CategoryPromptMapper, prompt_pairs_for_attributes,
+        CategoryPromptMapper, PaperAttributePromptMapper, prompt_pairs_for_attributes,
     )
     from attrivision.models.attrivision import AttriVision
 
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    if payload.get("prompt_mode") != "category_complete":
-        raise ValueError("AttriVision submission packaging currently requires category_complete")
     model = AttriVision(pretrained=None, model_name=payload["model_name"])
     model.load_state_dict(payload["model_state_dict"], strict=True)
     model.eval()
-    mapper = CategoryPromptMapper(payload["attribute_names"])
+    prompt_mode = payload.get("prompt_mode")
+    if prompt_mode == "category_complete":
+        mapper = CategoryPromptMapper(payload["attribute_names"])
+        semantic_prompts = mapper.prompts
+        semantic_keys = mapper.keys
+    elif prompt_mode == "paper_binary":
+        if retrieval_scoring != "paired_l1":
+            raise ValueError(
+                "paper_binary checkpoints must be packaged with --retrieval-scoring paired_l1"
+            )
+        mapper = PaperAttributePromptMapper(payload["attribute_names"])
+        # The dependency-free adapter only needs semantic prototypes for the
+        # cosine_set path. Keep an empty, shape-valid tensor for paired_l1.
+        semantic_prompts = []
+        semantic_keys = []
+    else:
+        raise ValueError(
+            "AttriVision submission packaging supports category_complete or paper_binary"
+        )
     with torch.inference_mode():
-        text_features = model.encode_text(model.tokenize(mapper.prompts)).float().cpu()
-        negative, positive = prompt_pairs_for_attributes(payload["attribute_names"])
-        paired_prompts = [text for pair in zip(negative, positive) for text in pair]
+        text_features = (
+            model.encode_text(model.tokenize(semantic_prompts)).float().cpu()
+            if semantic_prompts else torch.empty((0, 512), dtype=torch.float32)
+        )
+        if prompt_mode == "paper_binary":
+            paired_prompts = mapper.prompts
+        else:
+            negative, positive = prompt_pairs_for_attributes(payload["attribute_names"])
+            paired_prompts = [text for pair in zip(negative, positive) for text in pair]
         paired_text_features = (
             model.encode_text(model.tokenize(paired_prompts)).float().cpu()
             .reshape(len(payload["attribute_names"]), 2, -1)
@@ -97,7 +119,7 @@ def submission_checkpoint(checkpoint: Path, retrieval_scoring: str = "cosine_set
         "quick_gelu": payload["model_name"].endswith("-quickgelu"),
         "visual_state_dict": visual,
         "text_features": text_features,
-        "semantic_keys": mapper.keys,
+        "semantic_keys": semantic_keys,
         "paired_text_features": paired_text_features,
         "inverse_temperature": inverse_temperature,
         "retrieval_scoring": retrieval_scoring,

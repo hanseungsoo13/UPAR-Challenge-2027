@@ -23,9 +23,11 @@ ConvNeXt baseline은 상위 폴더에 그대로 유지된다.
 - LayerNorm/bias/temperature를 weight decay에서 제외한 AdamW
 - 5 epoch linear warmup + 100 epoch cosine decay, 최소 50 epoch 학습
 - 전체/vision/text trainable parameter와 epoch별 peak VRAM 기록
-- 기존 `upar.retrieval.retrieval_metrics`를 재사용한 Rank-1/mAP와 동일 ranking의
-  Rank-5/Rank-10
+- UPAR 2027 공식 mADM/mAP/Rank-1/5/10/mINP와 동일 ranking의 semantic top-1
 - `train.log`, `metrics.csv`, `checkpoint_best.pth`, `checkpoint_last.pth`, resume
+- `--paper-faithful` one-shot preset for the WACV recipe: 80 positive/negative
+  prompts, multi-attribute FCE, QuickGELU, paper-like augmentation, paired-L1
+  inference, and checkpoint selection by the official UPAR mADM
 
 ConvNeXt, body-part pooling, SID, SetEncoder, learnable query, cross-attention,
 별도 domain-generalization 모듈은 포함하지 않았다.
@@ -112,6 +114,29 @@ CUDA_VISIBLE_DEVICES=6 python examples/task2/sample_code_submission/attrivision/
   --output-dir outputs/attrivision_task2_hybrid
 ```
 
+### 논문식 재현 preset
+
+논문에 맞춘 설정을 개별 옵션으로 다시 조합하지 않도록 preset을 제공한다.
+이 preset은 40개 binary attribute 각각에 대해 presence/absence 문장을 만들고,
+image마다 최대 3개 문장을 무작위로 선택하고, 기존 재현 run과 같은 batch size 32로
+식 (2)~(6)의 diagonal FCE를 계산한다.
+검증은 40개 paired prompt 확률의 공식 L1 retrieval로 하고, checkpoint는 mAP가
+아닌 UPAR 공식 mADM이 가장 높은 epoch를 저장한다.
+
+```bash
+CUDA_VISIBLE_DEVICES=6 python examples/task2/sample_code_submission/attrivision/run.py \
+  --mode train_eval \
+  --device cuda:0 \
+  --paper-faithful \
+  --batch-size 32 \
+  --output-dir outputs/attrivision_paper_faithful
+```
+
+논문은 optimizer의 세부값, batch size, 전체 prompt 목록을 공개하지 않으므로
+이 preset의 해당 값은 CLI에서 확인·변경할 수 있다. `--paper-faithful`이 강제로
+고정하는 것은 논문에서 확인되는 구조적 요소와 평가 protocol이며, 데이터셋 버전이
+UPAR 2024인지 현재 Challenge release인지에 따른 점수 차이는 별도로 남는다.
+
 ### 재개
 
 ```bash
@@ -143,7 +168,7 @@ epoch다.
 | `--focal-gamma` | `2.0` | FCE gamma |
 | `--text-sampling` | `single` | `single` 또는 `multi` |
 | `--multi-attributes` | 3 | multi에서 image당 sampling할 최대 prompt 수 |
-| `--prompt-mode` | `category_complete` | 12개 범주의 complement 포함 여부 |
+| `--prompt-mode` | `category_complete` | 12개 범주, positive-only, paper binary 상태 |
 | `--contrastive-target` | `diagonal` | 논문식 owner pair 또는 `multi_positive` ablation |
 | `--unique-prompts` | 꺼짐 | `paper_fce` 전용 unique prompt sampler |
 | `--query-aggregation` | `mean` | query text feature aggregation |
@@ -152,7 +177,7 @@ epoch다.
 | `--warmup-epochs` | 5 | linear learning-rate warmup epoch |
 | `--min-learning-rate` | `1e-7` | cosine decay의 최저 learning rate |
 | `--minimum-training-epochs` | 50 | 이 epoch 전에는 early stopping 금지 |
-| `--early-stopping-patience` | 20 | mAP 미개선 evaluation 횟수 |
+| `--early-stopping-patience` | 20 | 선택 metric 미개선 evaluation 횟수 |
 
 전체 옵션은 `python .../attrivision/run.py --help`로 확인한다. 논문에 명시되지
 않은 optimizer, learning rate, batch size, alpha, gamma, sampling 개수 등은 모두
@@ -187,6 +212,11 @@ text encoder에 통과시킨다. 학습 중에는 이 feature들을 평균하지
 요청 크기보다 작아질 수 있으며, 실제 평균 batch와 CUDA peak allocated/reserved
 메모리는 매 epoch `train.log`와 `metrics.csv`에 기록된다.
 
+단, `--paper-faithful`의 `paper_binary`에서는 한 이미지 안에서 같은 state를 두 번
+뽑지 않는 `random.sample`을 사용한다. 서로 다른 이미지가 같은 `no ...` 문장을
+공유하는 것은 서로 다른 `(image, label)` pair이므로 허용한다. 80개 state 전체를
+batch 전역에서 강제로 중복 금지하면 기본 batch에서 불필요하게 batch가 쪼개진다.
+
 `paper_fce + multi_positive`에서는 image `i`의 positive label과 text sample `j`가 선택한
 semantic state가 하나라도 겹치면 `positive_mask[i,j]=1`이다. 방향별 loss는 각 anchor의
 positive log-probability 평균을 사용한다. `diagonal`은 각 text를 그 text가
@@ -216,8 +246,9 @@ python examples/task2/sample_code_submission/package_submission.py \
   --retrieval-scoring paired_l1
 ```
 
-이 ZIP에는 fine-tuned text encoder가 만든 80개 prompt feature와 learned temperature가
-함께 저장되므로 Codabench의 network-disabled 환경에서도 동일하게 추론한다.
+이 ZIP에는 fine-tuned text encoder가 만든 paired prompt feature와 learned temperature가
+함께 저장되므로 Codabench의 network-disabled 환경에서도 동일하게 추론한다. `paper_binary`
+checkpoint는 반드시 `--retrieval-scoring paired_l1`로 패키징한다.
 
 ## Paired-L1 진단 실험
 

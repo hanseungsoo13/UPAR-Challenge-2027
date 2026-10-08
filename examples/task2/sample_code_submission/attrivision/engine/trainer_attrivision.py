@@ -16,7 +16,9 @@ from upar.data import find_annotation_file, read_gt_csv
 from upar.retrieval import autocast
 
 from ..checkpoint import resume_training, save_best, save_last
-from ..datasets.attribute_prompts import CategoryPromptMapper, prompts_for_attributes
+from ..datasets.attribute_prompts import (
+    CategoryPromptMapper, PaperAttributePromptMapper, prompts_for_attributes,
+)
 from ..datasets.upar_abpr import (
     AttriVisionDataset,
     PromptBatch,
@@ -25,11 +27,15 @@ from ..datasets.upar_abpr import (
     semantic_label_matrix,
 )
 from ..losses.focal_clip_loss import FocalCLIPLoss
+from ..losses.category_structured_ce import CategoryStructuredCELoss
 from ..losses.task2_hybrid_loss import Task2HybridLoss
 from ..models.attrivision import AttriVision
 from ..tracking import RunLogger
 from ..transforms import build_eval_transform, build_train_transform
-from .evaluator_abpr import evaluate_binary_head, evaluate_native52
+from .evaluator_abpr import (
+    evaluate_abpr, evaluate_binary_head, evaluate_native52,
+    evaluate_native52_category_nll,
+)
 
 
 def _grad_scaler(enabled: bool) -> Any:
@@ -78,9 +84,17 @@ def train_one_epoch_paper(
     criterion: FocalCLIPLoss, scaler: Any, device: torch.device,
     amp: bool, grad_clip: float, binary_criterion: nn.Module | None = None,
     attr_weight: float = 1.0, diagnostics: bool = False,
+    category_criterion: CategoryStructuredCELoss | None = None,
+    prototype_tokens: torch.Tensor | None = None,
+    category_mode: str = "off", category_weight: float = 1.0,
 ) -> dict[str, float]:
     model.train()
-    totals = {"loss": 0.0, "fce": 0.0, "bce": 0.0, "i2t": 0.0, "t2i": 0.0, "samples": 0.0, "batches": 0.0}
+    if category_mode not in {"off", "only", "combined"}:
+        raise ValueError(f"Unknown Category CE mode: {category_mode}")
+    if category_mode != "off" and (category_criterion is None or prototype_tokens is None):
+        raise ValueError("Category CE requires its criterion and all 52 prototype tokens")
+    totals = {"loss": 0.0, "fce": 0.0, "category_ce": 0.0, "bce": 0.0,
+              "i2t": 0.0, "t2i": 0.0, "samples": 0.0, "batches": 0.0}
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     for batch_index, batch in enumerate(loader):
@@ -94,11 +108,28 @@ def train_one_epoch_paper(
         text_owners = batch.text_owners.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
         with autocast(device, amp):
-            image_features, text_features, logits = model(images, tokens)
-            result = criterion(logits, semantic_labels, selected, text_owners)
+            if category_mode == "only":
+                image_features = model.encode_image(images)
+                text_features = None
+                logits = None
+                fce = image_features.new_zeros(())
+                i2t = image_features.new_zeros(())
+                t2i = image_features.new_zeros(())
+            else:
+                image_features, text_features, logits = model(images, tokens)
+                result = criterion(logits, semantic_labels, selected, text_owners)
+                fce, i2t, t2i = result.loss, result.i2t, result.t2i
+            if category_mode != "off":
+                state_features = model.encode_text(prototype_tokens)
+                category_ce = category_criterion(
+                    image_features, state_features, semantic_labels,
+                )
+            else:
+                category_ce = image_features.new_zeros(())
             bce = attr_weight * binary_criterion(model.binary_logits_from_features(image_features), labels.float()) if binary_criterion is not None else image_features.new_zeros(())
-            total = result.loss + bce
-        if diagnostics and batch_index == 0:
+            total = fce + category_weight * category_ce + bce
+        if diagnostics and batch_index == 0 and category_mode != "only":
+            assert logits is not None
             positive_mask = criterion.positive_mask(
                 logits, semantic_labels, selected, text_owners,
             )
@@ -123,10 +154,11 @@ def train_one_epoch_paper(
         scheduler.step()
         count = len(images)
         totals["loss"] += float(total.detach()) * count
-        totals["fce"] += float(result.loss.detach()) * count
+        totals["fce"] += float(fce.detach()) * count
+        totals["category_ce"] += float(category_ce.detach()) * count
         totals["bce"] += float(bce.detach()) * count
-        totals["i2t"] += float(result.i2t.detach()) * count
-        totals["t2i"] += float(result.t2i.detach()) * count
+        totals["i2t"] += float(i2t.detach()) * count
+        totals["t2i"] += float(t2i.detach()) * count
         totals["samples"] += count
         totals["batches"] += 1
     return _finish_epoch_totals(totals, device)
@@ -270,6 +302,9 @@ def train(args: Any) -> Path:
         missing, unexpected = model.load_state_dict(init_state, strict=False)
         if set(missing) - {"binary_head.weight", "binary_head.bias"} or unexpected:
             raise ValueError(f"Invalid init checkpoint mismatch: missing={missing}, unexpected={unexpected}")
+    if getattr(args, "freeze_binary_head", False):
+        for parameter in model.binary_head.parameters():
+            parameter.requires_grad_(False)
     dataset = AttriVisionDataset(
         table,
         [data_root, train_gt.parent, REPOSITORY_ROOT],
@@ -288,14 +323,29 @@ def train(args: Any) -> Path:
         CategoryPromptMapper(table.attribute_names)
         if args.prompt_mode == "category_complete" else None
     )
-    prototype_prompts = mapper.prompts if mapper is not None else prompts_for_attributes(table.attribute_names)
-    prototype_tokens = model.tokenize(prototype_prompts).to(device) if args.use_fce else None
+    if args.prompt_mode == "paper_binary":
+        prototype_prompts = PaperAttributePromptMapper(table.attribute_names).prompts
+    else:
+        prototype_prompts = mapper.prompts if mapper is not None else prompts_for_attributes(table.attribute_names)
+    category_mode = getattr(args, "category_ce_mode", "off")
+    prototype_tokens = (
+        model.tokenize(prototype_prompts).to(device)
+        if args.use_fce or category_mode != "off" else None
+    )
     if args.use_fce and args.training_objective == "paper_fce":
+        # For paper_binary, "unique" means each image owns a distinct
+        # sampled (image, attribute-state) pair.  The old global-state sampler
+        # is intentionally not used because the same negative state is valid
+        # for many images and globally forbidding it would shrink batches.
+        collator_unique = args.unique_prompts and args.prompt_mode != "paper_binary"
         collator = PromptCollator(
             table.attribute_names, model.tokenizer, args.text_sampling, args.multi_attributes,
-            args.prompt_mode, args.unique_prompts,
+            args.prompt_mode, collator_unique,
         )
-    if args.use_fce and args.training_objective == "paper_fce" and args.unique_prompts:
+    if (
+        args.use_fce and args.training_objective == "paper_fce"
+        and args.unique_prompts and args.prompt_mode != "paper_binary"
+    ):
         prompts_per_image = 1 if args.text_sampling == "single" else args.multi_attributes
         sampler = UniquePromptBatchSampler(
             semantic_labels, args.batch_size, prompts_per_image, args.seed,
@@ -344,6 +394,14 @@ def train(args: Any) -> Path:
         criterion = FocalCLIPLoss(
             args.loss, args.contrastive_target, args.focal_alpha, args.focal_gamma,
         )
+    category_criterion = (
+        CategoryStructuredCELoss(
+            mapper.category_indices(), getattr(args, "category_temperature", 0.01),
+        ).to(device)
+        if category_mode != "off" and mapper is not None else None
+    )
+    if category_mode != "off" and mapper is None:
+        raise ValueError("Category CE requires prompt_mode=category_complete")
     positive_rates = torch.from_numpy(dataset.labels).float().mean(dim=0).clamp_min(1e-6)
     pos_weight = ((1.0 - positive_rates) / positive_rates).to(device)
     binary_criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
@@ -363,7 +421,13 @@ def train(args: Any) -> Path:
         "balance_max_weight": args.balance_max_weight,
         "use_fce": args.use_fce,
         "lambda_attr": args.lambda_attr,
+        "category_ce_mode": category_mode,
+        "category_ce_weight": getattr(args, "category_ce_weight", 1.0),
+        "category_temperature": getattr(args, "category_temperature", 0.01),
+        "freeze_binary_head": getattr(args, "freeze_binary_head", False),
         "augmentation": getattr(args, "augmentation", "current"),
+        "selection_metric": getattr(args, "selection_metric", "map"),
+        "paper_faithful": bool(getattr(args, "paper_faithful", False)),
         "positive_rates": positive_rates.tolist(),
     }
     optimizer = torch.optim.AdamW(
@@ -432,7 +496,9 @@ def train(args: Any) -> Path:
     binary_head_in_optimizer = all(
         id(parameter) in optimizer_parameter_ids for parameter in model.binary_head.parameters()
     )
-    if not binary_head_in_optimizer:
+    if getattr(args, "freeze_binary_head", False) and binary_head_in_optimizer:
+        raise RuntimeError("Frozen binary_head parameters must not be in the optimizer")
+    if not getattr(args, "freeze_binary_head", False) and not binary_head_in_optimizer:
         raise RuntimeError("binary_head parameters are missing from the optimizer")
     logger.log(
         f"Parameters: trainable={trainable_parameters:,}/{total_parameters:,}, "
@@ -478,16 +544,35 @@ def train(args: Any) -> Path:
                         bool(getattr(args, "batch_diagnostics", False))
                         and epoch == start_epoch
                     ),
+                    category_criterion=category_criterion,
+                    prototype_tokens=prototype_tokens,
+                    category_mode=category_mode,
+                    category_weight=getattr(args, "category_ce_weight", 1.0),
                 )
             metrics: dict[str, float] = {}
             should_stop = False
             if epoch % args.retrieval_interval == 0 or epoch == args.epochs:
-                if getattr(args, "validation_protocol", "binary_head") == "native52":
+                if getattr(args, "validation_protocol", "binary_head") == "native52_category_nll":
+                    metrics = evaluate_native52_category_nll(
+                        model, table.attribute_names, data_root,
+                        build_eval_transform(args.image_size), device,
+                        args.eval_batch_size, args.num_workers, args.amp,
+                        args.max_val_samples, getattr(args, "category_temperature", 0.01),
+                    )
+                elif getattr(args, "validation_protocol", "binary_head") == "native52":
                     metrics = evaluate_native52(
                         model, table.attribute_names, data_root,
                         build_eval_transform(args.image_size), device,
                         args.eval_batch_size, args.num_workers, args.amp,
                         args.max_val_samples, args.attribute_temperature,
+                    )
+                elif getattr(args, "validation_protocol", "binary_head") == "paired_l1":
+                    metrics = evaluate_abpr(
+                        model, table.attribute_names, data_root,
+                        build_eval_transform(args.image_size), device,
+                        args.eval_batch_size, args.num_workers, args.amp,
+                        args.max_val_samples, args.prompt_mode,
+                        "paired_l1", args.attribute_temperature,
                     )
                 else:
                     metrics = evaluate_binary_head(
@@ -501,15 +586,20 @@ def train(args: Any) -> Path:
                     metrics.update(evaluate_paper_fce(
                         model, validation_fce_loader, criterion, device, args.amp,
                     ))
-                if metrics["map"] > best_map:
-                    best_map = metrics["map"]
+                selection_key = getattr(args, "selection_metric", "map")
+                current_score = float(metrics.get(selection_key, metrics["map"]))
+                if current_score > best_map:
+                    best_map = current_score
                     best_epoch = epoch
                     stale = 0
                     save_best(
                         best_path, model, table.attribute_names, epoch,
                         {**losses, **metrics}, args.prompt_mode, training_config,
                     )
-                    logger.log(f"Saved new best checkpoint: {best_path}")
+                    logger.log(
+                        f"Saved new best checkpoint: {best_path} "
+                        f"({selection_key}={current_score:.6f})"
+                    )
                 else:
                     stale += 1
                     should_stop = (
@@ -522,6 +612,7 @@ def train(args: Any) -> Path:
             logger.log(
                 f"Epoch {epoch:03d}/{args.epochs}: total={losses['loss']:.6f}, "
                 f"fce={losses.get('fce', 0.0):.6f}, bce={losses.get('bce', 0.0):.6f}, "
+                + f"catce={losses.get('category_ce', 0.0):.6f}, "
                 + (f"prototype={losses['prototype']:.6f}, set={losses['set']:.6f}, "
                    if args.training_objective == "task2_hybrid" else "")
                 + f"i2t={losses['i2t']:.6f}, t2i={losses['t2i']:.6f}, lr={lr:.3e}"
@@ -531,7 +622,9 @@ def train(args: Any) -> Path:
                    f"Exact={100 * metrics.get('exact_match', float('nan')):.2f}%, "
                    f"Rank-1={100 * metrics['rank1']:.2f}%, "
                    f"Rank-5={100 * metrics['rank5']:.2f}%, Rank-10={100 * metrics['rank10']:.2f}%, "
-                   f"mAP={100 * metrics['map']:.2f}%, SemTop1={100 * metrics['semantic_top1']:.2f}%"
+                   f"mAP={100 * metrics['map']:.2f}%, "
+                   f"mADM={100 * metrics.get('mADM', float('nan')):.2f}%, "
+                   f"SemTop1={100 * metrics['semantic_top1']:.2f}%"
                    if metrics else "")
                 + (f", batch_avg={losses['average_batch_size']:.1f}, "
                    f"VRAM={losses['cuda_peak_allocated_gib']:.2f}/"
@@ -543,6 +636,7 @@ def train(args: Any) -> Path:
                 "i2t_loss": metrics.get("i2t_loss", losses["i2t"]),
                 "t2i_loss": metrics.get("t2i_loss", losses["t2i"]),
                 "fce_loss": metrics.get("fce_loss", losses.get("fce", 0.0)),
+                "category_ce_loss": losses.get("category_ce", 0.0),
                 "bce_loss": losses.get("bce", 0.0), "learning_rate": lr,
                 "prototype_loss": losses.get("prototype", ""),
                 "set_loss": losses.get("set", ""),
@@ -562,7 +656,8 @@ def train(args: Any) -> Path:
             )
             if should_stop:
                 logger.log(
-                    f"Early stopping at epoch {epoch}; best mAP={100 * best_map:.2f}% "
+                    f"Early stopping at epoch {epoch}; best "
+                    f"{getattr(args, 'selection_metric', 'map')}={100 * best_map:.2f}% "
                     f"at epoch {best_epoch}."
                 )
                 break

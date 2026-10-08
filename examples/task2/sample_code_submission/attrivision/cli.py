@@ -10,7 +10,10 @@ from upar.config import REPOSITORY_ROOT, choose_device, set_seed
 
 from .checkpoint import load_model
 from .datasets.attribute_prompts import prompts_for_attributes
-from .engine.evaluator_abpr import evaluate_abpr, evaluate_native52, print_evaluation
+from .engine.evaluator_abpr import (
+    evaluate_abpr, evaluate_native52, evaluate_native52_category_nll,
+    print_evaluation,
+)
 from .engine.trainer_attrivision import train
 from .losses.focal_clip_loss import FocalCLIPLoss
 from .losses.task2_hybrid_loss import Task2HybridLoss
@@ -26,6 +29,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--task", choices=("task2",), default="task2")
     parser.add_argument("--model", choices=("attrivision",), default="attrivision")
     parser.add_argument("--mode", choices=("train", "eval", "train_eval", "smoke"), default="train_eval")
+    parser.add_argument(
+        "--paper-faithful", action="store_true",
+        help="use the paper-style 40-attribute presence/absence FCE recipe",
+    )
     parser.add_argument("--data-root", default=str(REPOSITORY_ROOT / "data"))
     parser.add_argument("--output-dir", default="outputs/attrivision")
     parser.add_argument("--checkpoint")
@@ -50,9 +57,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--text-sampling", "--text_sampling", choices=("single", "multi"), default="single")
     parser.add_argument("--multi-attributes", type=int, default=3)
     parser.add_argument(
-        "--prompt-mode", choices=("category_complete", "binary_positive"),
+        "--prompt-mode", choices=("category_complete", "binary_positive", "paper_binary"),
         default="category_complete",
-        help="complete 12-category states (including complements) or positive binary attributes only",
+        help="12-category states, positive-only attributes, or paper-style positive/negative binary states",
     )
     parser.add_argument("--loss", choices=("clip", "focal_clip"), default="focal_clip")
     parser.add_argument(
@@ -63,6 +70,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prototype-loss-weight", type=float, default=0.25)
     parser.add_argument("--set-loss-weight", type=float, default=1.0)
     parser.add_argument("--lambda-attr", type=float, default=1.0)
+    parser.add_argument(
+        "--category-ce-mode", choices=("off", "only", "combined"), default="off",
+        help="optional 12-category Native52 CE objective",
+    )
+    parser.add_argument("--category-ce-weight", type=float, default=1.0)
+    parser.add_argument("--category-temperature", type=float, default=0.01)
+    parser.add_argument(
+        "--freeze-binary-head", action=argparse.BooleanOptionalAction, default=False,
+        help="exclude the unused 40-D head from gradients and optimizer groups",
+    )
     parser.add_argument("--use-fce", type=lambda value: value.lower() in {"1", "true", "yes", "y"}, default=True,
                         help="include the existing 52-state FCE objective (true/false)")
     parser.add_argument("--balance-max-weight", type=float, default=10.0)
@@ -100,10 +117,40 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--smoke-batch-size", type=int, default=2)
     parser.add_argument("--batch-diagnostics", action="store_true")
     parser.add_argument(
-        "--validation-protocol", choices=("binary_head", "native52"),
+        "--validation-protocol", choices=(
+            "binary_head", "native52", "native52_category_nll", "paired_l1",
+        ),
         default="binary_head",
     )
+    parser.add_argument(
+        "--selection-metric", choices=("map", "mADM"), default="map",
+        help="validation metric used for checkpoint selection",
+    )
     return parser
+
+
+def apply_paper_preset(args: argparse.Namespace) -> None:
+    """Resolve one reproducible paper-style recipe before validation/training."""
+    if not args.paper_faithful:
+        return
+    args.clip_model = "ViT-B-32-quickgelu"
+    args.prompt_mode = "paper_binary"
+    args.training_objective = "paper_fce"
+    args.text_sampling = "multi"
+    args.multi_attributes = 3
+    args.batch_size = 32
+    args.contrastive_target = "diagonal"
+    args.loss = "focal_clip"
+    args.use_fce = True
+    args.unique_prompts = True
+    args.lambda_attr = 0.0
+    args.freeze_binary_head = True
+    args.validation_protocol = "paired_l1"
+    args.retrieval_scoring = "paired_l1"
+    args.selection_metric = "mADM"
+    # The paper specifies rotation/flip augmentation but not random resized
+    # crop; keep the CLIP evaluation geometry and avoid the extra crop policy.
+    args.augmentation = "paper_like"
 
 
 def validate_args(args: argparse.Namespace) -> None:
@@ -136,6 +183,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("at least one hybrid loss weight must be positive")
     if args.lambda_attr < 0:
         raise ValueError("lambda-attr cannot be negative")
+    if args.category_ce_weight < 0 or args.category_temperature <= 0:
+        raise ValueError("category-ce-weight must be non-negative and category-temperature positive")
+    if args.category_ce_mode == "combined" and args.category_ce_weight <= 0:
+        raise ValueError("combined Category CE requires a positive category-ce-weight")
     if args.balance_max_weight < 1:
         raise ValueError("balance-max-weight must be at least 1")
     if args.attribute_temperature is not None and args.attribute_temperature <= 0:
@@ -183,7 +234,24 @@ def run_smoke(args: argparse.Namespace) -> None:
             f"loss={float(output.loss.detach()):.6f}, backward=finite"
         )
         return
-    if args.text_sampling == "single":
+    if args.prompt_mode == "paper_binary":
+        from .datasets.attribute_prompts import ATTRIBUTE_PROMPTS, PaperAttributePromptMapper
+
+        mapper = PaperAttributePromptMapper(list(ATTRIBUTE_PROMPTS))
+        assert len(mapper.prompts) == 80
+        attribute_labels = torch.zeros(batch_size, 40, dtype=torch.float32, device=device)
+        rows = torch.arange(batch_size, device=device)
+        attribute_labels[rows, rows % 40] = 1
+        labels = mapper.encode(attribute_labels)
+        count = 1 if args.text_sampling == "single" else min(args.multi_attributes, 40)
+        selected_indices = [torch.nonzero(row, as_tuple=False).flatten()[:count] for row in labels]
+        texts = [mapper.prompts[int(index)] for row in selected_indices for index in row]
+        owners = [image for image, row in enumerate(selected_indices) for _ in row]
+        attributes = [int(index) for row in selected_indices for index in row]
+        selected = torch.zeros(len(texts), 80, dtype=torch.bool, device=device)
+        selected[torch.arange(len(texts), device=device), torch.tensor(attributes, device=device)] = True
+        text_owners = torch.tensor(owners, dtype=torch.long, device=device)
+    elif args.text_sampling == "single":
         texts = [f"a photo of person number {index}" for index in range(batch_size)]
         labels = torch.eye(batch_size, device=device)
         selected = torch.eye(batch_size, device=device, dtype=torch.bool)
@@ -234,6 +302,7 @@ def run_smoke(args: argparse.Namespace) -> None:
 
 
 def run(args: argparse.Namespace) -> None:
+    apply_paper_preset(args)
     validate_args(args)
     if args.mode == "smoke":
         run_smoke(args)
@@ -248,7 +317,14 @@ def run(args: argparse.Namespace) -> None:
     device = choose_device(args.device)
     model, payload = load_model(checkpoint, device)
     prompts_for_attributes(payload["attribute_names"])
-    if args.validation_protocol == "native52":
+    if args.validation_protocol == "native52_category_nll":
+        metrics = evaluate_native52_category_nll(
+            model, payload["attribute_names"], Path(args.data_root).resolve(),
+            build_eval_transform(args.image_size), device, args.eval_batch_size,
+            args.num_workers, args.amp, args.max_val_samples,
+            args.category_temperature,
+        )
+    elif args.validation_protocol == "native52":
         metrics = evaluate_native52(
             model, payload["attribute_names"], Path(args.data_root).resolve(),
             build_eval_transform(args.image_size), device, args.eval_batch_size,

@@ -105,6 +105,57 @@ def retrieval_metrics(distances: np.ndarray, gallery_ids: np.ndarray) -> tuple[f
     return rank1_hits / len(distances), float(np.mean(average_precisions))
 
 
+def official_retrieval_metrics(
+    distances: np.ndarray, queries: np.ndarray, gallery_labels: np.ndarray,
+    gallery_ids: np.ndarray,
+) -> dict[str, float]:
+    """Compute the UPAR Task-2 metrics, including the official mADM.
+
+    Exact equality of all attribute bits defines relevance.  ADM gives each
+    exact-match rank the normalized mean attribute agreement accumulated over
+    the ranked gallery.  ``kind='stable'`` preserves organizer tie order.
+    """
+    distances = np.asarray(distances, dtype=np.float32)
+    queries = np.asarray(queries, dtype=np.float32)
+    gallery_labels = np.asarray(gallery_labels, dtype=np.float32)
+    gallery_ids = np.asarray(gallery_ids, dtype=np.int64).reshape(-1)
+    if (
+        distances.ndim != 2 or queries.ndim != 2 or gallery_labels.ndim != 2
+        or distances.shape != (len(queries), len(gallery_labels))
+        or queries.shape[1] != gallery_labels.shape[1]
+        or len(gallery_ids) != len(gallery_labels)
+        or not np.isfinite(distances).all()
+    ):
+        raise ValueError("Invalid aligned retrieval arrays")
+    totals = {key: 0.0 for key in (
+        "mADM", "mAP", "Rank-1", "Rank-5", "Rank-10", "mINP",
+        "semantic_top1",
+    )}
+    for query_id, (query, row) in enumerate(zip(queries, distances)):
+        agreement = 1.0 - np.abs(gallery_labels - query).sum(axis=1) / gallery_labels.shape[1]
+        relevant = agreement == 1.0
+        count = int(relevant.sum())
+        if count == 0:
+            raise ValueError(f"Query {query_id} has no exact gallery match")
+        order = np.argsort(row, kind="stable")
+        positions = np.flatnonzero(relevant[order])
+        ranks = positions.astype(np.float64) + 1.0
+        mean, maximum = float(agreement.mean()), float(agreement.max())
+        if maximum == mean:
+            normalized = np.ones(len(agreement), dtype=np.float64)
+        else:
+            normalized = np.maximum(0.0, (agreement - mean) / (maximum - mean))
+        prefix = np.cumsum(normalized[order], dtype=np.float64)
+        totals["mADM"] += float(np.mean(prefix[positions] / ranks))
+        totals["mAP"] += float(np.mean(np.arange(1, count + 1) / ranks))
+        totals["Rank-1"] += float(ranks[0] <= 1)
+        totals["Rank-5"] += float(ranks[0] <= 5)
+        totals["Rank-10"] += float(ranks[0] <= 10)
+        totals["mINP"] += float(count / ranks[-1])
+        totals["semantic_top1"] += float(positions[0] == 0)
+    return {key: value / len(queries) for key, value in totals.items()}
+
+
 def _read_numeric_csv(path: Path) -> tuple[np.ndarray, list[str] | None]:
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         rows = [row for row in csv.reader(handle) if row and any(cell.strip() for cell in row)]

@@ -14,7 +14,7 @@ from upar.config import REPOSITORY_ROOT
 from upar.data import AnnotationTable, ImagePathDataset, find_annotation_file, read_gt_csv
 from upar.retrieval import (
     autocast, l1_attribute_distances, load_retrieval_annotations,
-    reorder_columns, retrieval_metrics,
+    official_retrieval_metrics, reorder_columns,
 )
 
 from ..datasets.attribute_prompts import CategoryPromptMapper, prompts_for_attributes
@@ -79,7 +79,8 @@ def evaluate_binary_head(model: Any, model_attribute_names: Sequence[str], data_
     logits = model.binary_logits_from_features(features.to(device)).float()
     probabilities = torch.sigmoid(logits).cpu().numpy().astype(np.float32, copy=False)
     distances = l1_attribute_distances(queries, probabilities, distance_chunk_size)
-    rank1, mean_ap = retrieval_metrics(distances, ids)
+    official = official_retrieval_metrics(distances, queries, labels, ids)
+    rank1, mean_ap = official["Rank-1"], official["mAP"]
     rank_k = {}
     for k in (5, 10):
         order = np.argsort(distances, axis=1, kind="stable")[:, :min(k, distances.shape[1])]
@@ -92,6 +93,7 @@ def evaluate_binary_head(model: Any, model_attribute_names: Sequence[str], data_
     return {
         "images": float(len(table.image_paths)), "queries": float(len(queries)),
         "rank1": rank1, "rank5": rank_k[5], "rank10": rank_k[10], "map": mean_ap,
+        "mADM": official["mADM"], "mINP": official["mINP"],
         "macro_auroc": float(np.nanmean([m["auroc"] for m in per_attribute])),
         "macro_ap": float(np.nanmean([m["ap"] for m in per_attribute])),
         "macro_f1": float(np.nanmean([m["f1"] for m in per_attribute])),
@@ -147,17 +149,86 @@ def evaluate_native52(
     )
     hard = hard_category_projection(gallery, state_features, mapper)
     distances = l1_attribute_distances(queries, probabilities, distance_chunk_size)
-    rank1, mean_ap = retrieval_metrics(distances, ids)
+    official = official_retrieval_metrics(distances, queries, labels, ids)
+    rank1, mean_ap = official["Rank-1"], official["mAP"]
     binary = [_binary_metric(labels[:, i], probabilities[:, i])
               for i in range(labels.shape[1])]
     result: dict[str, Any] = {
         "images": float(len(table.image_paths)), "queries": float(len(queries)),
         "rank1": rank1, "rank5": _rank_at_k(distances, ids, 5),
         "rank10": _rank_at_k(distances, ids, 10), "map": mean_ap,
+        "mADM": official["mADM"], "mINP": official["mINP"],
         "macro_auroc": float(np.nanmean([item["auroc"] for item in binary])),
         "macro_ap": float(np.nanmean([item["ap"] for item in binary])),
         "retrieval_scoring": "native52_soft_l1",
         "temperature": float(1.0 / inverse_temperature),
+    }
+    result.update(hard_prediction_metrics(labels, hard))
+    semantic = semantic_query_metrics(distances, ids, distance_chunk_size)
+    result["semantic_top1"] = semantic["semantic_query_top1"]
+    result["semantic_mean_rank"] = semantic["semantic_query_mean_rank"]
+    return result
+
+
+@torch.inference_mode()
+def evaluate_native52_category_nll(
+    model: Any, model_attribute_names: Sequence[str], data_root: Path,
+    transform: Any, device: torch.device, batch_size: int,
+    num_workers: int, amp: bool, max_val_samples: int | None = None,
+    attribute_temperature: float = 0.01, distance_chunk_size: int = 256,
+) -> dict[str, Any]:
+    """Evaluate the fixed Native52 category-local NLL retrieval protocol."""
+    if attribute_temperature <= 0:
+        raise ValueError("Category-NLL temperature must be positive")
+    # Deferred imports avoid the audit helpers' reverse dependency on this module.
+    from ..compare_inference import encode_texts, native_state_outputs
+    from ..evaluate_native52_hard import (
+        hard_category_projection, hard_prediction_metrics, semantic_query_metrics,
+    )
+    from ..native52_retrieval_ablation import category_nll, category_softmax
+
+    gt_path = find_annotation_file(data_root, "val")
+    table = read_gt_csv(gt_path)
+    if max_val_samples is not None:
+        count = min(max_val_samples, len(table.image_paths))
+        table = AnnotationTable(
+            table.image_paths[:count], table.labels[:count], table.attribute_names,
+        )
+        queries, ids = np.unique(table.labels, axis=0, return_inverse=True)
+        query_names = table.attribute_names
+    else:
+        queries, ids, query_names = load_retrieval_annotations(gt_path.parent, table)
+    queries = reorder_columns(queries, query_names, model_attribute_names)
+    labels = reorder_columns(table.labels, table.attribute_names, model_attribute_names)
+    gallery = encode_gallery(
+        model, table.image_paths, [data_root, gt_path.parent, REPOSITORY_ROOT],
+        transform, device, batch_size, num_workers, amp,
+    )
+    mapper = CategoryPromptMapper(model_attribute_names)
+    state_features = encode_texts(model, mapper.prompts, device, amp)
+    groups = [np.asarray(group, dtype=np.int64) for group in mapper.category_indices()]
+    raw_logits = (gallery.float() @ state_features.float().T).numpy()
+    probabilities52 = category_softmax(raw_logits / attribute_temperature, groups)
+    queries52 = mapper.encode(torch.from_numpy(queries).float()).numpy()
+    distances = category_nll(queries52, probabilities52, groups)
+    official = official_retrieval_metrics(distances, queries, labels, ids)
+    rank1, mean_ap = official["Rank-1"], official["mAP"]
+
+    probabilities40, _ = native_state_outputs(
+        gallery, state_features, mapper, 1.0 / attribute_temperature,
+    )
+    binary = [_binary_metric(labels[:, index], probabilities40[:, index])
+              for index in range(labels.shape[1])]
+    hard = hard_category_projection(gallery, state_features, mapper)
+    result: dict[str, Any] = {
+        "images": float(len(table.image_paths)), "queries": float(len(queries)),
+        "rank1": rank1, "rank5": _rank_at_k(distances, ids, 5),
+        "rank10": _rank_at_k(distances, ids, 10), "map": mean_ap,
+        "mADM": official["mADM"], "mINP": official["mINP"],
+        "macro_auroc": float(np.nanmean([item["auroc"] for item in binary])),
+        "macro_ap": float(np.nanmean([item["ap"] for item in binary])),
+        "retrieval_scoring": "native52_category_nll",
+        "temperature": float(attribute_temperature),
     }
     result.update(hard_prediction_metrics(labels, hard))
     semantic = semantic_query_metrics(distances, ids, distance_chunk_size)
@@ -250,6 +321,7 @@ def evaluate_abpr(model: Any, model_attribute_names: Sequence[str], data_root: P
         queries, ids, query_names = load_retrieval_annotations(gt_path.parent, table)
 
     queries = reorder_columns(queries, query_names, model_attribute_names)
+    labels = reorder_columns(table.labels, table.attribute_names, model_attribute_names)
     gallery = encode_gallery(
         model, table.image_paths, [data_root, gt_path.parent, REPOSITORY_ROOT],
         transform, device, batch_size, num_workers, amp,
@@ -275,15 +347,17 @@ def evaluate_abpr(model: Any, model_attribute_names: Sequence[str], data_root: P
     if distances.shape != (len(queries), len(table.image_paths)) or not np.isfinite(distances).all():
         raise RuntimeError(f"Invalid distance matrix: {distances.shape}")
 
-    # Reuse the repository's Task 2 implementation for Rank-1 and mAP.
-    rank1, mean_ap = retrieval_metrics(distances, ids)
+    official = official_retrieval_metrics(distances, queries, labels, ids)
     return {
         "images": float(len(table.image_paths)),
         "queries": float(len(queries)),
-        "rank1": rank1,
+        "rank1": official["Rank-1"],
         "rank5": _rank_at_k(distances, ids, 5),
         "rank10": _rank_at_k(distances, ids, 10),
-        "map": mean_ap,
+        "map": official["mAP"],
+        "mADM": official["mADM"],
+        "mINP": official["mINP"],
+        "semantic_top1": official["semantic_top1"],
         "retrieval_scoring": retrieval_scoring,
     }
 
@@ -300,4 +374,6 @@ def print_evaluation(metrics: dict[str, Any], checkpoint: str) -> None:
     print(f"Rank-5       : {100 * metrics['rank5']:.2f} %")
     print(f"Rank-10      : {100 * metrics['rank10']:.2f} %")
     print(f"mAP          : {100 * metrics['map']:.2f} %")
+    if "mADM" in metrics:
+        print(f"mADM         : {100 * metrics['mADM']:.2f} %")
     print("=" * 44)
