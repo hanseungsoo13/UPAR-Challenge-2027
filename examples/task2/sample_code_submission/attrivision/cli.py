@@ -53,9 +53,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rotation", type=float, default=10.0)
     parser.add_argument(
         "--augmentation",
-        choices=("current", "rrc_scale_050", "paper_like"),
+        choices=("current", "rrc_scale_050", "resize_pad_crop", "paper_like"),
         default="current",
-        help="training crop policy; rrc_scale_050 raises the minimum crop area from 8%% to 50%%",
+        help="training crop policy; resize_pad_crop uses full resize plus local translation",
     )
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
@@ -140,8 +140,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="binary_head",
     )
     parser.add_argument(
-        "--selection-metric", choices=("map", "mADM"), default="map",
-        help="validation metric used for checkpoint selection",
+        "--selection-metric", choices=("map", "mADM"), default="mADM",
+        help="validation metric used for checkpoint selection (official default: mADM)",
     )
     return parser
 
@@ -227,6 +227,10 @@ def run_smoke(args: argparse.Namespace) -> None:
     transform_names = [type(item).__name__ for item in transform.transforms]
     if args.augmentation == "paper_like" and "RandomResizedCrop" in transform_names:
         raise AssertionError("paper_like augmentation must not use RandomResizedCrop")
+    if args.augmentation == "resize_pad_crop" and transform_names[:3] != [
+        "Resize", "Pad", "RandomCrop",
+    ]:
+        raise AssertionError("resize_pad_crop must be Resize -> Pad -> RandomCrop")
     if args.training_objective == "task2_hybrid":
         semantic_count = batch_size + 2
         texts = [f"a photo of semantic state {index}" for index in range(semantic_count)]
@@ -340,21 +344,21 @@ def run(args: argparse.Namespace) -> None:
     if args.validation_protocol == "native52_category_nll":
         metrics = evaluate_native52_category_nll(
             model, payload["attribute_names"], Path(args.data_root).resolve(),
-            build_eval_transform(args.image_size), device, args.eval_batch_size,
+            build_eval_transform(args.image_size, args.augmentation), device, args.eval_batch_size,
             args.num_workers, args.amp, args.max_val_samples,
             args.category_temperature,
         )
     elif args.validation_protocol == "native52":
         metrics = evaluate_native52(
             model, payload["attribute_names"], Path(args.data_root).resolve(),
-            build_eval_transform(args.image_size), device, args.eval_batch_size,
+            build_eval_transform(args.image_size, args.augmentation), device, args.eval_batch_size,
             args.num_workers, args.amp, args.max_val_samples,
             args.attribute_temperature,
         )
     else:
         metrics = evaluate_abpr(
             model, payload["attribute_names"], Path(args.data_root).resolve(),
-            build_eval_transform(args.image_size), device, args.eval_batch_size,
+            build_eval_transform(args.image_size, args.augmentation), device, args.eval_batch_size,
             args.num_workers, args.amp, args.max_val_samples,
             payload.get("prompt_mode", "binary_positive"),
             args.retrieval_scoring, args.attribute_temperature,

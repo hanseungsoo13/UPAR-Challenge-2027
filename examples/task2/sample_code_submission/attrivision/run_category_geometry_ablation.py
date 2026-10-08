@@ -76,6 +76,7 @@ def configure(args: Any) -> Path:
     args.category_temperature = 0.01
     args.attribute_temperature = 0.01
     args.validation_protocol = "native52_category_nll"
+    args.selection_metric = "mADM"
     args.training_log_filename = "training_log.csv"
     args.batch_diagnostics = False
     validate_args(args)
@@ -132,14 +133,24 @@ def experiment_result(name: str) -> dict[str, Any] | None:
         epoch0 = json.load(handle)
     rows = evaluated_rows(output_dir)
     best_r1 = max(rows, key=lambda row: (row["rank1"], row["map"], -row["epoch"]))
+    madm_rows = [row for row in rows if "mADM" in row]
+    best_madm = (
+        max(madm_rows, key=lambda row: (row["mADM"], row["map"], -row["epoch"]))
+        if madm_rows else None
+    )
     best_map = max(rows, key=lambda row: (row["map"], row["rank1"], -row["epoch"]))
     return {
         "method": name,
         "objective": EXPERIMENTS[name]["objective"],
         "epoch0": epoch0,
         "best_r1": best_r1,
+        "best_mADM": best_madm,
         "best_map": best_map,
         "best_r1_delta_from_epoch0": best_r1["rank1"] - epoch0["rank1"],
+        "best_mADM_delta_from_epoch0": (
+            best_madm["mADM"] - epoch0["mADM"]
+            if best_madm is not None and "mADM" in epoch0 else None
+        ),
         "best_map_delta_from_epoch0": best_map["map"] - epoch0["map"],
     }
 
@@ -154,7 +165,7 @@ def print_and_save_summary() -> None:
         if result is None:
             print(f"{name} | - | - | - | - | - | - | - | - | -")
             continue
-        row = result["best_map"]
+        row = result["best_mADM"] or result["best_map"]
         print(
             f"{name} | {int(row['epoch'])} | {row['macro_auroc']:.6f} | "
             f"{row['instance_f1']:.6f} | {row['mean_hamming_error']:.6f} | "
@@ -165,11 +176,17 @@ def print_and_save_summary() -> None:
             label: row[key] for label, key in METRICS
         }})
         best_r1 = result["best_r1"]
+        best_madm = result["best_mADM"]
         best_map = result["best_map"]
         print(
             f"{name} best R1={best_r1['rank1']:.6f} at epoch {int(best_r1['epoch'])}, "
             f"delta(epoch0)={result['best_r1_delta_from_epoch0']:+.6f}"
         )
+        if best_madm is not None:
+            print(
+                f"{name} best mADM={best_madm['mADM']:.6f} at epoch {int(best_madm['epoch'])}, "
+                f"delta(epoch0)={result['best_mADM_delta_from_epoch0']:+.6f}"
+            )
         print(
             f"{name} best mAP={best_map['map']:.6f} at epoch {int(best_map['epoch'])}, "
             f"delta(epoch0)={result['best_map_delta_from_epoch0']:+.6f}"

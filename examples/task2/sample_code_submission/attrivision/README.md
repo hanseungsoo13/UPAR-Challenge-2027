@@ -25,6 +25,8 @@ ConvNeXt baseline은 상위 폴더에 그대로 유지된다.
 - 전체/vision/text trainable parameter와 epoch별 peak VRAM 기록
 - UPAR 2027 공식 mADM/mAP/Rank-1/5/10/mINP와 동일 ranking의 semantic top-1
 - `train.log`, `metrics.csv`, `checkpoint_best.pth`, `checkpoint_last.pth`, resume
+- 기본 checkpoint 선택 기준은 UPAR 공식 `mADM`이며, epoch 로그의 `best_score`와
+  `selection_metric`으로 선택 기준을 명시한다.
 - `--paper-faithful` one-shot preset for the WACV recipe: 80 positive/negative
   prompts, multi-attribute FCE, QuickGELU, paper-like augmentation, paired-L1
   inference, and checkpoint selection by the official UPAR mADM
@@ -171,6 +173,34 @@ CUDA_VISIBLE_DEVICES=6 python examples/task2/sample_code_submission/attrivision/
 결과는 `outputs/attrivision_ablation/A5/`에 저장되며, A3와의 차이는
 `outputs/attrivision_ablation/pairwise_differences.json`에서 확인할 수 있다.
 
+A6는 가장 기본적인 A0를 기준으로 ConvNeXt E3의 순서를 직접 모사한다. A0와 A6는
+training objective, sampling, target 등 모든 설정을 공유하고 crop 정책만 다르다.
+Attrivision의 square 입력 제약에 맞춰 전체 이미지를 먼저 `224×224`로 resize한 뒤,
+`Pad(10) → RandomCrop(224)`로 작은 translation만 허용한다. A6 validation은 전체
+이미지를 `Resize((224,224))`만 적용한다. A-series checkpoint는 공식 `mADM`이
+가장 높은 epoch를 best로 저장한다.
+
+```text
+Resize((224,224))
+→ Pad(10)
+→ RandomCrop((224,224))
+```
+
+```bash
+CUDA_VISIBLE_DEVICES=6 python examples/task2/sample_code_submission/attrivision/run_attrivision_ablation.py \
+  --experiment A6 \
+  --mode train_eval \
+  --device cuda:0 \
+  --output-root outputs/attrivision_ablation_mADM
+```
+
+이 실행의 결과는 `outputs/attrivision_ablation_mADM/A6/`에
+저장된다. 기존 결과를 보존하려면 `--output-root`를 새 경로로 지정하면 된다.
+기본 경로를 사용할 때 결과는 `outputs/attrivision_ablation/A0/`와
+`outputs/attrivision_ablation/A6/`에
+저장되며, 두 결과가 모두 있으면 `A6 - A0` 차이가
+`outputs/attrivision_ablation/pairwise_differences.json`에 기록된다.
+
 ### 재개
 
 ```bash
@@ -193,7 +223,7 @@ epoch다.
 | `--clip-model` | `ViT-B-32-quickgelu` | OpenAI weight와 activation이 일치하는 CLIP |
 | `--batch-size` | 128 | train image batch size |
 | `--learning-rate` | `1e-5` | AdamW learning rate |
-| `--augmentation` | `current` | `current`, `rrc_scale_050`, `paper_like` crop policy |
+| `--augmentation` | `current` | `current`, `rrc_scale_050`, `resize_pad_crop`, `paper_like` crop policy |
 | `--training-objective` | `task2_hybrid` | Task 2 hybrid 또는 논문식 `paper_fce` |
 | `--prototype-loss-weight` | `0.25` | 전체 semantic prototype focal loss 가중치 |
 | `--set-loss-weight` | `1.0` | attribute-set contrastive loss 가중치 |

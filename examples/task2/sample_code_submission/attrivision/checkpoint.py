@@ -67,6 +67,10 @@ def save_last(path: Path, model: AttriVision, attribute_names: Sequence[str], ep
         "scheduler": scheduler.state_dict(),
         "scaler": scaler.state_dict(),
         "best_map": float(best_map),
+        # Keep the historical key for resume compatibility; this value is the
+        # configured selection score (mADM by default), not necessarily mAP.
+        "best_score": float(best_map),
+        "selection_metric": training_config.get("selection_metric", "mADM"),
         "best_epoch": int(best_epoch),
         "stale_evaluations": int(stale_evaluations),
         "python_rng": random.getstate(),

@@ -386,7 +386,7 @@ def train(args: Any) -> Path:
         val_table = read_gt_csv(val_gt)
         val_dataset = AttriVisionDataset(
             val_table, [data_root, val_gt.parent, REPOSITORY_ROOT],
-            build_eval_transform(args.image_size), args.max_val_samples,
+            build_eval_transform(args.image_size, getattr(args, "augmentation", "current")), args.max_val_samples,
         )
         validation_fce_loader = DataLoader(
             val_dataset, batch_size=args.eval_batch_size, shuffle=False,
@@ -461,6 +461,7 @@ def train(args: Any) -> Path:
     best_map = -math.inf
     best_epoch = 0
     stale = 0
+    selection_key = getattr(args, "selection_metric", "mADM")
     start_epoch = 1
 
     if args.resume:
@@ -477,7 +478,16 @@ def train(args: Any) -> Path:
         if payload.get("training_config") != training_config:
             raise ValueError("Resume checkpoint training objective differs from current arguments")
         state = payload["training_state"]
-        best_map = float(state["best_map"])
+        previous_selection_metric = state.get(
+            "selection_metric",
+            payload.get("training_config", {}).get("selection_metric"),
+        )
+        if previous_selection_metric and previous_selection_metric != selection_key:
+            raise ValueError(
+                f"Resume checkpoint selected {previous_selection_metric!r}, "
+                f"but the current run selects {selection_key!r}; start a fresh output directory."
+            )
+        best_map = float(state.get("best_score", state["best_map"]))
         best_epoch = int(state["best_epoch"])
         stale = int(state["stale_evaluations"])
         start_epoch = int(payload["epoch"]) + 1
@@ -568,21 +578,21 @@ def train(args: Any) -> Path:
                 if getattr(args, "validation_protocol", "binary_head") == "native52_category_nll":
                     metrics = evaluate_native52_category_nll(
                         model, table.attribute_names, data_root,
-                        build_eval_transform(args.image_size), device,
+                        build_eval_transform(args.image_size, getattr(args, "augmentation", "current")), device,
                         args.eval_batch_size, args.num_workers, args.amp,
                         args.max_val_samples, getattr(args, "category_temperature", 0.01),
                     )
                 elif getattr(args, "validation_protocol", "binary_head") == "native52":
                     metrics = evaluate_native52(
                         model, table.attribute_names, data_root,
-                        build_eval_transform(args.image_size), device,
+                        build_eval_transform(args.image_size, getattr(args, "augmentation", "current")), device,
                         args.eval_batch_size, args.num_workers, args.amp,
                         args.max_val_samples, args.attribute_temperature,
                     )
                 elif getattr(args, "validation_protocol", "binary_head") == "paired_l1":
                     metrics = evaluate_abpr(
                         model, table.attribute_names, data_root,
-                        build_eval_transform(args.image_size), device,
+                        build_eval_transform(args.image_size, getattr(args, "augmentation", "current")), device,
                         args.eval_batch_size, args.num_workers, args.amp,
                         args.max_val_samples, args.prompt_mode,
                         "paired_l1", args.attribute_temperature,
@@ -590,7 +600,7 @@ def train(args: Any) -> Path:
                 else:
                     metrics = evaluate_binary_head(
                         model, table.attribute_names, data_root,
-                        build_eval_transform(args.image_size), device,
+                        build_eval_transform(args.image_size, getattr(args, "augmentation", "current")), device,
                         args.eval_batch_size, args.num_workers, args.amp,
                         args.max_val_samples,
                     )
@@ -599,8 +609,13 @@ def train(args: Any) -> Path:
                     metrics.update(evaluate_paper_fce(
                         model, validation_fce_loader, criterion, device, args.amp,
                     ))
-                selection_key = getattr(args, "selection_metric", "map")
-                current_score = float(metrics.get(selection_key, metrics["map"]))
+                if selection_key not in metrics:
+                    raise RuntimeError(
+                        f"Validation protocol {getattr(args, 'validation_protocol', 'unknown')!r} "
+                        f"did not produce the requested selection metric {selection_key!r}. "
+                        f"Available metrics: {sorted(metrics)}"
+                    )
+                current_score = float(metrics[selection_key])
                 if current_score > best_map:
                     best_map = current_score
                     best_epoch = epoch
@@ -655,6 +670,7 @@ def train(args: Any) -> Path:
                 "prototype_loss": losses.get("prototype", ""),
                 "set_loss": losses.get("set", ""),
                 "best_map": best_map, "best_epoch": best_epoch,
+                "best_score": best_map, "selection_metric": selection_key,
                 "stale_evaluations": stale, "elapsed_seconds": elapsed,
                 "train_batches": losses["train_batches"],
                 "average_batch_size": losses["average_batch_size"],

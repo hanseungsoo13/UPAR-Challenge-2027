@@ -1,4 +1,4 @@
-"""Run the controlled A0--A5 AttriVision training-formulation ablations."""
+"""Run the controlled A0--A6 AttriVision training-formulation ablations."""
 from __future__ import annotations
 
 import csv
@@ -26,6 +26,7 @@ EXPERIMENTS: dict[str, dict[str, str]] = {
     "A3": {"sampling": "multi", "target": "diagonal", "augmentation": "current"},
     "A4": {"sampling": "multi", "target": "diagonal", "augmentation": "paper_like"},
     "A5": {"sampling": "multi", "target": "diagonal", "augmentation": "rrc_scale_050"},
+    "A6": {"sampling": "single", "target": "multi_positive", "augmentation": "resize_pad_crop"},
 }
 ROOT_OUTPUT = Path("outputs/attrivision_ablation")
 TABLE_METRICS = (
@@ -40,12 +41,14 @@ PAIRWISE = (
     ("A3", "A1", "diagonal effect under multi"),
     ("A4", "A3", "augmentation effect"),
     ("A5", "A3", "minimum RRC area 50% vs 8%"),
+    ("A6", "A0", "full resize plus local translation vs A0 RRC"),
 )
 
 
 def _configure(args: Any) -> Path:
     spec = EXPERIMENTS[args.experiment]
-    output_dir = ROOT_OUTPUT / args.experiment
+    output_root = Path(getattr(args, "output_root", ROOT_OUTPUT))
+    output_dir = output_root / args.experiment
     args.output_dir = str(output_dir)
     args.text_sampling = spec["sampling"]
     args.multi_attributes = 3
@@ -59,6 +62,7 @@ def _configure(args: Any) -> Path:
     args.unique_prompts = False
     args.validation_protocol = "native52"
     args.retrieval_scoring = "paired_l1"  # documented intent; native52 evaluator is authoritative
+    args.selection_metric = "mADM"
     args.clip_model = "ViT-B-32-quickgelu"
     args.pretrained_tag = "openai"
     args.no_pretrained = False
@@ -78,18 +82,18 @@ def _write_json(path: Path, value: Any) -> None:
     temporary.replace(path)
 
 
-def _collect_summary() -> dict[str, dict[str, Any]]:
+def _collect_summary(output_root: Path = ROOT_OUTPUT) -> dict[str, dict[str, Any]]:
     rows: dict[str, dict[str, Any]] = {}
     for name, spec in EXPERIMENTS.items():
-        path = ROOT_OUTPUT / name / "validation_metrics.json"
+        path = output_root / name / "validation_metrics.json"
         if path.is_file():
             with path.open(encoding="utf-8") as handle:
                 rows[name] = {**spec, **json.load(handle)}
     return rows
 
 
-def print_and_save_summary() -> None:
-    rows = _collect_summary()
+def print_and_save_summary(output_root: Path = ROOT_OUTPUT) -> None:
+    rows = _collect_summary(output_root)
     headers = ["Experiment", "Sampling", "Target", "Aug", *[name for name, _ in TABLE_METRICS]]
     print("\n" + " | ".join(headers))
     print(" | ".join(["---"] * len(headers)))
@@ -100,7 +104,7 @@ def print_and_save_summary() -> None:
                               EXPERIMENTS[experiment]["target"],
                               EXPERIMENTS[experiment]["augmentation"], *(["-"] * len(TABLE_METRICS))]))
             continue
-        values = [f"{float(row[key]):.6f}" for _, key in TABLE_METRICS]
+        values = [f"{float(row[key]):.6f}" if key in row else "-" for _, key in TABLE_METRICS]
         print(" | ".join([experiment, row["sampling"], row["target"], row["augmentation"], *values]))
 
     differences: dict[str, dict[str, float]] = {}
@@ -113,31 +117,36 @@ def print_and_save_summary() -> None:
         delta = {
             name: float(rows[first][key]) - float(rows[second][key])
             for name, key in TABLE_METRICS
+            if key in rows[first] and key in rows[second]
         }
         differences[label] = delta
         print(f"{label}: " + ", ".join(f"{key}={value:+.6f}" for key, value in delta.items()))
 
-    ROOT_OUTPUT.mkdir(parents=True, exist_ok=True)
-    with (ROOT_OUTPUT / "comparison_table.csv").open("w", encoding="utf-8", newline="") as handle:
+    output_root.mkdir(parents=True, exist_ok=True)
+    with (output_root / "comparison_table.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=headers)
         writer.writeheader()
         for experiment, row in rows.items():
             writer.writerow({
                 "Experiment": experiment, "Sampling": row["sampling"],
                 "Target": row["target"], "Aug": row["augmentation"],
-                **{name: row[key] for name, key in TABLE_METRICS},
+                **{name: row.get(key, "") for name, key in TABLE_METRICS},
             })
-    _write_json(ROOT_OUTPUT / "pairwise_differences.json", differences)
+    _write_json(output_root / "pairwise_differences.json", differences)
 
 
 def main() -> None:
     parser = build_parser()
-    parser.description = "Controlled AttriVision A0--A5 training ablations"
+    parser.description = "Controlled AttriVision A0--A6 training ablations"
     parser.add_argument("--experiment", choices=tuple(EXPERIMENTS))
+    parser.add_argument(
+        "--output-root", default=str(ROOT_OUTPUT),
+        help="root directory for per-experiment outputs; the experiment name is appended",
+    )
     parser.add_argument("--summary-only", action="store_true")
     args = parser.parse_args()
     if args.summary_only:
-        print_and_save_summary()
+        print_and_save_summary(Path(args.output_root))
         return
     if args.experiment is None:
         parser.error("--experiment is required unless --summary-only is used")
@@ -162,7 +171,7 @@ def main() -> None:
     model, payload = load_model(checkpoint, device)
     metrics = evaluate_native52(
         model, payload["attribute_names"], Path(args.data_root).resolve(),
-        build_eval_transform(args.image_size), device, args.eval_batch_size,
+        build_eval_transform(args.image_size, args.augmentation), device, args.eval_batch_size,
         args.num_workers, args.amp, args.max_val_samples, args.attribute_temperature,
     )
     checkpoint_metrics = payload.get("metrics", {})
@@ -174,7 +183,7 @@ def main() -> None:
         "checkpoint_epoch": payload.get("epoch"),
     })
     _write_json(output_dir / "validation_metrics.json", metrics)
-    print_and_save_summary()
+    print_and_save_summary(Path(args.output_root))
 
 
 if __name__ == "__main__":
