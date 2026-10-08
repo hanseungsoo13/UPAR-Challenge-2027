@@ -15,6 +15,22 @@ from .modeling import UPARModel, WeightedBCELoss
 from .retrieval import infer_probabilities, l1_attribute_distances, load_retrieval_annotations, reorder_columns
 
 
+def apply_ablation(args: argparse.Namespace) -> None:
+    """Apply the reproducible E1-E3 ladder without changing other defaults."""
+    if args.ablation == "NONE":
+        return
+    # E1 is the common evaluation/checkpoint-selection anchor for the ladder.
+    args.selection_metric = "madm"
+    if args.ablation in {"E2", "E3"}:
+        args.image_size = 256
+        args.image_width = 128
+        args.resize_size = 256
+        args.resize_width = 128
+    if args.ablation == "E3":
+        # Keep AugMix unchanged so E3 isolates the spatial crop policy.
+        args.crop_policy = "reference"
+
+
 def run_smoke_tests(args: argparse.Namespace) -> None:
     set_seed(args.seed, deterministic=True)
     data_root = Path(args.data_root).resolve()
@@ -46,9 +62,10 @@ def run_smoke_tests(args: argparse.Namespace) -> None:
     if args.smoke_model:
         device = choose_device(args.device)
         model = UPARModel(dropout=args.dropout, pretrained=False).to(device).eval()
-        size = max(32, args.image_size)
+        height = max(32, args.image_size)
+        width = max(32, args.image_width or args.image_size)
         with torch.inference_mode():
-            output = model(torch.randn(1, 3, size, size, device=device))
+            output = model(torch.randn(1, 3, height, width, device=device))
         assert output.shape == (1, NUM_ATTRIBUTES)
     print(
         "Smoke tests passed: train/val CSV, [B,40] loss, [Q,40] queries, "
@@ -73,13 +90,24 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="CHECKPOINT",
         help="resume training from CHECKPOINT, or from OUTPUT_DIR/last.pth when omitted",
     )
+    parser.add_argument(
+        "--ablation",
+        type=str.upper,
+        choices=("NONE", "E1", "E2", "E3"),
+        default="NONE",
+        help="reproducible ablation preset: E1=mADM, E2=256x128, E3=reference crop",
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--eval-batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--image-size", type=int, default=224)
+    parser.add_argument("--image-width", type=int)
     parser.add_argument("--resize-size", type=int)
+    parser.add_argument("--resize-width", type=int)
+    parser.add_argument("--crop-policy", choices=("current", "reference"), default="current")
+    parser.add_argument("--augmix", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=5e-4)
     parser.add_argument("--dropout", type=float, default=0.7)
@@ -99,6 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--retrieval-interval", type=int, default=1)
     parser.add_argument("--query-chunk-size", type=int, default=256)
+    parser.add_argument("--selection-metric", choices=("map", "madm"), default="map")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--no-pretrained", action="store_true")
@@ -123,6 +152,18 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("num_workers cannot be negative")
     if args.resize_size is not None and args.resize_size < args.image_size:
         raise ValueError("resize_size must be at least image_size")
+    if args.image_width is not None and args.image_width <= 0:
+        raise ValueError("image_width must be positive")
+    if args.resize_width is not None and args.resize_width <= 0:
+        raise ValueError("resize_width must be positive")
+    if args.resize_width is not None and args.image_width is None:
+        raise ValueError("resize_width requires image_width")
+    if (
+        args.image_width is not None
+        and args.resize_width is not None
+        and args.resize_width < args.image_width
+    ):
+        raise ValueError("resize_width must be at least image_width")
     if args.max_train_samples is not None and args.max_train_samples <= 0:
         raise ValueError("max_train_samples must be positive")
     if args.max_val_samples is not None and args.max_val_samples <= 0:
@@ -135,6 +176,7 @@ def validate_args(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = build_parser().parse_args()
+    apply_ablation(args)
     validate_args(args)
     if args.mode == "smoke":
         run_smoke_tests(args)

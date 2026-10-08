@@ -94,19 +94,30 @@ def resolve_image_path(raw_path: str | Path, roots: Sequence[Path]) -> Path:
 
 
 def build_train_transform(config: PreprocessingConfig) -> transforms.Compose:
-    return transforms.Compose([
-        transforms.RandomResizedCrop(config.image_size),
-        transforms.RandomHorizontalFlip(),
-        transforms.AugMix(),
+    if config.crop_policy == "current":
+        spatial = [transforms.RandomResizedCrop(config.output_size)]
+    elif config.crop_policy == "reference":
+        spatial = [
+            transforms.Resize(config.output_size),
+            transforms.Pad(10),
+            transforms.RandomCrop(config.output_size),
+        ]
+    else:
+        raise ValueError(f"Unknown crop policy: {config.crop_policy}")
+    spatial.append(transforms.RandomHorizontalFlip())
+    if config.augmix:
+        spatial.append(transforms.AugMix())
+    spatial.extend([
         transforms.ToTensor(),
         transforms.Normalize(config.mean, config.std),
     ])
+    return transforms.Compose(spatial)
 
 
 def build_eval_transform(config: PreprocessingConfig) -> transforms.Compose:
     return transforms.Compose([
-        transforms.Resize(config.resize_size, antialias=True),
-        transforms.CenterCrop(config.image_size),
+        transforms.Resize(config.resize_output_size, antialias=True),
+        transforms.CenterCrop(config.output_size),
         transforms.ToTensor(),
         transforms.Normalize(config.mean, config.std),
     ])

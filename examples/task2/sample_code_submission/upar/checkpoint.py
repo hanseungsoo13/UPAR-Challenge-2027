@@ -63,6 +63,7 @@ def save_training_checkpoint(
     best_epoch: int,
     evaluations_without_improvement: int,
     dropout: float,
+    selection_metric: str = "map",
 ) -> None:
     """Save the latest model and all state needed for training continuation."""
     payload = {
@@ -82,6 +83,8 @@ def save_training_checkpoint(
             "scheduler_state_dict": scheduler.state_dict(),
             "scaler_state_dict": scaler.state_dict(),
             "best_map": float(best_map),
+            "best_score": float(best_map),
+            "selection_metric": selection_metric,
             "best_epoch": int(best_epoch),
             "evaluations_without_improvement": int(evaluations_without_improvement),
             "python_rng_state": random.getstate(),

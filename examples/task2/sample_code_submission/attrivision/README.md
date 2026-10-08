@@ -137,6 +137,19 @@ CUDA_VISIBLE_DEVICES=6 python examples/task2/sample_code_submission/attrivision/
 고정하는 것은 논문에서 확인되는 구조적 요소와 평가 protocol이며, 데이터셋 버전이
 UPAR 2024인지 현재 Challenge release인지에 따른 점수 차이는 별도로 남는다.
 
+attribute sampling 수 `K=3`은 논문에 공개된 값이 아니라 기존 재현 실험을 위한
+기본값이다. 논문의 미공개 K를 비교하려면 `--paper-multi-attributes K`를 사용한다.
+예를 들어 `K=40`은 모든 binary state를 사용하지만, batch 안의 동일 prompt가
+반복되어 diagonal loss의 false negative가 늘고 text encoder 메모리/시간도 크게
+증가한다. 따라서 이 비교에서는 `--paper-contrastive-target multi_positive`와 작은
+batch size를 함께 별도 실험하는 것이 안전하다.
+
+```bash
+--paper-multi-attributes 40 \
+--paper-contrastive-target multi_positive \
+--paper-batch-size 8
+```
+
 ### 재개
 
 ```bash

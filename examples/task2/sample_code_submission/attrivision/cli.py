@@ -57,6 +57,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--text-sampling", "--text_sampling", choices=("single", "multi"), default="single")
     parser.add_argument("--multi-attributes", type=int, default=3)
     parser.add_argument(
+        "--paper-multi-attributes", type=int,
+        help="override the paper preset's sampled-state count (the paper does not publish K)",
+    )
+    parser.add_argument(
+        "--paper-contrastive-target", choices=("diagonal", "multi_positive"),
+        help="override the paper preset target for K-sampling ablations",
+    )
+    parser.add_argument(
+        "--paper-batch-size", type=int,
+        help="override the paper preset batch size (default: 32)",
+    )
+    parser.add_argument(
         "--prompt-mode", choices=("category_complete", "binary_positive", "paper_binary"),
         default="category_complete",
         help="12-category states, positive-only attributes, or paper-style positive/negative binary states",
@@ -137,9 +149,12 @@ def apply_paper_preset(args: argparse.Namespace) -> None:
     args.prompt_mode = "paper_binary"
     args.training_objective = "paper_fce"
     args.text_sampling = "multi"
-    args.multi_attributes = 3
-    args.batch_size = 32
-    args.contrastive_target = "diagonal"
+    args.multi_attributes = (
+        args.paper_multi_attributes
+        if args.paper_multi_attributes is not None else 3
+    )
+    args.batch_size = args.paper_batch_size if args.paper_batch_size is not None else 32
+    args.contrastive_target = args.paper_contrastive_target or "diagonal"
     args.loss = "focal_clip"
     args.use_fce = True
     args.unique_prompts = True

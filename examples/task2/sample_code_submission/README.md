@@ -31,6 +31,43 @@ CUDA_VISIBLE_DEVICES=4 python examples/task2/sample_code_submission/run.py \
 기본 설정은 최대 100 epoch, batch size 64이며 validation mAP가 12회 연속
 개선되지 않으면 조기 종료한다.
 
+## 1.1 ConvNeXt ablation ladder
+
+링크 baseline과의 차이를 하나씩 확인하려면 같은 seed와 데이터로 다음 preset을
+순서대로 실행한다. 각 preset은 이전 output을 resume하지 않으며, 독립적인
+`--output-dir`를 사용해야 한다.
+
+```bash
+# E1: official mADM으로 checkpoint 선택 및 평가
+python examples/task2/sample_code_submission/run.py \
+  --mode train_eval --ablation E1 \
+  --output-dir outputs/ablation-E1
+
+# E2: E1 + 256x128 입력, 기존 RandomResizedCrop 유지
+python examples/task2/sample_code_submission/run.py \
+  --mode train_eval --ablation E2 \
+  --output-dir outputs/ablation-E2
+
+# E3: E2 + Resize -> Pad(10) -> RandomCrop spatial policy
+python examples/task2/sample_code_submission/run.py \
+  --mode train_eval --ablation E3 \
+  --output-dir outputs/ablation-E3
+```
+
+E1은 `selection_metric=madm`을 공통 anchor로 만든다. E2는 `256x128`만
+변경하고, E3는 그 입력 크기에서 spatial crop policy만 바꾼다. E3에서도
+AugMix는 유지하므로 crop policy의 효과를 분리해서 볼 수 있다. 각 run의
+`metrics.csv`와 `train.log`에는 Rank-1, mAP, mADM이 함께 기록된다.
+
+기존 checkpoint를 official metric으로 다시 확인할 때는 학습 없이 다음처럼
+실행할 수 있다.
+
+```bash
+python examples/task2/sample_code_submission/run.py \
+  --mode eval --ablation E1 \
+  --checkpoint outputs/task2_baseline/best.pth
+```
+
 ## 2. 필요한 데이터 구조
 
 `--data-root`의 기본값은 저장소의 `data/` 디렉터리다. 최소한 다음 annotation
@@ -148,8 +185,8 @@ outputs/task2_baseline/
 
 - `train.log`: 학습 중 터미널에 표시되는 설정과 epoch 메시지를 기록한다.
 - `metrics.csv`: 완료된 모든 epoch의 loss, learning rate, 원본/EMA Rank-1과
-  mAP, 최고 epoch, early-stopping counter와 소요 시간을 기록한다.
-- `best.pth`: validation mAP가 개선될 때만 교체되는 추론·제출용 모델이다.
+  mAP/mADM, 최고 epoch, 선택 metric, early-stopping counter와 소요 시간을 기록한다.
+- `best.pth`: 선택한 validation metric이 개선될 때만 교체되는 추론·제출용 모델이다.
 - `last.pth`: 매 epoch 교체되며 모델, EMA, optimizer, scheduler, AMP scaler,
   난수 상태와 early-stopping 상태를 포함한다.
 

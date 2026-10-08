@@ -31,14 +31,34 @@ NUM_ATTRIBUTES = 40
 class PreprocessingConfig:
     image_size: int = 224
     resize_size: int = 232
+    image_width: int | None = None
+    resize_width: int | None = None
+    crop_policy: str = "current"
+    augmix: bool = True
     mean: tuple[float, float, float] = IMAGENET_MEAN
     std: tuple[float, float, float] = IMAGENET_STD
+
+    @property
+    def output_size(self) -> int | tuple[int, int]:
+        """Return the model input size, preserving legacy square configs."""
+        return self.image_size if self.image_width is None else (self.image_size, self.image_width)
+
+    @property
+    def resize_output_size(self) -> int | tuple[int, int]:
+        """Return the evaluation resize size, preserving legacy behavior."""
+        if self.image_width is None and self.resize_width is None:
+            return self.resize_size
+        return (self.resize_size, self.resize_width or self.image_width)
 
     @classmethod
     def from_dict(cls, values: dict) -> "PreprocessingConfig":
         return cls(
             image_size=int(values["image_size"]),
             resize_size=int(values["resize_size"]),
+            image_width=(int(values["image_width"]) if values.get("image_width") is not None else None),
+            resize_width=(int(values["resize_width"]) if values.get("resize_width") is not None else None),
+            crop_policy=str(values.get("crop_policy", "current")),
+            augmix=bool(values.get("augmix", True)),
             mean=tuple(values.get("mean", IMAGENET_MEAN)),
             std=tuple(values.get("std", IMAGENET_STD)),
         )
