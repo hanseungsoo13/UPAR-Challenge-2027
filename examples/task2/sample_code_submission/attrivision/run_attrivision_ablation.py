@@ -1,4 +1,4 @@
-"""Run the controlled A0--A4 AttriVision training-formulation ablations."""
+"""Run the controlled A0--A5 AttriVision training-formulation ablations."""
 from __future__ import annotations
 
 import csv
@@ -25,6 +25,7 @@ EXPERIMENTS: dict[str, dict[str, str]] = {
     "A2": {"sampling": "single", "target": "diagonal", "augmentation": "current"},
     "A3": {"sampling": "multi", "target": "diagonal", "augmentation": "current"},
     "A4": {"sampling": "multi", "target": "diagonal", "augmentation": "paper_like"},
+    "A5": {"sampling": "multi", "target": "diagonal", "augmentation": "rrc_scale_050"},
 }
 ROOT_OUTPUT = Path("outputs/attrivision_ablation")
 TABLE_METRICS = (
@@ -38,6 +39,7 @@ PAIRWISE = (
     ("A3", "A2", "multiple attribute effect under diagonal"),
     ("A3", "A1", "diagonal effect under multi"),
     ("A4", "A3", "augmentation effect"),
+    ("A5", "A3", "minimum RRC area 50% vs 8%"),
 )
 
 
@@ -130,7 +132,7 @@ def print_and_save_summary() -> None:
 
 def main() -> None:
     parser = build_parser()
-    parser.description = "Controlled AttriVision A0--A4 training ablations"
+    parser.description = "Controlled AttriVision A0--A5 training ablations"
     parser.add_argument("--experiment", choices=tuple(EXPERIMENTS))
     parser.add_argument("--summary-only", action="store_true")
     args = parser.parse_args()

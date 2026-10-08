@@ -150,6 +150,27 @@ batch size를 함께 별도 실험하는 것이 안전하다.
 --paper-batch-size 8
 ```
 
+### Crop ablation
+
+ConvNeXt E3의 강한 crop을 완화하는 효과를 Attrivision에서 확인하려면 A5를
+실행한다. A5는 A3와 동일한 multi-sampling/diagonal target 설정을 유지하고,
+학습 crop만 다음처럼 바꾼다.
+
+```text
+RandomResizedCrop(224, scale=(0.08, 1.0))
+→ RandomResizedCrop(224, scale=(0.5, 1.0))
+```
+
+```bash
+CUDA_VISIBLE_DEVICES=6 python examples/task2/sample_code_submission/attrivision/run_attrivision_ablation.py \
+  --experiment A5 \
+  --mode train_eval \
+  --device cuda:0
+```
+
+결과는 `outputs/attrivision_ablation/A5/`에 저장되며, A3와의 차이는
+`outputs/attrivision_ablation/pairwise_differences.json`에서 확인할 수 있다.
+
 ### 재개
 
 ```bash
@@ -172,6 +193,7 @@ epoch다.
 | `--clip-model` | `ViT-B-32-quickgelu` | OpenAI weight와 activation이 일치하는 CLIP |
 | `--batch-size` | 128 | train image batch size |
 | `--learning-rate` | `1e-5` | AdamW learning rate |
+| `--augmentation` | `current` | `current`, `rrc_scale_050`, `paper_like` crop policy |
 | `--training-objective` | `task2_hybrid` | Task 2 hybrid 또는 논문식 `paper_fce` |
 | `--prototype-loss-weight` | `0.25` | 전체 semantic prototype focal loss 가중치 |
 | `--set-loss-weight` | `1.0` | attribute-set contrastive loss 가중치 |

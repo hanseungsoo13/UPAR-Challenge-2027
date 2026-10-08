@@ -16,6 +16,10 @@ def build_train_transform(
         spatial = transforms.RandomResizedCrop(
             image_size, scale=(0.08, 1.0), interpolation=InterpolationMode.BICUBIC,
         )
+    elif augmentation == "rrc_scale_050":
+        spatial = transforms.RandomResizedCrop(
+            image_size, scale=(0.5, 1.0), interpolation=InterpolationMode.BICUBIC,
+        )
     elif augmentation == "paper_like":
         spatial = transforms.Compose([
             transforms.Resize(image_size, interpolation=InterpolationMode.BICUBIC, antialias=True),

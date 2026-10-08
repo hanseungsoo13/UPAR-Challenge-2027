@@ -51,7 +51,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--rotation", type=float, default=10.0)
-    parser.add_argument("--augmentation", choices=("current", "paper_like"), default="current")
+    parser.add_argument(
+        "--augmentation",
+        choices=("current", "rrc_scale_050", "paper_like"),
+        default="current",
+        help="training crop policy; rrc_scale_050 raises the minimum crop area from 8%% to 50%%",
+    )
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument("--text-sampling", "--text_sampling", choices=("single", "multi"), default="single")
