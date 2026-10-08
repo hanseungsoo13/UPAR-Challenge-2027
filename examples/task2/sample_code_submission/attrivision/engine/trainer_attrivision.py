@@ -78,6 +78,23 @@ def _finish_epoch_totals(totals: dict[str, float], device: torch.device) -> dict
     return result
 
 
+def _optimizer_step(
+    scaler: Any, optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+) -> None:
+    """Advance the LR schedule only when GradScaler applied the update.
+
+    With AMP, GradScaler can skip an optimizer update after an overflow. Calling
+    ``scheduler.step`` for that skipped batch triggers PyTorch's misleading
+    "scheduler.step before optimizer.step" warning and consumes the first LR.
+    """
+    previous_scale = float(scaler.get_scale())
+    scaler.step(optimizer)
+    scaler.update()
+    if float(scaler.get_scale()) >= previous_scale:
+        scheduler.step()
+
+
 def train_one_epoch_paper(
     model: AttriVision, loader: DataLoader, optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
@@ -149,9 +166,7 @@ def train_one_epoch_paper(
         scaler.unscale_(optimizer)
         if grad_clip > 0:
             nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
-        scheduler.step()
+        _optimizer_step(scaler, optimizer, scheduler)
         count = len(images)
         totals["loss"] += float(total.detach()) * count
         totals["fce"] += float(fce.detach()) * count
@@ -223,9 +238,7 @@ def train_one_epoch_hybrid(
         scaler.unscale_(optimizer)
         if grad_clip > 0:
             nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
-        scheduler.step()
+        _optimizer_step(scaler, optimizer, scheduler)
         count = len(images)
         totals["loss"] += float(total.detach()) * count
         totals["fce"] += float(output.loss.detach()) * count
@@ -258,7 +271,7 @@ def train_one_epoch_binary(
         scaler.unscale_(optimizer)
         if grad_clip > 0:
             nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        scaler.step(optimizer); scaler.update(); scheduler.step()
+        _optimizer_step(scaler, optimizer, scheduler)
         count = len(images)
         totals["loss"] += float(loss.detach()) * count
         totals["bce"] += float(loss.detach()) * count
@@ -616,7 +629,8 @@ def train(args: Any) -> Path:
                 + (f"prototype={losses['prototype']:.6f}, set={losses['set']:.6f}, "
                    if args.training_objective == "task2_hybrid" else "")
                 + f"i2t={losses['i2t']:.6f}, t2i={losses['t2i']:.6f}, lr={lr:.3e}"
-                + (f", AUROC={metrics['macro_auroc']:.4f}, AP={metrics['macro_ap']:.4f}, "
+                + (f", AUROC={metrics.get('macro_auroc', float('nan')):.4f}, "
+                   f"AP={metrics.get('macro_ap', float('nan')):.4f}, "
                    f"F1={metrics.get('instance_f1', metrics.get('macro_f1', float('nan'))):.4f}, "
                    f"BitErr={metrics.get('mean_hamming_error', float('nan')):.3f}, "
                    f"Exact={100 * metrics.get('exact_match', float('nan')):.2f}%, "

@@ -348,7 +348,7 @@ def evaluate_abpr(model: Any, model_attribute_names: Sequence[str], data_root: P
         raise RuntimeError(f"Invalid distance matrix: {distances.shape}")
 
     official = official_retrieval_metrics(distances, queries, labels, ids)
-    return {
+    result: dict[str, Any] = {
         "images": float(len(table.image_paths)),
         "queries": float(len(queries)),
         "rank1": official["Rank-1"],
@@ -360,6 +360,17 @@ def evaluate_abpr(model: Any, model_attribute_names: Sequence[str], data_root: P
         "semantic_top1": official["semantic_top1"],
         "retrieval_scoring": retrieval_scoring,
     }
+    if retrieval_scoring == "paired_l1":
+        per_attribute = [
+            _binary_metric(labels[:, index], probabilities[:, index])
+            for index in range(labels.shape[1])
+        ]
+        result.update({
+            "macro_auroc": float(np.nanmean([item["auroc"] for item in per_attribute])),
+            "macro_ap": float(np.nanmean([item["ap"] for item in per_attribute])),
+            "macro_f1": float(np.nanmean([item["f1"] for item in per_attribute])),
+        })
+    return result
 
 
 def print_evaluation(metrics: dict[str, Any], checkpoint: str) -> None:
