@@ -90,10 +90,13 @@ def main() -> None:
     args.use_fce = True
     args.lambda_attr = 0.0
     args.category_ce_mode = "off"
-    args.validation_protocol = "mixed_state_nll"
+    # Use the same Native52 Category-NLL protocol as A7 for fair comparison
+    # and checkpoint selection.  Mixed training changes supervision, not the
+    # official retrieval/ranking protocol.
+    args.validation_protocol = "native52_category_nll"
     args.category_temperature = 0.01
     args.selection_metric = "mADM"
-    args.retrieval_scoring = "cosine_set"
+    args.retrieval_scoring = "paired_l1"
     args.paper_faithful = False
     args.prototype_loss_weight = spec["prototype_weight"]
     args.set_loss_weight = spec["set_weight"]

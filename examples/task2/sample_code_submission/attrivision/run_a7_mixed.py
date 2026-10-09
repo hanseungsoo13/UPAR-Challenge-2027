@@ -36,10 +36,14 @@ def main() -> None:
     args.mixed_set_positive = "exact"
     args.mixed_min_shared_categories = 8
     args.mixed_set_beta = 4.0
-    args.validation_protocol = "mixed_state_nll"
+    # Keep A7's agreed checkpoint-selection/evaluation protocol.  The training
+    # ontology is mixed 50-state, but Native52 Category-NLL can still encode
+    # the 52 query prompts at inference time and is the only fair comparison
+    # against the existing A7 result.
+    args.validation_protocol = "native52_category_nll"
     args.category_temperature = 0.01
     args.selection_metric = "mADM"
-    args.retrieval_scoring = "cosine_set"
+    args.retrieval_scoring = "paired_l1"
     args.paper_faithful = False
 
     # Keep output paths explicit in logs/checkpoints even when this wrapper is

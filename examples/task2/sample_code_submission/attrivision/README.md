@@ -240,7 +240,10 @@ annotation의 실제 cardinality에 맞춰 50개 state를 사용한다. Age/Gend
 type에는 class-balanced multi-label BCE를 적용한다. `age_unknown`, `hair_other`,
 `lower_type_other`, `glasses_none`은 유지하고, Task 2 train/val에서 positive가
 없는 두 색상 `unspecified` state는 제거한다. 학습과 평가는 동일한 mixed-state
-query/gallery NLL을 사용한다.
+supervision을 사용하지만, checkpoint 선택과 retrieval 비교는 기존 A7과 동일한
+Native52 Category-NLL protocol을 사용한다. 50-state mixed checkpoint도 inference
+시점에는 기존 52개 Native prompt를 다시 encode할 수 있으므로 A7과 직접 비교할 수
+있다.
 
 기존 A7 checkpoint를 덮어쓰지 않도록 별도 output directory에 저장한다.
 
@@ -263,14 +266,15 @@ CUDA_VISIBLE_DEVICES=6 python examples/task2/sample_code_submission/attrivision/
 결과물은 `checkpoint_best.pth`, `checkpoint_last.pth`, `metrics.csv`, `train.log`,
 `validation_metrics.json`으로 `outputs/attrivision_ablation_mixed/A7-mixed/`에
 생성된다. 주요 설정은 checkpoint metadata의 `prompt_mode=mixed_category`,
-`training_objective=a7_mixed`, `validation_protocol=mixed_state_nll`에서 확인할 수
-있다.
+`training_objective=a7_mixed`, `validation_protocol=native52_category_nll`에서
+확인할 수 있다. `mixed_state_nll`은 mixed-state scoring을 별도로 진단할 때만
+사용한다.
 
 ### A7-mixed ablation
 
 초기 Rank-1 하락 원인을 분리하기 위해 A7과 동일한 pretrained model, crop, batch,
-learning-rate를 유지한 loss ablation을 제공한다. mixed-state evaluator는 각
-category 내부의 state 수까지 평균해 12개 category가 같은 비중을 갖도록 한다.
+learning-rate, Native52 Category-NLL validation을 유지한 loss ablation을 제공한다.
+Mixed-state NLL은 별도 진단용이며 M0–M5의 공식 checkpoint 선택에는 사용하지 않는다.
 
 | 실험 | prototype | set | set positive |
 | --- | ---: | ---: | --- |
