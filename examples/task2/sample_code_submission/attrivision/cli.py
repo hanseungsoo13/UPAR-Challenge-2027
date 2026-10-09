@@ -95,12 +95,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="penalty for residual 'other' and known-state co-activation",
     )
     parser.add_argument(
-        "--mixed-set-positive", choices=("exact", "category_overlap"), default="exact",
-        help="A7-mixed set positives: exact full state row or shared-category threshold",
+        "--mixed-set-positive",
+        choices=("exact", "category_overlap", "soft_category", "soft_raw40"),
+        default="exact",
+        help="A7-mixed set positive/soft-target definition",
     )
     parser.add_argument(
         "--mixed-min-shared-categories", type=int, default=8,
         help="minimum shared categories for category_overlap set positives",
+    )
+    parser.add_argument(
+        "--mixed-set-beta", type=float, default=4.0,
+        help="agreement softmax sharpness for A7-mixed soft set targets",
     )
     parser.add_argument("--lambda-attr", type=float, default=1.0)
     parser.add_argument(
@@ -222,6 +228,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("mixed-consistency-weight cannot be negative")
     if not 1 <= args.mixed_min_shared_categories <= 12:
         raise ValueError("mixed-min-shared-categories must be between 1 and 12")
+    if args.mixed_set_beta <= 0:
+        raise ValueError("mixed-set-beta must be positive")
     if args.lambda_attr < 0:
         raise ValueError("lambda-attr cannot be negative")
     if args.category_ce_weight < 0 or args.category_temperature <= 0:
@@ -269,11 +277,19 @@ def run_smoke(args: argparse.Namespace) -> None:
             args.mixed_consistency_weight,
             args.mixed_set_positive,
             min(args.mixed_min_shared_categories, 2),
+            args.mixed_set_beta,
         ).to(device)
         model.train()
         image_features = model.encode_image(images)
         text_features = model.encode_text(tokens)
-        output = criterion(image_features, text_features, labels, model.logit_scale)
+        binary_smoke_labels = (
+            torch.randint(0, 2, (batch_size, 40), device=device, dtype=torch.bool)
+            if args.mixed_set_positive == "soft_raw40" else None
+        )
+        output = criterion(
+            image_features, text_features, labels, model.logit_scale,
+            binary_smoke_labels,
+        )
         output.loss.backward()
         assert image_features.shape == (batch_size, 512)
         assert text_features.shape == (semantic_count, 512)

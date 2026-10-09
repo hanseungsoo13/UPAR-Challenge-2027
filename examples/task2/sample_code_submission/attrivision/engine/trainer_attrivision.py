@@ -281,6 +281,7 @@ def train_one_epoch_mixed(
             text_features = model.encode_text(prototype_tokens)
             output = criterion(
                 image_features, text_features, semantic_labels, model.logit_scale,
+                labels.float(),
             )
         scaler.scale(output.loss).backward()
         scaler.unscale_(optimizer)
@@ -461,6 +462,7 @@ def train(args: Any) -> Path:
             getattr(args, "mixed_consistency_weight", 0.1),
             getattr(args, "mixed_set_positive", "exact"),
             getattr(args, "mixed_min_shared_categories", 8),
+            getattr(args, "mixed_set_beta", 4.0),
         ).to(device)
     elif args.use_fce and args.training_objective == "task2_hybrid":
         criterion = Task2HybridLoss(
@@ -498,6 +500,7 @@ def train(args: Any) -> Path:
         "mixed_consistency_weight": getattr(args, "mixed_consistency_weight", 0.1),
         "mixed_set_positive": getattr(args, "mixed_set_positive", "exact"),
         "mixed_min_shared_categories": getattr(args, "mixed_min_shared_categories", 8),
+        "mixed_set_beta": getattr(args, "mixed_set_beta", 4.0),
         "balance_max_weight": args.balance_max_weight,
         "use_fce": args.use_fce,
         "lambda_attr": args.lambda_attr,
@@ -616,7 +619,8 @@ def train(args: Any) -> Path:
             f"set_weight={args.set_loss_weight:g}, "
             f"consistency_weight={getattr(args, 'mixed_consistency_weight', 0.1):g}, "
             f"set_positive={getattr(args, 'mixed_set_positive', 'exact')}, "
-            f"min_shared_categories={getattr(args, 'mixed_min_shared_categories', 8)}"
+            f"min_shared_categories={getattr(args, 'mixed_min_shared_categories', 8)}, "
+            f"set_beta={getattr(args, 'mixed_set_beta', 4.0):g}"
         )
     try:
         for epoch in range(start_epoch, args.epochs + 1):

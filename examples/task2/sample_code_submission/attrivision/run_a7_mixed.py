@@ -33,6 +33,9 @@ def main() -> None:
     args.use_fce = True
     args.lambda_attr = 0.0
     args.category_ce_mode = "off"
+    args.mixed_set_positive = "exact"
+    args.mixed_min_shared_categories = 8
+    args.mixed_set_beta = 4.0
     args.validation_protocol = "mixed_state_nll"
     args.category_temperature = 0.01
     args.selection_metric = "mADM"

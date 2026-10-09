@@ -278,6 +278,8 @@ category 내부의 state 수까지 평균해 12개 category가 같은 비중을 
 | M1 | 1.00 | 0.00 | set loss 제거 |
 | M2 | 1.00 | 0.25 | exact full state row |
 | M3 | 1.00 | 0.25 | 12개 category 중 8개 이상 공유 |
+| M4 | 1.00 | 0.25 | soft category agreement, beta=1.3 |
+| M5 | 1.00 | 0.25 | soft 40-bit agreement, beta=4.0 |
 
 한 번에 하나씩 실행한다.
 
@@ -291,7 +293,8 @@ CUDA_VISIBLE_DEVICES=6 python examples/task2/sample_code_submission/attrivision/
 
 `M1`이 회복되고 `M0`/`M2`가 낮으면 exact-set contrastive 항이 문제일 가능성이
 높다. `M3`는 동일한 full row가 드문 문제를 category-overlap positive로 완화하는
-실험이다. 각 실험의 resolved loss와 positive 설정은 `config.json` 및 `train.log`에
+실험이고, `M4`/`M5`는 hard positive 대신 agreement-weighted target distribution을
+사용한다. 각 실험의 resolved loss와 positive 설정은 `config.json` 및 `train.log`에
 기록된다.
 
 ### 재개
@@ -322,6 +325,7 @@ epoch다.
 | `--set-loss-weight` | `1.0` | attribute-set contrastive loss 가중치 |
 | `--mixed-set-positive` | `exact` | A7-mixed set positive 정의 |
 | `--mixed-min-shared-categories` | `8` | `category_overlap`의 최소 공유 category 수 |
+| `--mixed-set-beta` | `4.0` | soft agreement target의 sharpness |
 | `--balance-max-weight` | `10.0` | 희소 state class-balance weight 상한 |
 | `--loss` | `focal_clip` | `clip` 또는 `focal_clip` |
 | `--focal-alpha` | `1.0` | FCE alpha |

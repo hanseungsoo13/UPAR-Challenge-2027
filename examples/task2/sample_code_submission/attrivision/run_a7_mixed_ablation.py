@@ -22,6 +22,7 @@ EXPERIMENTS = {
         "set_weight": 1.0,
         "set_positive": "exact",
         "min_shared_categories": 8,
+        "beta": 4.0,
     },
     # Direct category supervision only.  This isolates whether the exact-set
     # contrastive term is responsible for the early retrieval drop.
@@ -30,6 +31,7 @@ EXPERIMENTS = {
         "set_weight": 0.0,
         "set_positive": "exact",
         "min_shared_categories": 8,
+        "beta": 4.0,
     },
     # Keep set contrastive as a regularizer, but make CE/BCE the primary term.
     "M2": {
@@ -37,6 +39,7 @@ EXPERIMENTS = {
         "set_weight": 0.25,
         "set_positive": "exact",
         "min_shared_categories": 8,
+        "beta": 4.0,
     },
     # Test whether a less sparse positive mask helps.  A pair is positive when
     # it shares at least eight of the twelve semantic categories.
@@ -45,6 +48,26 @@ EXPERIMENTS = {
         "set_weight": 0.25,
         "set_positive": "category_overlap",
         "min_shared_categories": 8,
+        "beta": 4.0,
+    },
+    # Soft category-balanced agreement.  beta=1.3 gives a one-category
+    # mismatch roughly 0.9x the weight of an exact match before rowwise
+    # normalization.
+    "M4": {
+        "prototype_weight": 1.0,
+        "set_weight": 0.25,
+        "set_positive": "soft_category",
+        "min_shared_categories": 8,
+        "beta": 1.3,
+    },
+    # Soft official 40-bit agreement.  beta=4.0 makes one and five changed
+    # bits approximately 0.9x and 0.6x an exact match before normalization.
+    "M5": {
+        "prototype_weight": 1.0,
+        "set_weight": 0.25,
+        "set_positive": "soft_raw40",
+        "min_shared_categories": 8,
+        "beta": 4.0,
     },
 }
 
@@ -76,6 +99,7 @@ def main() -> None:
     args.set_loss_weight = spec["set_weight"]
     args.mixed_set_positive = spec["set_positive"]
     args.mixed_min_shared_categories = spec["min_shared_categories"]
+    args.mixed_set_beta = spec["beta"]
     args.mixed_ablation = args.experiment
 
     run(args)

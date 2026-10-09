@@ -11,6 +11,25 @@ import torch.nn.functional as F
 from .focal_clip_loss import _directional_loss
 
 
+def _soft_directional_loss(
+    logits: torch.Tensor,
+    target_distribution: torch.Tensor,
+    focal: bool,
+    alpha: float,
+    gamma: float,
+) -> torch.Tensor:
+    """Cross-entropy against a dense, agreement-weighted target distribution."""
+    if logits.shape != target_distribution.shape:
+        raise ValueError("logits and target_distribution must have identical shapes")
+    targets = target_distribution.float().clamp_min(0.0)
+    targets = targets / targets.sum(dim=1, keepdim=True).clamp_min(1e-8)
+    log_prob = F.log_softmax(logits.float(), dim=1)
+    probability = log_prob.exp()
+    modulation = (1.0 - probability).pow(gamma) if focal else torch.ones_like(probability)
+    scale = alpha if focal else 1.0
+    return (-(scale * modulation * log_prob * targets).sum(dim=1)).mean()
+
+
 @dataclass
 class MixedStateLossOutput:
     loss: torch.Tensor
@@ -27,8 +46,9 @@ class MixedStateHybridLoss(nn.Module):
     """Supervise categorical and multi-label state groups separately.
 
     Single-label groups use a category-local softmax cross entropy.  Multi-label
-    groups use class-balanced focal BCE, while retaining the same set-level
-    image/query contrastive term used by the Task-2 hybrid objective.
+    groups use class-balanced focal BCE, while retaining a set-level image/query
+    contrastive term.  The set term can use exact positives, a hard
+    category-overlap mask, or a dense agreement-weighted target distribution.
     """
 
     def __init__(
@@ -43,6 +63,7 @@ class MixedStateHybridLoss(nn.Module):
         consistency_weight: float = 0.1,
         set_positive_mode: str = "exact",
         min_shared_categories: int = 8,
+        beta: float = 4.0,
     ) -> None:
         super().__init__()
         if positive_ratios.ndim != 1:
@@ -53,10 +74,17 @@ class MixedStateHybridLoss(nn.Module):
             raise ValueError("at least one hybrid loss weight must be positive")
         if consistency_weight < 0:
             raise ValueError("consistency_weight cannot be negative")
-        if set_positive_mode not in {"exact", "category_overlap"}:
-            raise ValueError("set_positive_mode must be 'exact' or 'category_overlap'")
+        if set_positive_mode not in {
+            "exact", "category_overlap", "soft_category", "soft_raw40",
+        }:
+            raise ValueError(
+                "set_positive_mode must be exact, category_overlap, "
+                "soft_category, or soft_raw40"
+            )
         if not 1 <= min_shared_categories <= len(group_specs):
             raise ValueError("min_shared_categories must be within the group count")
+        if beta <= 0:
+            raise ValueError("beta must be positive")
         self.group_specs = [
             (str(kind), tuple(int(index) for index in indices))
             for kind, indices in group_specs
@@ -78,6 +106,7 @@ class MixedStateHybridLoss(nn.Module):
         self.consistency_weight = float(consistency_weight)
         self.set_positive_mode = str(set_positive_mode)
         self.min_shared_categories = int(min_shared_categories)
+        self.beta = float(beta)
 
     @staticmethod
     def _category_balanced_query(
@@ -105,6 +134,7 @@ class MixedStateHybridLoss(nn.Module):
         text_features: torch.Tensor,
         semantic_labels: torch.Tensor,
         logit_scale: torch.Tensor,
+        binary_labels: torch.Tensor | None = None,
     ) -> MixedStateLossOutput:
         if image_features.ndim != 2 or text_features.ndim != 2:
             raise ValueError("image and text features must be matrices")
@@ -176,20 +206,60 @@ class MixedStateHybridLoss(nn.Module):
                 (overlap == semantic_counts[:, None])
                 & (overlap == semantic_counts[None, :])
             )
-        else:
+            positive_mask.fill_diagonal_(True)
+            i2t = _directional_loss(
+                set_logits, positive_mask, True, self.focal_alpha, self.focal_gamma,
+            )
+            t2i = _directional_loss(
+                set_logits.T, positive_mask.T, True, self.focal_alpha, self.focal_gamma,
+            )
+        elif self.set_positive_mode == "category_overlap":
             shared_categories = torch.zeros_like(overlap)
             for _, indices in self.group_specs:
                 shared_categories += (
                     targets[:, list(indices)] @ targets[:, list(indices)].T > 0
                 ).to(shared_categories.dtype)
             positive_mask = shared_categories >= self.min_shared_categories
-        positive_mask.fill_diagonal_(True)
-        i2t = _directional_loss(
-            set_logits, positive_mask, True, self.focal_alpha, self.focal_gamma,
-        )
-        t2i = _directional_loss(
-            set_logits.T, positive_mask.T, True, self.focal_alpha, self.focal_gamma,
-        )
+            positive_mask.fill_diagonal_(True)
+            i2t = _directional_loss(
+                set_logits, positive_mask, True, self.focal_alpha, self.focal_gamma,
+            )
+            t2i = _directional_loss(
+                set_logits.T, positive_mask.T, True, self.focal_alpha, self.focal_gamma,
+            )
+        else:
+            if self.set_positive_mode == "soft_raw40":
+                if binary_labels is None or binary_labels.ndim != 2:
+                    raise ValueError("soft_raw40 requires binary_labels with shape [B,40]")
+                if binary_labels.shape != (len(targets), 40):
+                    raise ValueError("soft_raw40 requires binary_labels with shape [B,40]")
+                agreement = 1.0 - (
+                    binary_labels.float()[:, None, :] != binary_labels.float()[None, :, :]
+                ).float().mean(dim=2)
+            else:
+                agreement = targets.new_zeros((len(targets), len(targets)))
+                for _, indices in self.group_specs:
+                    group = targets[:, list(indices)]
+                    intersection = group @ group.T
+                    union = (
+                        group.sum(dim=1, keepdim=True)
+                        + group.sum(dim=1, keepdim=True).T
+                        - intersection
+                    )
+                    agreement += torch.where(
+                        union > 0, intersection / union.clamp_min(1.0), 1.0,
+                    )
+                agreement = agreement / len(self.group_specs)
+            target_distribution = torch.softmax(self.beta * agreement, dim=1)
+            reverse_distribution = torch.softmax(self.beta * agreement.T, dim=1)
+            i2t = _soft_directional_loss(
+                set_logits, target_distribution, True,
+                self.focal_alpha, self.focal_gamma,
+            )
+            t2i = _soft_directional_loss(
+                set_logits.T, reverse_distribution, True,
+                self.focal_alpha, self.focal_gamma,
+            )
         set_contrastive = 0.5 * (i2t + t2i)
         total = self.prototype_weight * prototype + self.set_weight * set_contrastive
         return MixedStateLossOutput(
