@@ -17,7 +17,8 @@ from upar.retrieval import autocast
 
 from ..checkpoint import resume_training, save_best, save_last
 from ..datasets.attribute_prompts import (
-    CategoryPromptMapper, PaperAttributePromptMapper, prompts_for_attributes,
+    CategoryPromptMapper, MixedCategoryPromptMapper, PaperAttributePromptMapper,
+    prompts_for_attributes,
 )
 from ..datasets.upar_abpr import (
     AttriVisionDataset,
@@ -29,6 +30,7 @@ from ..datasets.upar_abpr import (
 from ..losses.focal_clip_loss import FocalCLIPLoss
 from ..losses.category_structured_ce import CategoryStructuredCELoss
 from ..losses.task2_hybrid_loss import Task2HybridLoss
+from ..losses.mixed_state_hybrid_loss import MixedStateHybridLoss
 from ..models.attrivision import AttriVision
 from ..tracking import RunLogger
 from ..transforms import build_eval_transform, build_train_transform
@@ -36,6 +38,7 @@ from .evaluator_abpr import (
     evaluate_abpr, evaluate_binary_head, evaluate_native52,
     evaluate_native52_category_nll,
 )
+from .evaluator_mixed import evaluate_mixed_state_nll
 
 
 def _grad_scaler(enabled: bool) -> Any:
@@ -252,6 +255,53 @@ def train_one_epoch_hybrid(
     return _finish_epoch_totals(totals, device)
 
 
+def train_one_epoch_mixed(
+    model: AttriVision, loader: DataLoader, optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    criterion: MixedStateHybridLoss, scaler: Any, device: torch.device,
+    amp: bool, grad_clip: float, prototype_tokens: torch.Tensor,
+    mapper: MixedCategoryPromptMapper,
+) -> dict[str, float]:
+    """Train A7-mixed with category-local CE and multi-label BCE."""
+    model.train()
+    totals = {
+        "loss": 0.0, "fce": 0.0, "prototype": 0.0, "set": 0.0,
+        "single_ce": 0.0, "multi_bce": 0.0, "consistency": 0.0,
+        "i2t": 0.0, "t2i": 0.0, "samples": 0.0, "batches": 0.0,
+    }
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    for images, labels in loader:
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        semantic_labels = mapper.encode(labels)
+        optimizer.zero_grad(set_to_none=True)
+        with autocast(device, amp):
+            image_features = model.encode_image(images)
+            text_features = model.encode_text(prototype_tokens)
+            output = criterion(
+                image_features, text_features, semantic_labels, model.logit_scale,
+            )
+        scaler.scale(output.loss).backward()
+        scaler.unscale_(optimizer)
+        if grad_clip > 0:
+            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        _optimizer_step(scaler, optimizer, scheduler)
+        count = len(images)
+        totals["loss"] += float(output.loss.detach()) * count
+        totals["fce"] += float(output.loss.detach()) * count
+        totals["prototype"] += float(output.prototype.detach()) * count
+        totals["set"] += float(output.set_contrastive.detach()) * count
+        totals["single_ce"] += float(output.single_ce.detach()) * count
+        totals["multi_bce"] += float(output.multi_bce.detach()) * count
+        totals["consistency"] += float(output.consistency.detach()) * count
+        totals["i2t"] += float(output.i2t.detach()) * count
+        totals["t2i"] += float(output.t2i.detach()) * count
+        totals["samples"] += count
+        totals["batches"] += 1
+    return _finish_epoch_totals(totals, device)
+
+
 def train_one_epoch_binary(
     model: AttriVision, loader: DataLoader, optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler, criterion: nn.Module,
@@ -332,10 +382,12 @@ def train(args: Any) -> Path:
     semantic_labels = semantic_label_matrix(
         torch.from_numpy(dataset.labels.copy()), table.attribute_names, args.prompt_mode,
     )
-    mapper = (
-        CategoryPromptMapper(table.attribute_names)
-        if args.prompt_mode == "category_complete" else None
-    )
+    if args.prompt_mode == "category_complete":
+        mapper = CategoryPromptMapper(table.attribute_names)
+    elif args.prompt_mode == "mixed_category":
+        mapper = MixedCategoryPromptMapper(table.attribute_names)
+    else:
+        mapper = None
     if args.prompt_mode == "paper_binary":
         prototype_prompts = PaperAttributePromptMapper(table.attribute_names).prompts
     else:
@@ -397,8 +449,18 @@ def train(args: Any) -> Path:
                 args.multi_attributes, args.prompt_mode, False, stochastic=False,
             ),
         )
-    criterion: FocalCLIPLoss | Task2HybridLoss | None
-    if args.use_fce and args.training_objective == "task2_hybrid":
+    criterion: FocalCLIPLoss | Task2HybridLoss | MixedStateHybridLoss | None
+    if args.use_fce and args.training_objective == "a7_mixed":
+        if not isinstance(mapper, MixedCategoryPromptMapper):
+            raise ValueError("a7_mixed requires prompt_mode=mixed_category")
+        criterion = MixedStateHybridLoss(
+            semantic_labels.float().mean(dim=0),
+            [(kind, indices) for _, kind, indices in mapper.category_specs()],
+            args.focal_alpha, args.focal_gamma, args.balance_max_weight,
+            args.prototype_loss_weight, args.set_loss_weight,
+            getattr(args, "mixed_consistency_weight", 0.1),
+        ).to(device)
+    elif args.use_fce and args.training_objective == "task2_hybrid":
         criterion = Task2HybridLoss(
             semantic_labels.float().mean(dim=0), args.focal_alpha, args.focal_gamma,
             args.balance_max_weight, args.prototype_loss_weight, args.set_loss_weight,
@@ -413,7 +475,7 @@ def train(args: Any) -> Path:
         ).to(device)
         if category_mode != "off" and mapper is not None else None
     )
-    if category_mode != "off" and mapper is None:
+    if category_mode != "off" and not isinstance(mapper, CategoryPromptMapper):
         raise ValueError("Category CE requires prompt_mode=category_complete")
     positive_rates = torch.from_numpy(dataset.labels).float().mean(dim=0).clamp_min(1e-6)
     pos_weight = ((1.0 - positive_rates) / positive_rates).to(device)
@@ -431,6 +493,7 @@ def train(args: Any) -> Path:
         "focal_gamma": args.focal_gamma,
         "prototype_loss_weight": args.prototype_loss_weight,
         "set_loss_weight": args.set_loss_weight,
+        "mixed_consistency_weight": getattr(args, "mixed_consistency_weight", 0.1),
         "balance_max_weight": args.balance_max_weight,
         "use_fce": args.use_fce,
         "lambda_attr": args.lambda_attr,
@@ -542,6 +605,13 @@ def train(args: Any) -> Path:
             f"set_weight={args.set_loss_weight:g}, "
             f"balance_cap={args.balance_max_weight:g}"
         )
+    if args.training_objective == "a7_mixed":
+        logger.log(
+            f"A7-mixed objective: semantic_prototypes={semantic_labels.shape[1]}, "
+            f"prototype_weight={args.prototype_loss_weight:g}, "
+            f"set_weight={args.set_loss_weight:g}, "
+            f"consistency_weight={getattr(args, 'mixed_consistency_weight', 0.1):g}"
+        )
     try:
         for epoch in range(start_epoch, args.epochs + 1):
             started = time.time()
@@ -549,6 +619,14 @@ def train(args: Any) -> Path:
                 losses = train_one_epoch_binary(
                     model, loader, optimizer, scheduler, binary_criterion, scaler,
                     device, args.amp, args.grad_clip, args.lambda_attr,
+                )
+            elif args.training_objective == "a7_mixed":
+                assert isinstance(criterion, MixedStateHybridLoss)
+                assert isinstance(mapper, MixedCategoryPromptMapper)
+                assert prototype_tokens is not None
+                losses = train_one_epoch_mixed(
+                    model, loader, optimizer, scheduler, criterion, scaler, device,
+                    args.amp, args.grad_clip, prototype_tokens, mapper,
                 )
             elif args.training_objective == "task2_hybrid":
                 assert isinstance(criterion, Task2HybridLoss)
@@ -577,6 +655,13 @@ def train(args: Any) -> Path:
             if epoch % args.retrieval_interval == 0 or epoch == args.epochs:
                 if getattr(args, "validation_protocol", "binary_head") == "native52_category_nll":
                     metrics = evaluate_native52_category_nll(
+                        model, table.attribute_names, data_root,
+                        build_eval_transform(args.image_size, getattr(args, "augmentation", "current")), device,
+                        args.eval_batch_size, args.num_workers, args.amp,
+                        args.max_val_samples, getattr(args, "category_temperature", 0.01),
+                    )
+                elif getattr(args, "validation_protocol", "binary_head") == "mixed_state_nll":
+                    metrics = evaluate_mixed_state_nll(
                         model, table.attribute_names, data_root,
                         build_eval_transform(args.image_size, getattr(args, "augmentation", "current")), device,
                         args.eval_batch_size, args.num_workers, args.amp,
@@ -642,7 +727,11 @@ def train(args: Any) -> Path:
                 f"fce={losses.get('fce', 0.0):.6f}, bce={losses.get('bce', 0.0):.6f}, "
                 + f"catce={losses.get('category_ce', 0.0):.6f}, "
                 + (f"prototype={losses['prototype']:.6f}, set={losses['set']:.6f}, "
-                   if args.training_objective == "task2_hybrid" else "")
+                   if args.training_objective in {"task2_hybrid", "a7_mixed"} else "")
+                + (f"single_ce={losses.get('single_ce', 0.0):.6f}, "
+                   f"multi_bce={losses.get('multi_bce', 0.0):.6f}, "
+                   f"consistency={losses.get('consistency', 0.0):.6f}, "
+                   if args.training_objective == "a7_mixed" else "")
                 + f"i2t={losses['i2t']:.6f}, t2i={losses['t2i']:.6f}, lr={lr:.3e}"
                 + (f", AUROC={metrics.get('macro_auroc', float('nan')):.4f}, "
                    f"AP={metrics.get('macro_ap', float('nan')):.4f}, "
@@ -669,6 +758,9 @@ def train(args: Any) -> Path:
                 "bce_loss": losses.get("bce", 0.0), "learning_rate": lr,
                 "prototype_loss": losses.get("prototype", ""),
                 "set_loss": losses.get("set", ""),
+                "single_ce_loss": losses.get("single_ce", ""),
+                "multi_bce_loss": losses.get("multi_bce", ""),
+                "consistency_loss": losses.get("consistency", ""),
                 "best_map": best_map, "best_epoch": best_epoch,
                 "best_score": best_map, "selection_metric": selection_key,
                 "stale_evaluations": stale, "elapsed_seconds": elapsed,

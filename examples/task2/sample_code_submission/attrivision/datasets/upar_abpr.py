@@ -14,7 +14,8 @@ from torch.utils.data import Dataset, Sampler
 from upar.data import AnnotationTable, resolve_image_path
 
 from .attribute_prompts import (
-    CategoryPromptMapper, PaperAttributePromptMapper, prompts_for_attributes,
+    CategoryPromptMapper, MixedCategoryPromptMapper, PaperAttributePromptMapper,
+    prompts_for_attributes,
 )
 
 
@@ -53,6 +54,8 @@ def semantic_label_matrix(
     """Convert numeric UPAR labels to the text states used by a prompt mode."""
     if prompt_mode == "category_complete":
         return CategoryPromptMapper(attribute_names).encode(labels)
+    if prompt_mode == "mixed_category":
+        return MixedCategoryPromptMapper(attribute_names).encode(labels)
     if prompt_mode == "binary_positive":
         return labels > 0.5
     if prompt_mode == "paper_binary":
@@ -151,10 +154,14 @@ class PromptCollator:
             raise ValueError("text_sampling must be 'single' or 'multi'")
         if multi_attributes <= 0:
             raise ValueError("multi_attributes must be positive")
-        if prompt_mode not in {"category_complete", "binary_positive", "paper_binary"}:
-            raise ValueError("prompt_mode must be 'category_complete' or 'binary_positive'")
+        if prompt_mode not in {
+            "category_complete", "mixed_category", "binary_positive", "paper_binary",
+        }:
+            raise ValueError("unknown prompt_mode")
         if prompt_mode == "category_complete":
             self.mapper = CategoryPromptMapper(attribute_names)
+        elif prompt_mode == "mixed_category":
+            self.mapper = MixedCategoryPromptMapper(attribute_names)
         elif prompt_mode == "paper_binary":
             self.mapper = PaperAttributePromptMapper(attribute_names)
         else:

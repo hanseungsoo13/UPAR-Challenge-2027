@@ -14,8 +14,10 @@ from .engine.evaluator_abpr import (
     evaluate_abpr, evaluate_native52, evaluate_native52_category_nll,
     print_evaluation,
 )
+from .engine.evaluator_mixed import evaluate_mixed_state_nll
 from .engine.trainer_attrivision import train
 from .losses.focal_clip_loss import FocalCLIPLoss
+from .losses.mixed_state_hybrid_loss import MixedStateHybridLoss
 from .losses.task2_hybrid_loss import Task2HybridLoss
 from .models.attrivision import AttriVision
 from .transforms import build_eval_transform, build_train_transform
@@ -74,18 +76,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="override the paper preset batch size (default: 32)",
     )
     parser.add_argument(
-        "--prompt-mode", choices=("category_complete", "binary_positive", "paper_binary"),
+        "--prompt-mode", choices=(
+            "category_complete", "mixed_category", "binary_positive", "paper_binary",
+        ),
         default="category_complete",
-        help="12-category states, positive-only attributes, or paper-style positive/negative binary states",
+        help="legacy 52-state, A7 mixed-state, positive-only, or paper binary prompts",
     )
     parser.add_argument("--loss", choices=("clip", "focal_clip"), default="focal_clip")
     parser.add_argument(
-        "--training-objective", choices=("task2_hybrid", "paper_fce"),
+        "--training-objective", choices=("task2_hybrid", "a7_mixed", "paper_fce"),
         default="task2_hybrid",
-        help="Task-2-aligned prototype/set loss or the paper-equation FCE ablation",
+        help="Task-2 hybrid, A7 mixed-state, or paper-equation FCE objective",
     )
     parser.add_argument("--prototype-loss-weight", type=float, default=0.25)
     parser.add_argument("--set-loss-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--mixed-consistency-weight", type=float, default=0.1,
+        help="penalty for residual 'other' and known-state co-activation",
+    )
     parser.add_argument("--lambda-attr", type=float, default=1.0)
     parser.add_argument(
         "--category-ce-mode", choices=("off", "only", "combined"), default="off",
@@ -136,6 +144,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--validation-protocol", choices=(
             "binary_head", "native52", "native52_category_nll", "paired_l1",
+            "mixed_state_nll",
         ),
         default="binary_head",
     )
@@ -201,6 +210,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("hybrid loss weights cannot be negative")
     if args.prototype_loss_weight + args.set_loss_weight <= 0:
         raise ValueError("at least one hybrid loss weight must be positive")
+    if args.mixed_consistency_weight < 0:
+        raise ValueError("mixed-consistency-weight cannot be negative")
     if args.lambda_attr < 0:
         raise ValueError("lambda-attr cannot be negative")
     if args.category_ce_weight < 0 or args.category_temperature <= 0:
@@ -231,6 +242,37 @@ def run_smoke(args: argparse.Namespace) -> None:
         "Resize", "Pad", "RandomCrop",
     ]:
         raise AssertionError("resize_pad_crop must be Resize -> Pad -> RandomCrop")
+    if args.training_objective == "a7_mixed":
+        semantic_count = 5
+        texts = [f"a photo of mixed state {index}" for index in range(semantic_count)]
+        labels = torch.zeros(batch_size, semantic_count, dtype=torch.bool, device=device)
+        labels[:, 0] = True
+        labels[:, 2] = True
+        labels[0, 1] = True
+        labels[1:, 3] = True
+        tokens = model.tokenize(texts).to(device)
+        criterion = MixedStateHybridLoss(
+            labels.float().mean(dim=0).clamp_min(1 / max(batch_size, 1)),
+            [("single", [0, 1]), ("multi", [2, 3, 4])],
+            args.focal_alpha, args.focal_gamma, args.balance_max_weight,
+            args.prototype_loss_weight, args.set_loss_weight,
+            args.mixed_consistency_weight,
+        ).to(device)
+        model.train()
+        image_features = model.encode_image(images)
+        text_features = model.encode_text(tokens)
+        output = criterion(image_features, text_features, labels, model.logit_scale)
+        output.loss.backward()
+        assert image_features.shape == (batch_size, 512)
+        assert text_features.shape == (semantic_count, 512)
+        assert torch.isfinite(output.loss)
+        assert any(parameter.grad is not None for parameter in model.parameters())
+        print(
+            "A7-mixed sanity checks passed: "
+            f"image={tuple(image_features.shape)}, text={tuple(text_features.shape)}, "
+            f"loss={float(output.loss.detach()):.6f}, backward=finite"
+        )
+        return
     if args.training_objective == "task2_hybrid":
         semantic_count = batch_size + 2
         texts = [f"a photo of semantic state {index}" for index in range(semantic_count)]
@@ -347,6 +389,12 @@ def run(args: argparse.Namespace) -> None:
             build_eval_transform(args.image_size, args.augmentation), device, args.eval_batch_size,
             args.num_workers, args.amp, args.max_val_samples,
             args.category_temperature,
+        )
+    elif args.validation_protocol == "mixed_state_nll":
+        metrics = evaluate_mixed_state_nll(
+            model, payload["attribute_names"], Path(args.data_root).resolve(),
+            build_eval_transform(args.image_size, args.augmentation), device, args.eval_batch_size,
+            args.num_workers, args.amp, args.max_val_samples, args.category_temperature,
         )
     elif args.validation_protocol == "native52":
         metrics = evaluate_native52(

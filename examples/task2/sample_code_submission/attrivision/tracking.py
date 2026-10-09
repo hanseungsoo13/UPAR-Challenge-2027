@@ -7,7 +7,7 @@ from typing import Any
 
 
 FIELDS = (
-    "epoch", "total_loss", "fce_loss", "category_ce_loss", "bce_loss", "prototype_loss", "set_loss", "i2t_loss", "t2i_loss", "learning_rate",
+    "epoch", "total_loss", "fce_loss", "category_ce_loss", "bce_loss", "prototype_loss", "set_loss", "single_ce_loss", "multi_bce_loss", "consistency_loss", "i2t_loss", "t2i_loss", "learning_rate",
     "rank1", "rank5", "rank10", "map", "mADM", "mINP", "best_map", "best_score",
     "selection_metric", "best_epoch",
     "macro_auroc", "macro_ap", "instance_f1", "mean_hamming_error", "exact_match",

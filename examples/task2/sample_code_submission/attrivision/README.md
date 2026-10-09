@@ -46,6 +46,25 @@ conda activate rws-upar-challenge
 
 ## 실행
 
+### E0 FCE mask audit
+
+A1의 train batch에서 실제로 sampling된 text candidate만 대상으로 FCE
+positive mask의 false-negative/false-positive를 확인하려면 별도
+e0_mask_audit/ 폴더의 audit를 실행한다. 이 진단은 GT, 기존 sampler,
+기존 FCE mask 코드만 사용하며 checkpoint와 CLIP encoder를 로드하지 않는다.
+
+~~~bash
+python examples/task2/sample_code_submission/attrivision/e0_mask_audit/e0_mask_audit.py \
+  --data-root data \
+  --seeds 42 43 44 45 46
+~~~
+
+기본값은 A1의 category_complete + multi(max3) + multi_positive 설정이다.
+결과는 outputs/attrivision_e0_mask_audit/summary.json과 CSV 파일에 저장된다.
+owner-only diagonal을 비교하려면 --contrastive-target diagonal을 추가한다.
+자세한 지표 정의와 파일 목록은 attrivision/e0_mask_audit/README.md를
+참고한다.
+
 모든 명령은 저장소 루트에서 실행한다. 물리 GPU 6번만 노출하면 프로그램
 내부의 장치 번호는 `cuda:0`이다.
 
@@ -212,6 +231,40 @@ CUDA_VISIBLE_DEVICES=6 python examples/task2/sample_code_submission/attrivision/
   --device cuda:0 \
   --output-root outputs/attrivision_ablation_mADM
 ```
+
+### A7-mixed: mixed categorical/multi-label retraining
+
+기존 A7은 52개 state 전체를 category-softmax로 처리한다. A7-mixed는 Task 2
+annotation의 실제 cardinality에 맞춰 50개 state를 사용한다. Age/Gender/Glasses와
+같은 single-label category에는 category CE를, Hair/Upper color/Lower color/Lower
+type에는 class-balanced multi-label BCE를 적용한다. `age_unknown`, `hair_other`,
+`lower_type_other`, `glasses_none`은 유지하고, Task 2 train/val에서 positive가
+없는 두 색상 `unspecified` state는 제거한다. 학습과 평가는 동일한 mixed-state
+query/gallery NLL을 사용한다.
+
+기존 A7 checkpoint를 덮어쓰지 않도록 별도 output directory에 저장한다.
+
+```bash
+CUDA_VISIBLE_DEVICES=6 python examples/task2/sample_code_submission/attrivision/run_a7_mixed.py \
+  --mode train_eval \
+  --device cuda:0 \
+  --output-dir outputs/attrivision_ablation_mixed/A7-mixed
+```
+
+빠른 smoke test는 다음과 같다.
+
+```bash
+CUDA_VISIBLE_DEVICES=6 python examples/task2/sample_code_submission/attrivision/run_a7_mixed.py \
+  --mode smoke \
+  --device cuda:0 \
+  --no-pretrained
+```
+
+결과물은 `checkpoint_best.pth`, `checkpoint_last.pth`, `metrics.csv`, `train.log`,
+`validation_metrics.json`으로 `outputs/attrivision_ablation_mixed/A7-mixed/`에
+생성된다. 주요 설정은 checkpoint metadata의 `prompt_mode=mixed_category`,
+`training_objective=a7_mixed`, `validation_protocol=mixed_state_nll`에서 확인할 수
+있다.
 
 ### 재개
 
