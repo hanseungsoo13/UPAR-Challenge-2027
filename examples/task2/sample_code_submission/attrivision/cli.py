@@ -84,12 +84,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--loss", choices=("clip", "focal_clip"), default="focal_clip")
     parser.add_argument(
-        "--training-objective", choices=("task2_hybrid", "a7_mixed", "paper_fce"),
+        "--training-objective",
+        choices=("task2_hybrid", "a7_mixed", "paper_fce", "a7_fce_mixed_aux"),
         default="task2_hybrid",
-        help="Task-2 hybrid, A7 mixed-state, or paper-equation FCE objective",
+        help="Task-2 hybrid, A7 mixed-state, paper-equation FCE, or A7-FCE-50 with mixed prototype auxiliary objective",
     )
     parser.add_argument("--prototype-loss-weight", type=float, default=0.25)
     parser.add_argument("--set-loss-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--mixed-aux-prototype-weight", type=float, default=0.1,
+        help="weight of the mixed CE/BCE prototype auxiliary term in A7-FCE-50",
+    )
     parser.add_argument(
         "--mixed-consistency-weight", type=float, default=0.1,
         help="penalty for residual 'other' and known-state co-activation",
@@ -222,6 +227,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("focal alpha and gamma cannot be negative")
     if args.prototype_loss_weight < 0 or args.set_loss_weight < 0:
         raise ValueError("hybrid loss weights cannot be negative")
+    if args.mixed_aux_prototype_weight < 0:
+        raise ValueError("mixed-aux-prototype-weight cannot be negative")
     if args.prototype_loss_weight + args.set_loss_weight <= 0:
         raise ValueError("at least one hybrid loss weight must be positive")
     if args.mixed_consistency_weight < 0:
@@ -260,6 +267,59 @@ def run_smoke(args: argparse.Namespace) -> None:
         "Resize", "Pad", "RandomCrop",
     ]:
         raise AssertionError("resize_pad_crop must be Resize -> Pad -> RandomCrop")
+    if args.training_objective == "a7_fce_mixed_aux":
+        semantic_count = 5
+        texts = [f"a photo of sampled state {index}" for index in range(batch_size)]
+        prototype_texts = [f"a photo of mixed state {index}" for index in range(semantic_count)]
+        labels = torch.zeros(batch_size, semantic_count, dtype=torch.bool, device=device)
+        labels[:, 0] = True
+        labels[:, 2] = True
+        labels[0, 1] = True
+        labels[1:, 3] = True
+        selected = torch.zeros(batch_size, semantic_count, dtype=torch.bool, device=device)
+        selected[torch.arange(batch_size), torch.where(labels[:, 1], 1, 0)] = True
+        owners = torch.arange(batch_size, device=device)
+        tokens = model.tokenize(texts).to(device)
+        prototype_tokens = model.tokenize(prototype_texts).to(device)
+        fce_criterion = FocalCLIPLoss(
+            args.loss, args.contrastive_target, args.focal_alpha, args.focal_gamma,
+        )
+        prototype_criterion = MixedStateHybridLoss(
+            labels.float().mean(dim=0).clamp_min(1 / max(batch_size, 1)),
+            [("single", [0, 1]), ("multi", [2, 3, 4])],
+            args.focal_alpha, args.focal_gamma, args.balance_max_weight,
+            prototype_weight=1.0, set_weight=0.0,
+            consistency_weight=args.mixed_consistency_weight,
+            set_positive_mode=args.mixed_set_positive,
+            min_shared_categories=min(args.mixed_min_shared_categories, 2),
+            beta=args.mixed_set_beta,
+        ).to(device)
+        model.train()
+        image_features, text_features, logits = model(images, tokens)
+        fce_output = fce_criterion(logits, labels, selected, owners)
+        prototype_features = model.encode_text(prototype_tokens)
+        prototype_output = prototype_criterion(
+            image_features, prototype_features, labels, model.logit_scale,
+            torch.randint(0, 2, (batch_size, 40), device=device, dtype=torch.float32),
+            include_set=False,
+        )
+        total = fce_output.loss + args.mixed_aux_prototype_weight * prototype_output.prototype
+        total.backward()
+        assert image_features.shape == (batch_size, 512)
+        assert text_features.shape == (batch_size, 512)
+        assert prototype_features.shape == (semantic_count, 512)
+        assert logits.shape == (batch_size, batch_size)
+        assert torch.isfinite(total)
+        assert torch.isfinite(prototype_output.prototype)
+        assert any(parameter.grad is not None for parameter in model.parameters())
+        assert float(prototype_output.set_contrastive) == 0.0
+        print(
+            "A7-FCE-50 auxiliary sanity checks passed: "
+            f"fce={float(fce_output.loss.detach()):.6f}, "
+            f"prototype={float(prototype_output.prototype.detach()):.6f}, "
+            f"total={float(total.detach()):.6f}, set=0, backward=finite"
+        )
+        return
     if args.training_objective == "a7_mixed":
         semantic_count = 5
         texts = [f"a photo of mixed state {index}" for index in range(semantic_count)]

@@ -303,6 +303,71 @@ def train_one_epoch_mixed(
     return _finish_epoch_totals(totals, device)
 
 
+def train_one_epoch_mixed_fce_aux(
+    model: AttriVision, loader: DataLoader, optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    fce_criterion: FocalCLIPLoss,
+    prototype_criterion: MixedStateHybridLoss,
+    scaler: Any, device: torch.device, amp: bool, grad_clip: float,
+    prototype_tokens: torch.Tensor, prototype_weight: float,
+) -> dict[str, float]:
+    """Train A7-FCE-50 with a small mixed prototype CE/BCE auxiliary term.
+
+    The sampled multi-positive FCE remains the main A7 objective.  The mixed
+    prototype criterion supplies category-local CE for single-state groups and
+    focal BCE for multi-state groups; its set-level term is deliberately
+    disabled for this ablation.
+    """
+    if prototype_weight < 0:
+        raise ValueError("prototype_weight cannot be negative")
+    model.train()
+    totals = {
+        "loss": 0.0, "fce": 0.0, "prototype": 0.0, "set": 0.0,
+        "single_ce": 0.0, "multi_bce": 0.0, "consistency": 0.0,
+        "i2t": 0.0, "t2i": 0.0, "samples": 0.0, "batches": 0.0,
+    }
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    for batch in loader:
+        if not isinstance(batch, PromptBatch):
+            raise TypeError("PromptCollator must return PromptBatch")
+        images = batch.images.to(device, non_blocking=True)
+        labels = batch.labels.to(device, non_blocking=True)
+        semantic_labels = batch.semantic_labels.to(device, non_blocking=True)
+        tokens = batch.tokens.to(device, non_blocking=True)
+        selected = batch.selected_semantics.to(device, non_blocking=True)
+        text_owners = batch.text_owners.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        with autocast(device, amp):
+            image_features, _, logits = model(images, tokens)
+            fce_output = fce_criterion(logits, semantic_labels, selected, text_owners)
+            prototype_text_features = model.encode_text(prototype_tokens)
+            prototype_output = prototype_criterion(
+                image_features, prototype_text_features, semantic_labels,
+                model.logit_scale, labels.float(), include_set=False,
+            )
+            fce = fce_output.loss
+            prototype = prototype_output.prototype
+            total = fce + prototype_weight * prototype
+        scaler.scale(total).backward()
+        scaler.unscale_(optimizer)
+        if grad_clip > 0:
+            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        _optimizer_step(scaler, optimizer, scheduler)
+        count = len(images)
+        totals["loss"] += float(total.detach()) * count
+        totals["fce"] += float(fce.detach()) * count
+        totals["prototype"] += float(prototype.detach()) * count
+        totals["single_ce"] += float(prototype_output.single_ce.detach()) * count
+        totals["multi_bce"] += float(prototype_output.multi_bce.detach()) * count
+        totals["consistency"] += float(prototype_output.consistency.detach()) * count
+        totals["i2t"] += float(fce_output.i2t.detach()) * count
+        totals["t2i"] += float(fce_output.t2i.detach()) * count
+        totals["samples"] += count
+        totals["batches"] += 1
+    return _finish_epoch_totals(totals, device)
+
+
 def train_one_epoch_binary(
     model: AttriVision, loader: DataLoader, optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler, criterion: nn.Module,
@@ -398,7 +463,7 @@ def train(args: Any) -> Path:
         model.tokenize(prototype_prompts).to(device)
         if args.use_fce or category_mode != "off" else None
     )
-    if args.use_fce and args.training_objective == "paper_fce":
+    if args.use_fce and args.training_objective in {"paper_fce", "a7_fce_mixed_aux"}:
         # For paper_binary, "unique" means each image owns a distinct
         # sampled (image, attribute-state) pair.  The old global-state sampler
         # is intentionally not used because the same negative state is valid
@@ -409,7 +474,7 @@ def train(args: Any) -> Path:
             args.prompt_mode, collator_unique,
         )
     if (
-        args.use_fce and args.training_objective == "paper_fce"
+        args.use_fce and args.training_objective in {"paper_fce", "a7_fce_mixed_aux"}
         and args.unique_prompts and args.prompt_mode != "paper_binary"
     ):
         prompts_per_image = 1 if args.text_sampling == "single" else args.multi_attributes
@@ -434,7 +499,7 @@ def train(args: Any) -> Path:
         **loader_options,
     )
     validation_fce_loader = None
-    if args.use_fce and args.training_objective == "paper_fce":
+    if args.use_fce and args.training_objective in {"paper_fce", "a7_fce_mixed_aux"}:
         val_gt = find_annotation_file(data_root, "val")
         val_table = read_gt_csv(val_gt)
         val_dataset = AttriVisionDataset(
@@ -451,6 +516,7 @@ def train(args: Any) -> Path:
             ),
         )
     criterion: FocalCLIPLoss | Task2HybridLoss | MixedStateHybridLoss | None
+    aux_prototype_criterion: MixedStateHybridLoss | None = None
     if args.use_fce and args.training_objective == "a7_mixed":
         if not isinstance(mapper, MixedCategoryPromptMapper):
             raise ValueError("a7_mixed requires prompt_mode=mixed_category")
@@ -463,6 +529,22 @@ def train(args: Any) -> Path:
             getattr(args, "mixed_set_positive", "exact"),
             getattr(args, "mixed_min_shared_categories", 8),
             getattr(args, "mixed_set_beta", 4.0),
+        ).to(device)
+    elif args.use_fce and args.training_objective == "a7_fce_mixed_aux":
+        if not isinstance(mapper, MixedCategoryPromptMapper):
+            raise ValueError("a7_fce_mixed_aux requires prompt_mode=mixed_category")
+        criterion = FocalCLIPLoss(
+            args.loss, args.contrastive_target, args.focal_alpha, args.focal_gamma,
+        )
+        aux_prototype_criterion = MixedStateHybridLoss(
+            semantic_labels.float().mean(dim=0),
+            [(kind, indices) for _, kind, indices in mapper.category_specs()],
+            args.focal_alpha, args.focal_gamma, args.balance_max_weight,
+            prototype_weight=1.0, set_weight=0.0,
+            consistency_weight=getattr(args, "mixed_consistency_weight", 0.1),
+            set_positive_mode=getattr(args, "mixed_set_positive", "exact"),
+            min_shared_categories=getattr(args, "mixed_min_shared_categories", 8),
+            beta=getattr(args, "mixed_set_beta", 4.0),
         ).to(device)
     elif args.use_fce and args.training_objective == "task2_hybrid":
         criterion = Task2HybridLoss(
@@ -501,6 +583,7 @@ def train(args: Any) -> Path:
         "mixed_set_positive": getattr(args, "mixed_set_positive", "exact"),
         "mixed_min_shared_categories": getattr(args, "mixed_min_shared_categories", 8),
         "mixed_set_beta": getattr(args, "mixed_set_beta", 4.0),
+        "mixed_aux_prototype_weight": getattr(args, "mixed_aux_prototype_weight", 0.1),
         "balance_max_weight": args.balance_max_weight,
         "use_fce": args.use_fce,
         "lambda_attr": args.lambda_attr,
@@ -622,6 +705,13 @@ def train(args: Any) -> Path:
             f"min_shared_categories={getattr(args, 'mixed_min_shared_categories', 8)}, "
             f"set_beta={getattr(args, 'mixed_set_beta', 4.0):g}"
         )
+    if args.training_objective == "a7_fce_mixed_aux":
+        logger.log(
+            f"A7-FCE-50 auxiliary objective: main=focal_clip/multi_positive, "
+            f"mixed_prototype_weight={getattr(args, 'mixed_aux_prototype_weight', 0.1):g}, "
+            "mixed_set_weight=0, "
+            f"consistency_weight={getattr(args, 'mixed_consistency_weight', 0.1):g}"
+        )
     try:
         for epoch in range(start_epoch, args.epochs + 1):
             started = time.time()
@@ -629,6 +719,17 @@ def train(args: Any) -> Path:
                 losses = train_one_epoch_binary(
                     model, loader, optimizer, scheduler, binary_criterion, scaler,
                     device, args.amp, args.grad_clip, args.lambda_attr,
+                )
+            elif args.training_objective == "a7_fce_mixed_aux":
+                assert isinstance(criterion, FocalCLIPLoss)
+                assert isinstance(aux_prototype_criterion, MixedStateHybridLoss)
+                assert isinstance(mapper, MixedCategoryPromptMapper)
+                assert prototype_tokens is not None
+                losses = train_one_epoch_mixed_fce_aux(
+                    model, loader, optimizer, scheduler, criterion,
+                    aux_prototype_criterion, scaler, device, args.amp,
+                    args.grad_clip, prototype_tokens,
+                    getattr(args, "mixed_aux_prototype_weight", 0.1),
                 )
             elif args.training_objective == "a7_mixed":
                 assert isinstance(criterion, MixedStateHybridLoss)
@@ -737,11 +838,11 @@ def train(args: Any) -> Path:
                 f"fce={losses.get('fce', 0.0):.6f}, bce={losses.get('bce', 0.0):.6f}, "
                 + f"catce={losses.get('category_ce', 0.0):.6f}, "
                 + (f"prototype={losses['prototype']:.6f}, set={losses['set']:.6f}, "
-                   if args.training_objective in {"task2_hybrid", "a7_mixed"} else "")
+                   if args.training_objective in {"task2_hybrid", "a7_mixed", "a7_fce_mixed_aux"} else "")
                 + (f"single_ce={losses.get('single_ce', 0.0):.6f}, "
                    f"multi_bce={losses.get('multi_bce', 0.0):.6f}, "
                    f"consistency={losses.get('consistency', 0.0):.6f}, "
-                   if args.training_objective == "a7_mixed" else "")
+                   if args.training_objective in {"a7_mixed", "a7_fce_mixed_aux"} else "")
                 + f"i2t={losses['i2t']:.6f}, t2i={losses['t2i']:.6f}, lr={lr:.3e}"
                 + (f", AUROC={metrics.get('macro_auroc', float('nan')):.4f}, "
                    f"AP={metrics.get('macro_ap', float('nan')):.4f}, "

@@ -292,6 +292,35 @@ A7-FCE-50 ≈ 기존 A7  → mixed vocabulary는 문제가 아님
 A7-FCE-50도 낮음     → 50-state prompt/ontology가 원인일 가능성
 ```
 
+### A7-FCE-50-aux: A7 FCE + mixed prototype auxiliary
+
+`A7-FCE-50-aux`는 위 A7-FCE-50의 sampled multi-positive FocalCLIP 신호를
+주 loss로 그대로 유지하면서, mixed 50-state prototype supervision을 작은 보조
+항으로 추가하는 실험이다.
+
+```text
+L_total = L_A7_FCE + 0.1 * L_mixed_prototype
+L_mixed_prototype = category CE(single groups)
+                    + class-balanced focal BCE(multi groups)
+                    + residual-state consistency
+set-level loss = 0
+```
+
+따라서 `A7-mixed`처럼 full-set positive를 학습하지 않는다. 이 실험의 목적은
+prototype CE/BCE가 A7의 retrieval 구조를 보완하는지, 아니면 주 FCE 신호를
+방해하는지를 분리해서 확인하는 것이다. 평가는 A7 및 A7-FCE-50과 동일한
+Native52 Category-NLL이다.
+
+```bash
+CUDA_VISIBLE_DEVICES=6 python examples/task2/sample_code_submission/attrivision/run_a7_fce_mixed_aux.py \
+  --mode train_eval \
+  --device cuda:0 \
+  --output-dir outputs/attrivision_ablation_mixed/A7-FCE-50-aux
+```
+
+보조 항의 가중치는 기본 `0.1`이며 `--mixed-aux-prototype-weight`로 바꿀 수 있다.
+`train.log`와 checkpoint metadata에는 `set_weight=0` 및 보조 가중치가 기록된다.
+
 ### A7-mixed ablation
 
 초기 Rank-1 하락 원인을 분리하기 위해 A7과 동일한 pretrained model, crop, batch,
@@ -349,6 +378,7 @@ epoch다.
 | `--training-objective` | `task2_hybrid` | Task 2 hybrid 또는 논문식 `paper_fce` |
 | `--prototype-loss-weight` | `0.25` | 전체 semantic prototype focal loss 가중치 |
 | `--set-loss-weight` | `1.0` | attribute-set contrastive loss 가중치 |
+| `--mixed-aux-prototype-weight` | `0.1` | A7-FCE-50-aux의 mixed CE/BCE 보조 가중치 |
 | `--mixed-set-positive` | `exact` | A7-mixed set positive 정의 |
 | `--mixed-min-shared-categories` | `8` | `category_overlap`의 최소 공유 category 수 |
 | `--mixed-set-beta` | `4.0` | soft agreement target의 sharpness |
