@@ -84,6 +84,10 @@ Current release counts:
 [`examples/task2/sample_code_submission/README.md`](examples/task2/sample_code_submission/README.md)를
 참고한다.
 
+검증된 AttriVision A7만 학습, 평가하고 Codabench 제출 ZIP까지 만들려면
+[`examples/task2/attrivision_a7/README.md`](examples/task2/attrivision_a7/README.md)의
+전용 workflow를 사용한다.
+
 The default run trains for at most 100 epochs and stops after 12 validation
 checks without an mAP improvement:
 
