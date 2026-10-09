@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 
-from .config import DEFAULT_CHECKPOINT, SUBMISSION_DIR, choose_device
+from .config import DEFAULT_CHECKPOINT, REPOSITORY_ROOT, SUBMISSION_DIR, choose_device
 from .data import ImagePathDataset
 from .retrieval import autocast, l1_attribute_distances, reorder_columns
 
@@ -87,6 +87,137 @@ _ATTRIBUTE_NAMES: list[str] = []
 _SEMANTIC_KEYS: list[str] = []
 _CONFIG: dict[str, Any] = {}
 
+# This is the fixed Native52 layout used by AttriVision's A7 evaluator.  It is
+# kept here instead of importing the research package so the packaged
+# submission remains dependency-free.
+_MULTI_CATEGORY_LAYOUT = (
+    (("Age-Young", "Age-Adult", "Age-Old"),
+     ("age_young", "age_adult", "age_old"), "age_unknown"),
+    (("Hair-Length-Short", "Hair-Length-Long", "Hair-Length-Bald"),
+     ("hair_short", "hair_long", "hair_bald"), "hair_other"),
+    (tuple(f"UpperBody-Color-{color}" for color in (
+        "Black", "Blue", "Brown", "Green", "Grey", "Orange", "Pink",
+        "Purple", "Red", "White", "Yellow", "Other",
+    )), tuple(f"upper_color_{color}" for color in (
+        "black", "blue", "brown", "green", "grey", "orange", "pink",
+        "purple", "red", "white", "yellow", "other",
+    )), "upper_color_unspecified"),
+    (tuple(f"LowerBody-Color-{color}" for color in (
+        "Black", "Blue", "Brown", "Green", "Grey", "Orange", "Pink",
+        "Purple", "Red", "White", "Yellow", "Other",
+    )), tuple(f"lower_color_{color}" for color in (
+        "black", "blue", "brown", "green", "grey", "orange", "pink",
+        "purple", "red", "white", "yellow", "other",
+    )), "lower_color_unspecified"),
+    (("LowerBody-Type-Trousers&Shorts", "LowerBody-Type-Skirt&Dress"),
+     ("lower_trousers_shorts", "lower_skirt_dress"), "lower_type_other"),
+    (("Accessory-Glasses-Normal", "Accessory-Glasses-Sun"),
+     ("glasses_normal", "glasses_sun"), "glasses_none"),
+)
+_BINARY_CATEGORY_LAYOUT = (
+    ("Gender-Female", "gender_woman", "gender_man"),
+    ("UpperBody-Length-Short", "upper_sleeves_short", "upper_sleeves_long"),
+    ("LowerBody-Length-Short", "lower_length_short", "lower_length_long"),
+    ("Accessory-Backpack", "backpack_yes", "backpack_no"),
+    ("Accessory-Bag", "bag_yes", "bag_no"),
+    ("Accessory-Hat", "hat_yes", "hat_no"),
+)
+
+
+def _category_groups(semantic_keys: list[str]) -> list[np.ndarray]:
+    state_index = {key: index for index, key in enumerate(semantic_keys)}
+    groups: list[np.ndarray] = []
+    for _, state_keys, fallback_key in _MULTI_CATEGORY_LAYOUT:
+        groups.append(np.asarray(
+            [state_index[key] for key in (*state_keys, fallback_key)], dtype=np.int64,
+        ))
+    for _, positive_key, negative_key in _BINARY_CATEGORY_LAYOUT:
+        groups.append(np.asarray(
+            [state_index[positive_key], state_index[negative_key]], dtype=np.int64,
+        ))
+    covered = np.concatenate(groups) if groups else np.empty(0, dtype=np.int64)
+    if len(groups) != 12 or len(covered) != 52 or len(np.unique(covered)) != 52:
+        raise ValueError("Packaged AttriVision semantic states are not a Native52 partition")
+    return groups
+
+
+def _category_query_states(
+    queries: np.ndarray, query_names: list[str],
+) -> tuple[np.ndarray, list[np.ndarray]]:
+    ordered = reorder_columns(queries, query_names, _ATTRIBUTE_NAMES) > 0.5
+    attribute_index = {name: index for index, name in enumerate(_ATTRIBUTE_NAMES)}
+    state_index = {key: index for index, key in enumerate(_SEMANTIC_KEYS)}
+    states = np.zeros((len(ordered), len(_SEMANTIC_KEYS)), dtype=np.float32)
+    groups = _category_groups(_SEMANTIC_KEYS)
+
+    for columns, state_keys, fallback_key in _MULTI_CATEGORY_LAYOUT:
+        values = ordered[:, [attribute_index[column] for column in columns]]
+        for offset, key in enumerate(state_keys):
+            states[:, state_index[key]] = values[:, offset]
+        states[:, state_index[fallback_key]] = ~values.any(axis=1)
+    for column, positive_key, negative_key in _BINARY_CATEGORY_LAYOUT:
+        values = ordered[:, attribute_index[column]]
+        states[:, state_index[positive_key]] = values
+        states[:, state_index[negative_key]] = ~values
+
+    return states, groups
+
+
+def _native52_category_nll_distances(
+    queries: np.ndarray, query_names: list[str], gallery: torch.Tensor,
+) -> np.ndarray:
+    if _TEXT_FEATURES is None or len(_SEMANTIC_KEYS) != 52:
+        raise ValueError("Category-NLL requires the packaged 52-state text features")
+    temperature = float(_CONFIG["category_temperature"])
+    if temperature <= 0:
+        raise ValueError("Category-NLL temperature must be positive")
+    queries = np.asarray(queries, dtype=np.float32)
+    if queries.ndim != 2 or not np.isin(queries, (0.0, 1.0)).all():
+        raise ValueError("queries must be a binary [Q,40] array")
+    query_states, groups = _category_query_states(queries, query_names)
+    raw_logits = (gallery.float() @ _TEXT_FEATURES.float().T).numpy()
+    probabilities = np.empty_like(raw_logits, dtype=np.float32)
+    for indices in groups:
+        values = raw_logits[:, indices].astype(np.float64) / temperature
+        values -= values.max(axis=1, keepdims=True)
+        exponentials = np.exp(values)
+        probabilities[:, indices] = (
+            exponentials / exponentials.sum(axis=1, keepdims=True)
+        ).astype(np.float32)
+
+    result = np.zeros((len(query_states), len(probabilities)), dtype=np.float32)
+    log_probabilities = np.log(np.clip(probabilities, 1e-12, 1.0))
+    for indices in groups:
+        targets = query_states[:, indices]
+        counts = targets.sum(axis=1, keepdims=True)
+        if np.any(counts == 0):
+            raise ValueError("Every query category needs an active semantic state")
+        result -= (targets / counts) @ log_probabilities[:, indices].T
+    result /= len(groups)
+    if not np.isfinite(result).all():
+        raise RuntimeError("Category-NLL distance matrix contains NaN or Inf")
+    return result
+
+
+def _build_eval_transform() -> transforms.Compose:
+    if _CONFIG["augmentation"] == "resize_pad_crop":
+        spatial = [transforms.Resize(
+            (224, 224), interpolation=InterpolationMode.BICUBIC, antialias=True,
+        )]
+    elif _CONFIG["augmentation"] == "center_crop":
+        spatial = [
+            transforms.Resize(224, interpolation=InterpolationMode.BICUBIC, antialias=True),
+            transforms.CenterCrop(224),
+        ]
+    else:
+        raise ValueError(f"Unknown AttriVision submission augmentation: {_CONFIG['augmentation']}")
+    return transforms.Compose([
+        *spatial,
+        transforms.ToTensor(),
+        transforms.Normalize((0.48145466, 0.4578275, 0.40821073),
+                             (0.26862954, 0.26130258, 0.27577711)),
+    ])
+
 
 def load_model() -> None:
     global _MODEL, _DEVICE, _TEXT_FEATURES, _PAIRED_TEXT_FEATURES
@@ -114,6 +245,12 @@ def load_model() -> None:
         "progress_every": max(1, int(os.environ.get("UPAR_PROGRESS_EVERY", "5"))),
         "retrieval_scoring": os.environ.get(
             "UPAR_RETRIEVAL_SCORING", checkpoint.get("retrieval_scoring", "cosine_set")
+        ),
+        "category_temperature": float(os.environ.get(
+            "UPAR_CATEGORY_TEMPERATURE", checkpoint.get("category_temperature", 0.01)
+        )),
+        "augmentation": os.environ.get(
+            "UPAR_AUGMENTATION", checkpoint.get("augmentation", "center_crop")
         ),
     }
     print(
@@ -150,14 +287,31 @@ def rank_gallery(sample: dict[str, Any]) -> dict[str, np.ndarray]:
     if _MODEL is None: load_model()
     assert _MODEL is not None and _DEVICE is not None and _TEXT_FEATURES is not None
     paths = [item["image_path"] for item in sample["gallery"]]
-    transform = transforms.Compose([transforms.Resize(224, interpolation=InterpolationMode.BICUBIC, antialias=True), transforms.CenterCrop(224), transforms.ToTensor(), transforms.Normalize((0.48145466,0.4578275,0.40821073),(0.26862954,0.26130258,0.27577711))])
-    loader = DataLoader(ImagePathDataset(paths, [Path.cwd(), SUBMISSION_DIR], transform), batch_size=_CONFIG["batch_size"], num_workers=_CONFIG["num_workers"], pin_memory=_DEVICE.type == "cuda")
+    transform = _build_eval_transform()
+    loader = DataLoader(
+        ImagePathDataset(
+            paths, [Path.cwd(), SUBMISSION_DIR, REPOSITORY_ROOT, REPOSITORY_ROOT / "data"],
+            transform,
+        ),
+        batch_size=_CONFIG["batch_size"],
+        num_workers=_CONFIG["num_workers"],
+        pin_memory=_DEVICE.type == "cuda",
+    )
     chunks, started = [], time.perf_counter()
     for index, images in enumerate(loader, 1):
         with autocast(_DEVICE, _CONFIG["amp"]): chunks.append(_MODEL(images.to(_DEVICE)).float().cpu())
         if index % _CONFIG["progress_every"] == 0 or index == len(loader): print(f"[submission] gallery batch {index}/{len(loader)}", flush=True)
     gallery = torch.cat(chunks)
     queries = np.asarray(sample["queries"], dtype=np.float32)
+    if _CONFIG["retrieval_scoring"] == "native52_category_nll":
+        distances = _native52_category_nll_distances(
+            queries, list(sample["attribute_names"]), gallery,
+        )
+        print(
+            f"[submission] Native52 Category-NLL retrieval complete in "
+            f"{time.perf_counter()-started:.1f}s; distances={distances.shape}", flush=True,
+        )
+        return {"distances": distances}
     if _CONFIG["retrieval_scoring"] == "paired_l1":
         if _PAIRED_TEXT_FEATURES is None:
             raise ValueError("Packaged checkpoint does not contain paired prompt features")

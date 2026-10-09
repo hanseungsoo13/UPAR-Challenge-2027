@@ -177,8 +177,8 @@ A6는 가장 기본적인 A0를 기준으로 ConvNeXt E3의 순서를 직접 모
 training objective, sampling, target 등 모든 설정을 공유하고 crop 정책만 다르다.
 Attrivision의 square 입력 제약에 맞춰 전체 이미지를 먼저 `224×224`로 resize한 뒤,
 `Pad(10) → RandomCrop(224)`로 작은 translation만 허용한다. A6 validation은 전체
-이미지를 `Resize((224,224))`만 적용한다. A-series checkpoint는 공식 `mADM`이
-가장 높은 epoch를 best로 저장한다.
+이미지를 `Resize((224,224))`만 적용한다. A6는 기존 Native52 soft-L1 validation과
+공식 `mADM` 기준을 유지한다.
 
 ```text
 Resize((224,224))
@@ -200,6 +200,18 @@ CUDA_VISIBLE_DEVICES=6 python examples/task2/sample_code_submission/attrivision/
 `outputs/attrivision_ablation/A6/`에
 저장되며, 두 결과가 모두 있으면 `A6 - A0` 차이가
 `outputs/attrivision_ablation/pairwise_differences.json`에 기록된다.
+
+A6와 동일한 crop을 사용하되 Category-NLL ranking으로 평가하는 별도 A7은 다음과
+같이 실행한다. A7은 `category_temperature=0.01`과 공식 `mADM` 기준으로 best
+checkpoint를 선택한다.
+
+```bash
+CUDA_VISIBLE_DEVICES=6 python examples/task2/sample_code_submission/attrivision/run_attrivision_ablation.py \
+  --experiment A7 \
+  --mode train_eval \
+  --device cuda:0 \
+  --output-root outputs/attrivision_ablation_mADM
+```
 
 ### 재개
 
@@ -314,6 +326,18 @@ python examples/task2/sample_code_submission/package_submission.py \
 이 ZIP에는 fine-tuned text encoder가 만든 paired prompt feature와 learned temperature가
 함께 저장되므로 Codabench의 network-disabled 환경에서도 동일하게 추론한다. `paper_binary`
 checkpoint는 반드시 `--retrieval-scoring paired_l1`로 패키징한다.
+
+A7 checkpoint를 표준 제출 `run.py`로 사용할 때는 다음 preset을 사용한다. 이 preset은
+Category-NLL ranking(`T=0.01`)과 A7의 `resize_pad_crop` 평가 geometry를 ZIP 안에
+저장하므로, 제출 adapter에서도 학습 중 best checkpoint를 고른 동일한 rank 방식을
+사용한다.
+
+```bash
+python examples/task2/sample_code_submission/package_submission.py \
+  --checkpoint outputs/attrivision_ablation_mADM/A7/checkpoint_best.pth \
+  --model attrivision_a7 \
+  --output submissions/attrivision_a7.zip
+```
 
 ## Paired-L1 진단 실험
 

@@ -1,4 +1,4 @@
-"""Run the controlled A0--A6 AttriVision training-formulation ablations."""
+"""Run the controlled A0--A7 AttriVision training-formulation ablations."""
 from __future__ import annotations
 
 import csv
@@ -13,7 +13,9 @@ if str(SUBMISSION_DIR) not in sys.path:
 
 from attrivision.checkpoint import load_model  # noqa: E402
 from attrivision.cli import build_parser, run, validate_args  # noqa: E402
-from attrivision.engine.evaluator_abpr import evaluate_native52  # noqa: E402
+from attrivision.engine.evaluator_abpr import (  # noqa: E402
+    evaluate_native52, evaluate_native52_category_nll,
+)
 from attrivision.engine.trainer_attrivision import train  # noqa: E402
 from attrivision.transforms import build_eval_transform  # noqa: E402
 from upar.config import choose_device  # noqa: E402
@@ -27,12 +29,13 @@ EXPERIMENTS: dict[str, dict[str, str]] = {
     "A4": {"sampling": "multi", "target": "diagonal", "augmentation": "paper_like"},
     "A5": {"sampling": "multi", "target": "diagonal", "augmentation": "rrc_scale_050"},
     "A6": {"sampling": "single", "target": "multi_positive", "augmentation": "resize_pad_crop"},
+    "A7": {"sampling": "single", "target": "multi_positive", "augmentation": "resize_pad_crop"},
 }
 ROOT_OUTPUT = Path("outputs/attrivision_ablation")
 TABLE_METRICS = (
     ("AUROC", "macro_auroc"), ("InstF1", "instance_f1"),
     ("BitErr", "mean_hamming_error"), ("ExactMatch", "exact_match"),
-    ("R1", "rank1"), ("mAP", "map"),
+    ("R1", "rank1"), ("mAP", "map"), ("mADM", "mADM"),
 )
 PAIRWISE = (
     ("A1", "A0", "multiple attribute effect"),
@@ -42,6 +45,7 @@ PAIRWISE = (
     ("A4", "A3", "augmentation effect"),
     ("A5", "A3", "minimum RRC area 50% vs 8%"),
     ("A6", "A0", "full resize plus local translation vs A0 RRC"),
+    ("A7", "A6", "Category-NLL vs Native52 soft-L1 under the same A6 crop"),
 )
 
 
@@ -60,7 +64,11 @@ def _configure(args: Any) -> Path:
     args.lambda_attr = 0.0
     args.use_fce = True
     args.unique_prompts = False
-    args.validation_protocol = "native52"
+    # A7 is the Category-NLL counterpart to A6. Other A-series runs retain
+    # their original Native52 soft-L1 validation protocol.
+    args.validation_protocol = (
+        "native52_category_nll" if args.experiment == "A7" else "native52"
+    )
     args.retrieval_scoring = "paired_l1"  # documented intent; native52 evaluator is authoritative
     args.selection_metric = "mADM"
     args.clip_model = "ViT-B-32-quickgelu"
@@ -137,7 +145,7 @@ def print_and_save_summary(output_root: Path = ROOT_OUTPUT) -> None:
 
 def main() -> None:
     parser = build_parser()
-    parser.description = "Controlled AttriVision A0--A6 training ablations"
+    parser.description = "Controlled AttriVision A0--A7 training ablations"
     parser.add_argument("--experiment", choices=tuple(EXPERIMENTS))
     parser.add_argument(
         "--output-root", default=str(ROOT_OUTPUT),
@@ -156,7 +164,10 @@ def main() -> None:
         "experiment_spec": EXPERIMENTS[args.experiment],
         "binary_head_loss": False,
         "initialization": "OpenAI CLIP ViT-B/32",
-        "retrieval_protocol": "Native52 category softmax -> 40-D -> L1",
+        "retrieval_protocol": (
+            "Native52 Category-NLL" if args.validation_protocol == "native52_category_nll"
+            else "Native52 category softmax -> 40-D -> L1"
+        ),
     }
     _write_json(output_dir / "config.json", config)
     if args.mode == "smoke":
@@ -169,11 +180,19 @@ def main() -> None:
     checkpoint = train(args)
     device = choose_device(args.device)
     model, payload = load_model(checkpoint, device)
-    metrics = evaluate_native52(
-        model, payload["attribute_names"], Path(args.data_root).resolve(),
-        build_eval_transform(args.image_size, args.augmentation), device, args.eval_batch_size,
-        args.num_workers, args.amp, args.max_val_samples, args.attribute_temperature,
-    )
+    eval_transform = build_eval_transform(args.image_size, args.augmentation)
+    if args.validation_protocol == "native52_category_nll":
+        metrics = evaluate_native52_category_nll(
+            model, payload["attribute_names"], Path(args.data_root).resolve(),
+            eval_transform, device, args.eval_batch_size, args.num_workers, args.amp,
+            args.max_val_samples, args.category_temperature,
+        )
+    else:
+        metrics = evaluate_native52(
+            model, payload["attribute_names"], Path(args.data_root).resolve(),
+            eval_transform, device, args.eval_batch_size, args.num_workers, args.amp,
+            args.max_val_samples, args.attribute_temperature,
+        )
     checkpoint_metrics = payload.get("metrics", {})
     metrics.update({
         "fce_loss": checkpoint_metrics.get("fce_loss"),

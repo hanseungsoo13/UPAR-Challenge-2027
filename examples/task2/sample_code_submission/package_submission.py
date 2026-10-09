@@ -53,12 +53,35 @@ def load_checkpoint_metadata(source: Path | BinaryIO) -> dict[str, Any]:
     }
 
 
-def submission_checkpoint(checkpoint: Path, retrieval_scoring: str = "cosine_set",
-                          attribute_temperature: float | None = None) -> tuple[bytes | None, dict[str, Any]]:
+def submission_checkpoint(
+    checkpoint: Path,
+    retrieval_scoring: str = "cosine_set",
+    attribute_temperature: float | None = None,
+    category_temperature: float = 0.01,
+    augmentation: str = "center_crop",
+    model: str = "auto",
+) -> tuple[bytes | None, dict[str, Any]]:
     """Convert research AttriVision weights to a dependency-free inference payload."""
     metadata = load_checkpoint_metadata(checkpoint)
-    if metadata["architecture"] != "attrivision_openclip_vit_b_32":
+    architecture = metadata["architecture"]
+    if model == "convnext" and architecture in {
+        "attrivision_openclip_vit_b_32", "attrivision_submission_vit_b_32",
+    }:
+        raise ValueError("--model convnext requires a ConvNeXt checkpoint")
+    if model == "attrivision_a7":
+        if architecture != "attrivision_openclip_vit_b_32":
+            raise ValueError("--model attrivision_a7 requires an AttriVision research checkpoint")
+        retrieval_scoring = "native52_category_nll"
+        category_temperature = 0.01
+        augmentation = "resize_pad_crop"
+    if architecture != "attrivision_openclip_vit_b_32":
         return None, metadata
+    if retrieval_scoring not in {"cosine_set", "paired_l1", "native52_category_nll"}:
+        raise ValueError(f"Unknown AttriVision retrieval scoring: {retrieval_scoring}")
+    if augmentation not in {"center_crop", "resize_pad_crop"}:
+        raise ValueError(f"Unknown AttriVision submission augmentation: {augmentation}")
+    if category_temperature <= 0:
+        raise ValueError("category_temperature must be positive")
     from attrivision.datasets.attribute_prompts import (
         CategoryPromptMapper, PaperAttributePromptMapper, prompt_pairs_for_attributes,
     )
@@ -87,6 +110,8 @@ def submission_checkpoint(checkpoint: Path, retrieval_scoring: str = "cosine_set
         raise ValueError(
             "AttriVision submission packaging supports category_complete or paper_binary"
         )
+    if retrieval_scoring == "native52_category_nll" and prompt_mode != "category_complete":
+        raise ValueError("native52_category_nll requires a category_complete AttriVision checkpoint")
     with torch.inference_mode():
         text_features = (
             model.encode_text(model.tokenize(semantic_prompts)).float().cpu()
@@ -123,6 +148,8 @@ def submission_checkpoint(checkpoint: Path, retrieval_scoring: str = "cosine_set
         "paired_text_features": paired_text_features,
         "inverse_temperature": inverse_temperature,
         "retrieval_scoring": retrieval_scoring,
+        "category_temperature": float(category_temperature),
+        "augmentation": augmentation,
         "attribute_names": payload["attribute_names"],
         "epoch": payload.get("epoch"),
         "metrics": payload.get("metrics", {}),
@@ -160,8 +187,15 @@ def source_files() -> list[Path]:
     return sorted(files)
 
 
-def build_archive(checkpoint: Path, output: Path, retrieval_scoring: str = "cosine_set",
-                  attribute_temperature: float | None = None) -> None:
+def build_archive(
+    checkpoint: Path,
+    output: Path,
+    retrieval_scoring: str = "cosine_set",
+    attribute_temperature: float | None = None,
+    category_temperature: float = 0.01,
+    augmentation: str = "center_crop",
+    model: str = "auto",
+) -> None:
     if not checkpoint.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -170,7 +204,8 @@ def build_archive(checkpoint: Path, output: Path, retrieval_scoring: str = "cosi
         temporary.unlink()
 
     converted, metadata = submission_checkpoint(
-        checkpoint, retrieval_scoring, attribute_temperature,
+        checkpoint, retrieval_scoring, attribute_temperature, category_temperature,
+        augmentation, model,
     )
     with zipfile.ZipFile(temporary, "w") as archive:
         for path in source_files():
@@ -214,12 +249,26 @@ def main() -> None:
         help="output zip path (default: submissions/upar_task2_YYYYMMDD_HHMMSS.zip)",
     )
     parser.add_argument(
-        "--retrieval-scoring", choices=("cosine_set", "paired_l1"), default="cosine_set",
+        "--model", choices=("auto", "convnext", "attrivision_a7"), default="auto",
+        help="submission preset; auto preserves the checkpoint's architecture",
+    )
+    parser.add_argument(
+        "--retrieval-scoring",
+        choices=("cosine_set", "paired_l1", "native52_category_nll"),
+        default="cosine_set",
         help="AttriVision submission ranking method",
     )
     parser.add_argument(
         "--attribute-temperature", type=float,
         help="paired_l1 softmax temperature T (default: checkpoint's learned CLIP temperature)",
+    )
+    parser.add_argument(
+        "--category-temperature", type=float, default=0.01,
+        help="native52_category_nll softmax temperature",
+    )
+    parser.add_argument(
+        "--augmentation", choices=("center_crop", "resize_pad_crop"), default="center_crop",
+        help="AttriVision submission evaluation geometry",
     )
     args = parser.parse_args()
     output = args.output or default_output_path()
@@ -227,7 +276,8 @@ def main() -> None:
         raise ValueError("--output must end in .zip")
     build_archive(
         args.checkpoint.resolve(), output.resolve(),
-        args.retrieval_scoring, args.attribute_temperature,
+        args.retrieval_scoring, args.attribute_temperature, args.category_temperature,
+        args.augmentation, args.model,
     )
 
 

@@ -264,6 +264,18 @@ python examples/task2/sample_code_submission/package_submission.py \
   --checkpoint outputs/attrivision_task2_hybrid/checkpoint_best.pth
 ```
 
+A7 AttriVision checkpoint는 `--model attrivision_a7` preset으로 패키징한다. 이
+옵션은 제출용 `run.py`에 A7과 동일한 `native52_category_nll`, temperature
+`0.01`, `resize_pad_crop` 평가 전처리를 함께 저장한다. 기존 ConvNeXt 제출
+경로와 일반 checkpoint 패키징 동작은 그대로 유지된다.
+
+```bash
+python examples/task2/sample_code_submission/package_submission.py \
+  --checkpoint outputs/attrivision_ablation_mADM/A7/checkpoint_best.pth \
+  --model attrivision_a7 \
+  --output submissions/attrivision_a7.zip
+```
+
 이 경우 packager가 OpenCLIP text encoder로 52개 고정 prompt embedding을 미리
 계산하고, visual encoder weight만 제출용 checkpoint로 변환한다. 따라서 Codabench
 환경에 `open_clip_torch`가 없어도 실행되며 원본 약 605 MB checkpoint는 약 352 MB로
@@ -296,11 +308,20 @@ Submissions** 탭의 첨부 버튼으로 생성된 ZIP을 업로드한다. 제�
 - `load_model()`: checkpoint와 전처리 설정을 한 번 로드한다.
 - `predict_attributes(gallery, attribute_names)`: ConvNeXt 제출에서 gallery별
   `[N, 40]` attribute probability를 반환한다.
-- `rank_gallery(sample)`: ConvNeXt는 L1 distance를, AttriVision은 cosine
-  similarity 행렬을 반환한다.
+- `rank_gallery(sample)`: ConvNeXt는 L1 distance를, AttriVision은 선택된
+  cosine similarity 또는 Native52 distance 행렬을 반환한다. A7 preset으로
+  패키징한 AttriVision은 `native52_category_nll` distance를 반환한다.
+
+A7의 제출 ranking은 gallery의 52개 semantic-state cosine logit을 category별
+softmax(`T=0.01`)로 바꾼 뒤, query의 12개 category target에 대한 평균
+negative log-likelihood를 distance로 계산한다. 따라서 challenge ingestion이
+표준 `run.py`의 `rank_gallery()`를 호출해도 A7 validation과 같은 rank 방향이
+유지된다.
 
 추론 환경은 `UPAR_DEVICE`, `UPAR_CHECKPOINT`, `UPAR_BATCH_SIZE`,
-`UPAR_NUM_WORKERS`, `UPAR_AMP` 환경 변수로 조정할 수 있다.
+`UPAR_NUM_WORKERS`, `UPAR_AMP` 환경 변수로 조정할 수 있다. AttriVision 제출의
+ranking/geometry를 점검할 때는 `UPAR_RETRIEVAL_SCORING`,
+`UPAR_CATEGORY_TEMPERATURE`, `UPAR_AUGMENTATION`도 override할 수 있다.
 
 ## 9. 코드 구조
 
