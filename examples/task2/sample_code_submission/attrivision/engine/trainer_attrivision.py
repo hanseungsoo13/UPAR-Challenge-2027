@@ -459,6 +459,8 @@ def train(args: Any) -> Path:
             args.focal_alpha, args.focal_gamma, args.balance_max_weight,
             args.prototype_loss_weight, args.set_loss_weight,
             getattr(args, "mixed_consistency_weight", 0.1),
+            getattr(args, "mixed_set_positive", "exact"),
+            getattr(args, "mixed_min_shared_categories", 8),
         ).to(device)
     elif args.use_fce and args.training_objective == "task2_hybrid":
         criterion = Task2HybridLoss(
@@ -494,6 +496,8 @@ def train(args: Any) -> Path:
         "prototype_loss_weight": args.prototype_loss_weight,
         "set_loss_weight": args.set_loss_weight,
         "mixed_consistency_weight": getattr(args, "mixed_consistency_weight", 0.1),
+        "mixed_set_positive": getattr(args, "mixed_set_positive", "exact"),
+        "mixed_min_shared_categories": getattr(args, "mixed_min_shared_categories", 8),
         "balance_max_weight": args.balance_max_weight,
         "use_fce": args.use_fce,
         "lambda_attr": args.lambda_attr,
@@ -610,7 +614,9 @@ def train(args: Any) -> Path:
             f"A7-mixed objective: semantic_prototypes={semantic_labels.shape[1]}, "
             f"prototype_weight={args.prototype_loss_weight:g}, "
             f"set_weight={args.set_loss_weight:g}, "
-            f"consistency_weight={getattr(args, 'mixed_consistency_weight', 0.1):g}"
+            f"consistency_weight={getattr(args, 'mixed_consistency_weight', 0.1):g}, "
+            f"set_positive={getattr(args, 'mixed_set_positive', 'exact')}, "
+            f"min_shared_categories={getattr(args, 'mixed_min_shared_categories', 8)}"
         )
     try:
         for epoch in range(start_epoch, args.epochs + 1):

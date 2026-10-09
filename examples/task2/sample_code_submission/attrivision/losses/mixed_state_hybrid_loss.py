@@ -41,6 +41,8 @@ class MixedStateHybridLoss(nn.Module):
         prototype_weight: float = 0.25,
         set_weight: float = 1.0,
         consistency_weight: float = 0.1,
+        set_positive_mode: str = "exact",
+        min_shared_categories: int = 8,
     ) -> None:
         super().__init__()
         if positive_ratios.ndim != 1:
@@ -51,6 +53,10 @@ class MixedStateHybridLoss(nn.Module):
             raise ValueError("at least one hybrid loss weight must be positive")
         if consistency_weight < 0:
             raise ValueError("consistency_weight cannot be negative")
+        if set_positive_mode not in {"exact", "category_overlap"}:
+            raise ValueError("set_positive_mode must be 'exact' or 'category_overlap'")
+        if not 1 <= min_shared_categories <= len(group_specs):
+            raise ValueError("min_shared_categories must be within the group count")
         self.group_specs = [
             (str(kind), tuple(int(index) for index in indices))
             for kind, indices in group_specs
@@ -70,6 +76,8 @@ class MixedStateHybridLoss(nn.Module):
         self.prototype_weight = float(prototype_weight)
         self.set_weight = float(set_weight)
         self.consistency_weight = float(consistency_weight)
+        self.set_positive_mode = str(set_positive_mode)
+        self.min_shared_categories = int(min_shared_categories)
 
     @staticmethod
     def _category_balanced_query(
@@ -163,10 +171,18 @@ class MixedStateHybridLoss(nn.Module):
         set_logits = scale.float() * image_features.float() @ query_features.T
         overlap = targets @ targets.T
         semantic_counts = targets.sum(dim=1)
-        positive_mask = (
-            (overlap == semantic_counts[:, None])
-            & (overlap == semantic_counts[None, :])
-        )
+        if self.set_positive_mode == "exact":
+            positive_mask = (
+                (overlap == semantic_counts[:, None])
+                & (overlap == semantic_counts[None, :])
+            )
+        else:
+            shared_categories = torch.zeros_like(overlap)
+            for _, indices in self.group_specs:
+                shared_categories += (
+                    targets[:, list(indices)] @ targets[:, list(indices)].T > 0
+                ).to(shared_categories.dtype)
+            positive_mask = shared_categories >= self.min_shared_categories
         positive_mask.fill_diagonal_(True)
         i2t = _directional_loss(
             set_logits, positive_mask, True, self.focal_alpha, self.focal_gamma,

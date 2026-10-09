@@ -266,6 +266,34 @@ CUDA_VISIBLE_DEVICES=6 python examples/task2/sample_code_submission/attrivision/
 `training_objective=a7_mixed`, `validation_protocol=mixed_state_nll`에서 확인할 수
 있다.
 
+### A7-mixed ablation
+
+초기 Rank-1 하락 원인을 분리하기 위해 A7과 동일한 pretrained model, crop, batch,
+learning-rate를 유지한 loss ablation을 제공한다. mixed-state evaluator는 각
+category 내부의 state 수까지 평균해 12개 category가 같은 비중을 갖도록 한다.
+
+| 실험 | prototype | set | set positive |
+| --- | ---: | ---: | --- |
+| M0 | 0.25 | 1.00 | exact full state row |
+| M1 | 1.00 | 0.00 | set loss 제거 |
+| M2 | 1.00 | 0.25 | exact full state row |
+| M3 | 1.00 | 0.25 | 12개 category 중 8개 이상 공유 |
+
+한 번에 하나씩 실행한다.
+
+```bash
+CUDA_VISIBLE_DEVICES=6 python examples/task2/sample_code_submission/attrivision/run_a7_mixed_ablation.py \
+  --experiment M1 \
+  --mode train_eval \
+  --device cuda:0 \
+  --output-root outputs/attrivision_ablation_mixed
+```
+
+`M1`이 회복되고 `M0`/`M2`가 낮으면 exact-set contrastive 항이 문제일 가능성이
+높다. `M3`는 동일한 full row가 드문 문제를 category-overlap positive로 완화하는
+실험이다. 각 실험의 resolved loss와 positive 설정은 `config.json` 및 `train.log`에
+기록된다.
+
 ### 재개
 
 ```bash
@@ -292,6 +320,8 @@ epoch다.
 | `--training-objective` | `task2_hybrid` | Task 2 hybrid 또는 논문식 `paper_fce` |
 | `--prototype-loss-weight` | `0.25` | 전체 semantic prototype focal loss 가중치 |
 | `--set-loss-weight` | `1.0` | attribute-set contrastive loss 가중치 |
+| `--mixed-set-positive` | `exact` | A7-mixed set positive 정의 |
+| `--mixed-min-shared-categories` | `8` | `category_overlap`의 최소 공유 category 수 |
 | `--balance-max-weight` | `10.0` | 희소 state class-balance weight 상한 |
 | `--loss` | `focal_clip` | `clip` 또는 `focal_clip` |
 | `--focal-alpha` | `1.0` | FCE alpha |

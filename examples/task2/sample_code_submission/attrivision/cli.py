@@ -94,6 +94,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--mixed-consistency-weight", type=float, default=0.1,
         help="penalty for residual 'other' and known-state co-activation",
     )
+    parser.add_argument(
+        "--mixed-set-positive", choices=("exact", "category_overlap"), default="exact",
+        help="A7-mixed set positives: exact full state row or shared-category threshold",
+    )
+    parser.add_argument(
+        "--mixed-min-shared-categories", type=int, default=8,
+        help="minimum shared categories for category_overlap set positives",
+    )
     parser.add_argument("--lambda-attr", type=float, default=1.0)
     parser.add_argument(
         "--category-ce-mode", choices=("off", "only", "combined"), default="off",
@@ -212,6 +220,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("at least one hybrid loss weight must be positive")
     if args.mixed_consistency_weight < 0:
         raise ValueError("mixed-consistency-weight cannot be negative")
+    if not 1 <= args.mixed_min_shared_categories <= 12:
+        raise ValueError("mixed-min-shared-categories must be between 1 and 12")
     if args.lambda_attr < 0:
         raise ValueError("lambda-attr cannot be negative")
     if args.category_ce_weight < 0 or args.category_temperature <= 0:
@@ -257,6 +267,8 @@ def run_smoke(args: argparse.Namespace) -> None:
             args.focal_alpha, args.focal_gamma, args.balance_max_weight,
             args.prototype_loss_weight, args.set_loss_weight,
             args.mixed_consistency_weight,
+            args.mixed_set_positive,
+            min(args.mixed_min_shared_categories, 2),
         ).to(device)
         model.train()
         image_features = model.encode_image(images)

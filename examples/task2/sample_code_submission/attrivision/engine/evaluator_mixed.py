@@ -72,10 +72,15 @@ def mixed_state_distances(
                 contribution = -(normalized @ log_prob.T)
             else:
                 log_not = np.log(np.clip(1.0 - probabilities[:, indices], epsilon, 1.0))
+                # Average the state-wise BCE inside the category.  Without
+                # this normalization, a 12-state colour category contributes
+                # roughly twelve times as much as a binary category, even
+                # though the training objective averages states within each
+                # multi-label group.
                 contribution = -(
                     block_targets @ log_prob.T
                     + (1.0 - block_targets) @ log_not.T
-                )
+                ) / float(len(indices))
                 # A colour group has no fallback in A7-mixed.  If a future
                 # annotation has no colour, omit only that missing category
                 # rather than creating an artificial target.
