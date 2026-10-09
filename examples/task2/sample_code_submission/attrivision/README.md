@@ -270,6 +270,28 @@ CUDA_VISIBLE_DEVICES=6 python examples/task2/sample_code_submission/attrivision/
 확인할 수 있다. `mixed_state_nll`은 mixed-state scoring을 별도로 진단할 때만
 사용한다.
 
+### A7-FCE-50: mixed vocabulary with the original A7 FCE
+
+`A7-FCE-50`은 mixed 50-state vocabulary가 성능 하락의 원인인지, 아니면
+기존 A7의 학습 signal을 제거한 것이 원인인지 분리하는 진단 실험이다. 학습은
+기존 A7과 동일한 sampled single-state FocalCLIP 및 `multi_positive` mask를
+사용하고, mixed prototype CE/BCE와 set-level hybrid loss는 사용하지 않는다.
+평가는 A7과 동일한 Native52 Category-NLL이다.
+
+```bash
+CUDA_VISIBLE_DEVICES=6 python examples/task2/sample_code_submission/attrivision/run_a7_fce_mixed.py \
+  --mode train_eval \
+  --device cuda:0 \
+  --output-dir outputs/attrivision_ablation_mixed/A7-FCE-50
+```
+
+해석은 간단하다.
+
+```text
+A7-FCE-50 ≈ 기존 A7  → mixed vocabulary는 문제가 아님
+A7-FCE-50도 낮음     → 50-state prompt/ontology가 원인일 가능성
+```
+
 ### A7-mixed ablation
 
 초기 Rank-1 하락 원인을 분리하기 위해 A7과 동일한 pretrained model, crop, batch,
