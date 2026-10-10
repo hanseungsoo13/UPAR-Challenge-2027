@@ -321,6 +321,34 @@ CUDA_VISIBLE_DEVICES=6 python examples/task2/sample_code_submission/attrivision/
 보조 항의 가중치는 기본 `0.1`이며 `--mixed-aux-prototype-weight`로 바꿀 수 있다.
 `train.log`와 checkpoint metadata에는 `set_weight=0` 및 보조 가중치가 기록된다.
 
+### Frozen CLIP + image adapter feasibility
+
+prototype CE/BCE를 CLIP 본체가 아니라 CLIP embedding 위의 작은 adapter에만
+적용하는 feasibility runner도 제공한다. CLIP image/text encoder와 learned
+temperature는 고정하고, 512-D image embedding 뒤에 identity-initialized
+residual bottleneck adapter만 학습한다. Native52 평가에서도 adapter를 거친
+image embedding과 고정된 CLIP text embedding을 사용한다. runner는 Native52
+Category-NLL과 mixed-state NLL을 모두 출력한다. Native52는 기존 A7 및 공식
+mADM과의 비교 기준이고, mixed-state NLL은 mixed CE/BCE와 동일한
+single-softmax/multi-sigmoid semantics가 retrieval에 반영되는지 확인하는
+진단 기준이다.
+
+```bash
+CUDA_VISIBLE_DEVICES=6 python \
+  examples/task2/sample_code_submission/attrivision/run_mixed_adapter_feasibility.py \
+  --mode train_eval \
+  --device cuda:0 \
+  --checkpoint outputs/attrivision_ablation_mADM/A7/checkpoint_best.pth \
+  --epochs 1 \
+  --max-train-samples 256 \
+  --max-val-samples 256 \
+  --output-dir outputs/attrivision_adapter_feasibility
+```
+
+먼저 구조만 확인하려면 `--mode smoke`를 사용한다. 이 실험은 CLIP 본체를
+fine-tuning하는 실험이 아니라, 고정된 CLIP embedding을 adapter로 추가 학습할
+수 있는지 확인하는 실험이다.
+
 ### A7-mixed ablation
 
 초기 Rank-1 하락 원인을 분리하기 위해 A7과 동일한 pretrained model, crop, batch,
