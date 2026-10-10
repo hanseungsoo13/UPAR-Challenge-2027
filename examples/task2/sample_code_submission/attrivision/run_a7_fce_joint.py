@@ -230,13 +230,17 @@ def _resolved_config(args: argparse.Namespace) -> dict[str, Any]:
     for key, value in overrides.items():
         if value is not None:
             config[key] = value
-    if args.lambdas is not None:
-        config["lambda_joint"] = args.lambdas
-    if not config.get("lambda_joint"):
-        raise ValueError("config.lambda_joint must contain at least one value")
-    config["lambda_joint"] = [float(value) for value in config["lambda_joint"]]
-    if any(value <= 0 for value in config["lambda_joint"]):
-        raise ValueError("lambda_joint values must be positive")
+    if args.lambda_joint is not None:
+        config["lambda_joint"] = args.lambda_joint
+    if isinstance(config.get("lambda_joint"), list):
+        if len(config["lambda_joint"]) != 1:
+            raise ValueError(
+                "Run one lambda per process. Pass --lambda-joint 0.1, 0.5, or 1.0."
+            )
+        config["lambda_joint"] = config["lambda_joint"][0]
+    config["lambda_joint"] = float(config["lambda_joint"])
+    if config["lambda_joint"] <= 0:
+        raise ValueError("lambda_joint must be positive")
     config["checkpoint"] = str(Path(config["checkpoint"]).resolve())
     config["data_root"] = str(Path(config["data_root"]).resolve())
     config["output_root"] = str(Path(config["output_root"]).resolve())
@@ -428,7 +432,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-train-samples", type=int)
     parser.add_argument("--max-val-samples", type=int)
     parser.add_argument("--seed", type=int)
-    parser.add_argument("--lambdas", type=float, nargs="+")
+    parser.add_argument(
+        "--lambda-joint", type=float,
+        help="one lambda value for this process; run separate processes for each value",
+    )
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=None)
     return parser
 
@@ -453,7 +460,7 @@ def main() -> None:
     train_table = read_gt_csv(train_gt)
     train_roots = [Path(config["data_root"]), train_gt.parent, REPOSITORY_ROOT]
     print(f"A7 base checkpoint: {checkpoint}", flush=True)
-    print(f"Device: {device}; lambdas: {config['lambda_joint']}", flush=True)
+    print(f"Device: {device}; lambda_joint: {config['lambda_joint']}", flush=True)
 
     set_seed(config["seed"], config.get("deterministic", False))
     baseline_model, baseline_payload = load_model(checkpoint, device)
@@ -482,12 +489,11 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    results = [baseline_record]
-    for lambda_joint in config["lambda_joint"]:
-        result = _train_lambda(
-            lambda_joint, config, train_table, train_roots, baseline_metrics, device,
-        )
-        results.append(result)
+    lambda_joint = config["lambda_joint"]
+    result = _train_lambda(
+        lambda_joint, config, train_table, train_roots, baseline_metrics, device,
+    )
+    results = [baseline_record, result]
 
     comparison_rows = []
     for result in results:
