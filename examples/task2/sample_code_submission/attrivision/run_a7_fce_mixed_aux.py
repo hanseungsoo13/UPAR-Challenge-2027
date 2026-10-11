@@ -36,7 +36,6 @@ def main() -> None:
     args.lambda_attr = 0.0
     args.category_ce_mode = "off"
     args.unique_prompts = False
-    args.mixed_aux_prototype_weight = 0.1
     args.set_loss_weight = 0.0
     args.validation_protocol = "native52_category_nll"
     args.category_temperature = 0.01

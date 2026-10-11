@@ -394,6 +394,55 @@ CUDA_VISIBLE_DEVICES=6 python examples/task2/sample_code_submission/attrivision/
 `checkpoint_last.pth`를 사용한다. `--epochs`는 추가 epoch가 아니라 전체 목표
 epoch다.
 
+### A7 best checkpoint 기반 FCE feasibility
+
+FCE를 제거하지 않고 A7 best checkpoint에서 이어서 다음 가설을 비교할 수 있다.
+
+```bash
+python examples/task2/sample_code_submission/attrivision/run_a7_fce_feasibility.py \
+  --experiment F1_aux_010 \
+  --a7-checkpoint outputs/attrivision_ablation_mADM/A7/checkpoint_best.pth \
+  --device cuda:0 \
+  --epochs 50
+```
+
+전체 suite는 다음과 같이 실행한다.
+
+```bash
+python examples/task2/sample_code_submission/attrivision/run_a7_fce_feasibility.py \
+  --all \
+  --a7-checkpoint outputs/attrivision_ablation_mADM/A7/checkpoint_best.pth \
+  --device cuda:0 \
+  --epochs 50
+```
+
+이번에 추가한 clean category-complete 비교만 실행하려면 다음처럼 개별 실행한다.
+`F5`와 `F6`은 auxiliary 없이 text/vision trainability만 비교하고, `F7`은 full
+model에서 LR만 `5e-7`로 낮춘다.
+
+```bash
+CUDA_VISIBLE_DEVICES=6 python \
+  examples/task2/sample_code_submission/attrivision/run_a7_fce_feasibility.py \
+  --clean \
+  --a7-checkpoint outputs/attrivision_ablation_mADM/A7/checkpoint_best.pth \
+  --output-root outputs/attrivision_fce_feasibility_clean \
+  --device cuda:0 \
+  --epochs 30 \
+  --minimum-training-epochs 10 \
+  --early-stopping-patience 5
+```
+
+`F6_fce_last2`, `F7_fce_ultralow_lr`도 `--experiment` 값만 바꿔 같은 방식으로
+실행한다. 기존 8개와 clean 3개를 한 번에 모두 실행하려면 `--all`을 사용한다.
+
+실험은 모두 FCE를 주 loss로 유지한다. `F0`는 low-LR FCE continuation,
+`F1/F2`는 mixed CE/BCE auxiliary 가중치 `0.10/0.25`, `F3`는 mixed auxiliary와
+text tower/temperature 고정, `F4`는 mixed auxiliary와 마지막 vision block 2개만
+학습한다. 추가한 clean feasibility인 `F5/F6/F7`은 mixed auxiliary를 제거하고
+`category_complete`를 고정한 뒤, text freeze/last-2-block/ultra-low-LR 효과를
+각각 분리해서 본다. 결과는 각 실험 디렉터리와
+`outputs/attrivision_fce_feasibility/summary.json`에 기록된다.
+
 ## 주요 옵션
 
 | 옵션 | 기본값 | 의미 |

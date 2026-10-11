@@ -60,6 +60,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="training crop policy; resize_pad_crop uses full resize plus local translation",
     )
     parser.add_argument("--learning-rate", type=float, default=1e-5)
+    parser.add_argument(
+        "--visual-learning-rate", type=float,
+        help="optional learning rate for CLIP visual parameters",
+    )
+    parser.add_argument(
+        "--text-learning-rate", type=float,
+        help="optional learning rate for CLIP text parameters",
+    )
     parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument("--text-sampling", "--text_sampling", choices=("single", "multi"), default="single")
     parser.add_argument("--multi-attributes", type=int, default=3)
@@ -123,6 +131,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--freeze-binary-head", action=argparse.BooleanOptionalAction, default=False,
         help="exclude the unused 40-D head from gradients and optimizer groups",
+    )
+    parser.add_argument(
+        "--freeze-text-encoder", action=argparse.BooleanOptionalAction, default=False,
+        help="freeze the CLIP text tower while retaining FCE training",
+    )
+    parser.add_argument(
+        "--freeze-logit-scale", action=argparse.BooleanOptionalAction, default=False,
+        help="freeze CLIP logit_scale to prevent temperature drift",
+    )
+    parser.add_argument(
+        "--trainable-vision-blocks", type=int, default=0,
+        help="number of final ViT vision blocks to train; 0 means all visual parameters",
     )
     parser.add_argument("--use-fce", type=lambda value: value.lower() in {"1", "true", "yes", "y"}, default=True,
                         help="include the existing 52-state FCE objective (true/false)")
@@ -215,12 +235,21 @@ def validate_args(args: argparse.Namespace) -> None:
             raise ValueError(f"{field} has an invalid value: {getattr(args, field)}")
     if args.warmup_epochs < 0:
         raise ValueError("warmup-epochs cannot be negative")
-    if args.learning_rate <= 0 or args.min_learning_rate < 0 or args.weight_decay < 0 or args.rotation < 0:
+    if (
+        args.learning_rate <= 0
+        or (args.visual_learning_rate is not None and args.visual_learning_rate <= 0)
+        or (args.text_learning_rate is not None and args.text_learning_rate <= 0)
+        or args.min_learning_rate < 0
+        or args.weight_decay < 0
+        or args.rotation < 0
+    ):
         raise ValueError("learning-rate must be positive; weight-decay and rotation cannot be negative")
     if args.min_learning_rate > args.learning_rate:
         raise ValueError("min-learning-rate cannot exceed learning-rate")
     if args.warmup_epochs >= args.epochs and not args.debug:
         raise ValueError("warmup-epochs must be smaller than epochs")
+    if args.trainable_vision_blocks < 0:
+        raise ValueError("trainable-vision-blocks cannot be negative")
     if args.image_size != 224:
         raise ValueError("Vanilla CLIP ViT-B/32 requires --image-size 224")
     if args.focal_alpha < 0 or args.focal_gamma < 0:

@@ -291,7 +291,7 @@ def _train_lambda(
         "focal_clip", "multi_positive", config["focal_alpha"], config["focal_gamma"],
     )
     optimizer = torch.optim.AdamW(
-        _optimizer_groups(model, config["weight_decay"]), lr=config["learning_rate"],
+        _optimizer_groups(model, config["weight_decay"], config["learning_rate"]),
     )
     scheduler = build_scheduler(
         optimizer, len(loader), config["epochs"], config["warmup_epochs"],

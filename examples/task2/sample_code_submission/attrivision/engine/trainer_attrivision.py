@@ -395,21 +395,74 @@ def train_one_epoch_binary(
     return _finish_epoch_totals(totals, device)
 
 
-def _optimizer_groups(model: nn.Module, weight_decay: float) -> list[dict[str, Any]]:
-    """Apply AdamW decay only to matrix/kernel weights, as in standard CLIP tuning."""
-    decay: list[nn.Parameter] = []
-    no_decay: list[nn.Parameter] = []
+def _optimizer_groups(
+    model: nn.Module, weight_decay: float, learning_rate: float,
+    visual_learning_rate: float | None = None,
+    text_learning_rate: float | None = None,
+) -> list[dict[str, Any]]:
+    """Build AdamW groups with optional tower-specific learning rates."""
+    grouped: dict[tuple[float, bool], list[nn.Parameter]] = {}
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
-        if parameter.ndim < 2 or name.endswith("logit_scale"):
-            no_decay.append(parameter)
+        if name.startswith("clip.visual.") and visual_learning_rate is not None:
+            group_lr = visual_learning_rate
+        elif name.startswith("clip.") and text_learning_rate is not None:
+            group_lr = text_learning_rate
         else:
-            decay.append(parameter)
-    return [
-        {"params": decay, "weight_decay": weight_decay},
-        {"params": no_decay, "weight_decay": 0.0},
-    ]
+            group_lr = learning_rate
+        use_decay = parameter.ndim >= 2 and not name.endswith("logit_scale")
+        grouped.setdefault((group_lr, use_decay), []).append(parameter)
+    groups: list[dict[str, Any]] = []
+    for (group_lr, use_decay), parameters in sorted(grouped.items(), key=lambda item: item[0]):
+        groups.append({
+            "params": parameters,
+            "lr": group_lr,
+            "weight_decay": weight_decay if use_decay else 0.0,
+        })
+    return groups
+
+
+def _configure_trainability(model: AttriVision, args: Any) -> None:
+    """Apply feasibility-study freezing without changing the FCE objective."""
+    for parameter in model.parameters():
+        parameter.requires_grad_(True)
+
+    if getattr(args, "freeze_text_encoder", False):
+        text_prefixes = (
+            "clip.token_embedding", "clip.positional_embedding", "clip.transformer",
+            "clip.ln_final", "clip.text_projection",
+        )
+        for name, parameter in model.named_parameters():
+            if name.startswith(text_prefixes):
+                parameter.requires_grad_(False)
+
+    if getattr(args, "freeze_logit_scale", False):
+        model.clip.logit_scale.requires_grad_(False)
+
+    trainable_blocks = int(getattr(args, "trainable_vision_blocks", 0))
+    if trainable_blocks:
+        visual = model.clip.visual
+        blocks = getattr(getattr(visual, "transformer", None), "resblocks", None)
+        if blocks is None:
+            raise RuntimeError("The selected CLIP visual tower has no transformer resblocks")
+        if trainable_blocks > len(blocks):
+            raise ValueError(
+                f"trainable-vision-blocks={trainable_blocks} exceeds visual depth {len(blocks)}"
+            )
+        for parameter in visual.parameters():
+            parameter.requires_grad_(False)
+        for block in list(blocks)[-trainable_blocks:]:
+            for parameter in block.parameters():
+                parameter.requires_grad_(True)
+        for module_name in ("ln_post", "proj"):
+            module = getattr(visual, module_name, None)
+            if module is not None:
+                if isinstance(module, nn.Parameter):
+                    module.requires_grad_(True)
+                else:
+                    for parameter in module.parameters():
+                        parameter.requires_grad_(True)
 
 
 def train(args: Any) -> Path:
@@ -431,6 +484,7 @@ def train(args: Any) -> Path:
         missing, unexpected = model.load_state_dict(init_state, strict=False)
         if set(missing) - {"binary_head.weight", "binary_head.bias"} or unexpected:
             raise ValueError(f"Invalid init checkpoint mismatch: missing={missing}, unexpected={unexpected}")
+    _configure_trainability(model, args)
     if getattr(args, "freeze_binary_head", False):
         for parameter in model.binary_head.parameters():
             parameter.requires_grad_(False)
@@ -587,6 +641,11 @@ def train(args: Any) -> Path:
         "balance_max_weight": args.balance_max_weight,
         "use_fce": args.use_fce,
         "lambda_attr": args.lambda_attr,
+        "visual_learning_rate": getattr(args, "visual_learning_rate", None),
+        "text_learning_rate": getattr(args, "text_learning_rate", None),
+        "freeze_text_encoder": getattr(args, "freeze_text_encoder", False),
+        "freeze_logit_scale": getattr(args, "freeze_logit_scale", False),
+        "trainable_vision_blocks": getattr(args, "trainable_vision_blocks", 0),
         "category_ce_mode": category_mode,
         "category_ce_weight": getattr(args, "category_ce_weight", 1.0),
         "category_temperature": getattr(args, "category_temperature", 0.01),
@@ -597,7 +656,11 @@ def train(args: Any) -> Path:
         "positive_rates": positive_rates.tolist(),
     }
     optimizer = torch.optim.AdamW(
-        _optimizer_groups(model, args.weight_decay), lr=args.learning_rate,
+        _optimizer_groups(
+            model, args.weight_decay, args.learning_rate,
+            getattr(args, "visual_learning_rate", None),
+            getattr(args, "text_learning_rate", None),
+        ),
     )
     scheduler = build_scheduler(
         optimizer, len(loader), args.epochs, args.warmup_epochs,
@@ -656,6 +719,13 @@ def train(args: Any) -> Path:
         f"Initialization checkpoint: {args.init_checkpoint if args.init_checkpoint else 'pretrained/default'}; "
         f"binary_head={'newly_initialized' if args.init_checkpoint else 'newly_initialized'}; "
         f"use_fce={args.use_fce}, lambda_attr={args.lambda_attr:g}"
+    )
+    logger.log(
+        f"Feasibility freezing: freeze_text={getattr(args, 'freeze_text_encoder', False)}, "
+        f"freeze_logit_scale={getattr(args, 'freeze_logit_scale', False)}, "
+        f"trainable_vision_blocks={getattr(args, 'trainable_vision_blocks', 0)}, "
+        f"visual_lr={getattr(args, 'visual_learning_rate', None)}, "
+        f"text_lr={getattr(args, 'text_learning_rate', None)}"
     )
     logger.log(f"Training samples={len(dataset)}, attributes={len(table.attribute_names)}")
     total_parameters = sum(parameter.numel() for parameter in model.parameters())
