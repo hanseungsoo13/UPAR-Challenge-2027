@@ -45,12 +45,13 @@ def configure(args: argparse.Namespace) -> None:
     args.output_dir = str(Path(args.output_root) / experiment)
     unseen_domain = args.unseen_domain
     args.mode = "eval" if experiment == "E0" and not unseen_domain else "train_eval"
-    args.epochs = 10
     args.clip_model = "ViT-B-32-quickgelu"
     args.pretrained_tag = "openai"
     args.no_pretrained = False
     args.init_checkpoint = None
-    args.resume = None
+    # Preserve an explicit --resume so an interrupted run can be extended
+    # to a larger total epoch target.  --init-checkpoint remains disabled
+    # because every DG ablation must start from the same OpenAI CLIP init.
     args.image_size = 224
     args.prompt_mode = "category_complete"
     args.training_objective = "paper_fce"
@@ -150,6 +151,9 @@ def print_summary(metrics: dict[str, Any]) -> None:
 def main() -> None:
     parser = build_parser()
     parser.description = "A7 Domain Generalization screening experiments E0--E4"
+    # Keep the short screening default, but do not overwrite an explicit
+    # --epochs value supplied by the user.
+    parser.set_defaults(epochs=10)
     parser.add_argument("--experiment", choices=EXPERIMENTS, required=True)
     parser.add_argument("--output-root", default=str(ROOT_OUTPUT))
     args = parser.parse_args()
