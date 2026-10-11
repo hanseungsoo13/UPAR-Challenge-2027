@@ -443,6 +443,30 @@ text tower/temperature 고정, `F4`는 mixed auxiliary와 마지막 vision block
 각각 분리해서 본다. 결과는 각 실험 디렉터리와
 `outputs/attrivision_fce_feasibility/summary.json`에 기록된다.
 
+### A7 best 이후 Native52 stage-2 objective
+
+A7 FCE를 먼저 학습한 뒤 best checkpoint에서 Native52 category geometry를
+후반 보정하는 실험이다. N1은 FCE를 끄고 12개 category-local CE만 사용하며,
+N2는 FCE를 유지하고 Native52 CE를 `0.05 * category_ce` 보조항으로 추가한다.
+두 실험 모두 `category_complete` 52-state prompt와 원래 AttriVision CLIP 구조를
+그대로 사용하며 adapter나 mixed 50-state loss는 사용하지 않는다.
+
+```bash
+CUDA_VISIBLE_DEVICES=6 python \
+  examples/task2/sample_code_submission/attrivision/run_a7_native52_stage2.py \
+  --all \
+  --a7-checkpoint outputs/attrivision_ablation_mADM/A7/checkpoint_best.pth \
+  --output-root outputs/attrivision_native52_stage2 \
+  --device cuda:0 \
+  --epochs 30 \
+  --minimum-training-epochs 10 \
+  --early-stopping-patience 5
+```
+
+하나만 실행하려면 `--all` 대신 `--experiment N1_native52_only` 또는
+`--experiment N2_fce_native52`를 사용한다. N2의 보조 가중치는
+`--category-ce-weight 0.01`, `0.03`, `0.10`처럼 바꿔 비교할 수 있다.
+
 ## 주요 옵션
 
 | 옵션 | 기본값 | 의미 |
