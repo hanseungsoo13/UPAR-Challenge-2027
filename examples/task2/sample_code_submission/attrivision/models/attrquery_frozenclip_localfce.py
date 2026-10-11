@@ -158,16 +158,27 @@ class CategoryCrossAttention(nn.Module):
             self.norm2 = nn.LayerNorm(visual_dim)
         self.output_projection = nn.Linear(visual_dim, text_dim)
 
-    def forward(self, patch_tokens: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, patch_tokens: torch.Tensor, return_attention: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if patch_tokens.ndim != 3:
             raise ValueError(f"Expected patch tokens [B,N,D], got {tuple(patch_tokens.shape)}")
         batch_size = patch_tokens.shape[0]
         queries = self.category_queries.unsqueeze(0).expand(batch_size, -1, -1)
-        attended, _ = self.attention(queries, patch_tokens, patch_tokens, need_weights=False)
+        attended, attention = self.attention(
+            queries, patch_tokens, patch_tokens,
+            need_weights=return_attention,
+            average_attn_weights=False,
+        )
         output = self.norm1(queries + self.dropout(attended))
         if self.use_ffn:
             output = self.norm2(output + self.dropout(self.ffn(output)))
-        return F.normalize(self.output_projection(output.float()), dim=-1)
+        features = F.normalize(self.output_projection(output.float()), dim=-1)
+        if return_attention:
+            if attention is None:
+                raise RuntimeError("Cross-attention weights were requested but not returned")
+            return features, attention
+        return features
 
 
 class AttrQueryFrozenCLIPLocalFCE(nn.Module):
@@ -280,6 +291,43 @@ class AttrQueryFrozenCLIPLocalFCE(nn.Module):
             return output.unsqueeze(1).expand(-1, self.num_categories, -1)
         patch_tokens = self._frozen_patch_tokens(images)
         return self.local_head(patch_tokens)
+
+    def category_features_with_attention(
+        self, images: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, tuple[int, int]]:
+        """Return local features and per-head ``[B,H,C,N]`` attention weights.
+
+        This method is inference-only by contract and is intentionally kept
+        separate from the regular training forward path.
+        """
+        if self.feature_mode != "local":
+            raise RuntimeError("Attention diagnostics require feature_mode='local'")
+        patch_tokens = self._frozen_patch_tokens(images)
+        result = self.local_head(patch_tokens, return_attention=True)
+        features, attention = result
+        patch_count = patch_tokens.shape[1]
+        visual = self.base.clip.visual
+        conv1 = getattr(visual, "conv1", None)
+        stride = getattr(conv1, "stride", (1, 1))
+        if isinstance(stride, int):
+            stride_h = stride_w = int(stride)
+        else:
+            stride_h, stride_w = int(stride[0]), int(stride[1])
+        grid_h = (int(images.shape[-2]) + stride_h - 1) // stride_h
+        grid_w = (int(images.shape[-1]) + stride_w - 1) // stride_w
+        if grid_h * grid_w != patch_count:
+            side = int(round(patch_count ** 0.5))
+            if side * side != patch_count:
+                raise RuntimeError(
+                    f"Cannot reconstruct patch grid for {patch_count} tokens "
+                    f"from input {tuple(images.shape[-2:])}"
+                )
+            grid_h = grid_w = side
+        if attention.shape[-1] != patch_count:
+            raise RuntimeError(
+                f"Attention source length {attention.shape[-1]} differs from patch count {patch_count}"
+            )
+        return features, attention, (grid_h, grid_w)
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         return self.category_features(images)
