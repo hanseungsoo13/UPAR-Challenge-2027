@@ -1054,6 +1054,24 @@ def train(args: Any) -> Path:
 
             elapsed = time.time() - started
             lr = float(optimizer.param_groups[0]["lr"])
+            domain_log = ""
+            if "domain_macro_mADM" in metrics:
+                domain_parts = []
+                for domain in ("PA100k", "PETA", "Market1501"):
+                    prefix = f"domain_{domain}_"
+                    if f"{prefix}mADM" not in metrics:
+                        continue
+                    domain_parts.append(
+                        f"{domain} R1={100 * metrics[f'{prefix}rank1']:.2f}%, "
+                        f"mADM={100 * metrics[f'{prefix}mADM']:.2f}%"
+                    )
+                domain_log = ", " + ", ".join(domain_parts)
+                if "unseen_mADM" in metrics:
+                    domain_log += (
+                        f", Unseen({metrics['unseen_domain']}) "
+                        f"R1={100 * metrics['unseen_rank1']:.2f}%, "
+                        f"mADM={100 * metrics['unseen_mADM']:.2f}%"
+                    )
             logger.log(
                 f"Epoch {epoch:03d}/{args.epochs}: total={losses['loss']:.6f}, "
                 f"fce={losses.get('fce', 0.0):.6f}, bce={losses.get('bce', 0.0):.6f}, "
@@ -1081,6 +1099,7 @@ def train(args: Any) -> Path:
                       f"mADM={100 * metrics['domain_macro_mADM']:.2f}%, "
                       f"Worst={100 * metrics['worst_domain_mADM']:.2f}%"
                       if "domain_macro_mADM" in metrics else "")
+                   + domain_log
                    if metrics else "")
                 + (f", batch_avg={losses['average_batch_size']:.1f}, "
                    f"VRAM={losses['cuda_peak_allocated_gib']:.2f}/"
