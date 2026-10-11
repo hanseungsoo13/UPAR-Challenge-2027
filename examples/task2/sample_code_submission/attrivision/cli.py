@@ -194,6 +194,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--domain-wise-validation", action=argparse.BooleanOptionalAction, default=False,
         help="Also score domain query groups with the complete validation gallery.",
     )
+    parser.add_argument(
+        "--unseen-domain", default=None,
+        help="Exclude this image-path domain prefix from training (e.g. Market1501).",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--debug", action="store_true")
@@ -303,6 +307,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("rsc-drop-ratio must be in [0, 1)")
     if args.swad_start_epoch < 1:
         raise ValueError("swad-start-epoch must be positive")
+    if args.unseen_domain is not None and not args.unseen_domain.strip():
+        raise ValueError("unseen-domain cannot be empty")
     if args.resume == "__LAST__":
         args.resume = str(Path(args.output_dir) / "checkpoint_last.pth")
     if args.resume and args.mode not in {"train", "train_eval"}:

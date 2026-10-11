@@ -43,7 +43,8 @@ def _write_json(path: Path, value: Any) -> None:
 def configure(args: argparse.Namespace) -> None:
     experiment = args.experiment
     args.output_dir = str(Path(args.output_root) / experiment)
-    args.mode = "eval" if experiment == "E0" else "train_eval"
+    unseen_domain = args.unseen_domain
+    args.mode = "eval" if experiment == "E0" and not unseen_domain else "train_eval"
     args.epochs = 10
     args.clip_model = "ViT-B-32-quickgelu"
     args.pretrained_tag = "openai"
@@ -69,12 +70,16 @@ def configure(args: argparse.Namespace) -> None:
     args.paper_faithful = False
     args.domain_wise_validation = True
     args.training_log_filename = "training_log.csv"
+    args.unseen_domain = unseen_domain
     args.distill_weight = 0.0
     args.rsc_drop_ratio = 0.0
     args.swad_start_epoch = 3
 
     if experiment == "E0":
-        args.checkpoint = str(Path(args.checkpoint) if args.checkpoint else A7_CHECKPOINT)
+        args.checkpoint = (
+            None if unseen_domain
+            else str(Path(args.checkpoint) if args.checkpoint else A7_CHECKPOINT)
+        )
         args.dg_method = "none"
     elif experiment == "E1":
         args.dg_method = "miro"
@@ -108,6 +113,7 @@ def evaluate_and_save(args: argparse.Namespace, checkpoint: Path) -> dict[str, A
         "checkpoint_epoch": payload.get("epoch"),
         "experiment": args.experiment,
         "dg_method": args.dg_method,
+        "unseen_domain": args.unseen_domain,
         "a7_reference_checkpoint": str(A7_CHECKPOINT),
     })
     _write_json(Path(args.output_dir) / "validation_metrics.json", metrics)

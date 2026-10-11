@@ -8,13 +8,14 @@ import time
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from upar.config import REPOSITORY_ROOT, choose_device, set_seed
-from upar.data import find_annotation_file, read_gt_csv
+from upar.data import AnnotationTable, find_annotation_file, read_gt_csv
 from upar.retrieval import autocast
 
 from ..checkpoint import resume_training, save_best, save_last
@@ -551,6 +552,21 @@ def train(args: Any) -> Path:
     data_root = Path(args.data_root).resolve()
     train_gt = find_annotation_file(data_root, "train")
     table = read_gt_csv(train_gt)
+    unseen_domain = getattr(args, "unseen_domain", None)
+    if unseen_domain:
+        keep = np.asarray(
+            [str(path).split("/", 1)[0] != unseen_domain for path in table.image_paths],
+            dtype=bool,
+        )
+        removed = int((~keep).sum())
+        if removed == 0:
+            raise ValueError(
+                f"unseen-domain={unseen_domain!r} was not found in training annotations"
+            )
+        table = AnnotationTable(
+            [path for path, selected in zip(table.image_paths, keep) if selected],
+            table.labels[keep], table.attribute_names,
+        )
     model = AttriVision(
         pretrained=None if args.no_pretrained or args.resume or args.init_checkpoint else args.pretrained_tag,
         model_name=args.clip_model,
@@ -748,6 +764,7 @@ def train(args: Any) -> Path:
         "rsc_drop_ratio": getattr(args, "rsc_drop_ratio", 0.0),
         "swad_start_epoch": getattr(args, "swad_start_epoch", 3),
         "domain_wise_validation": getattr(args, "domain_wise_validation", False),
+        "unseen_domain": unseen_domain,
         "positive_rates": positive_rates.tolist(),
     }
     optimizer = torch.optim.AdamW(
@@ -838,7 +855,10 @@ def train(args: Any) -> Path:
         f"swad_start_epoch={getattr(args, 'swad_start_epoch', 3)}, "
         f"domain_wise_validation={getattr(args, 'domain_wise_validation', False)}"
     )
-    logger.log(f"Training samples={len(dataset)}, attributes={len(table.attribute_names)}")
+    logger.log(
+        f"Training samples={len(dataset)}, attributes={len(table.attribute_names)}, "
+        f"unseen_domain={unseen_domain or 'none'}"
+    )
     total_parameters = sum(parameter.numel() for parameter in model.parameters())
     trainable_parameters = sum(
         parameter.numel() for parameter in model.parameters() if parameter.requires_grad

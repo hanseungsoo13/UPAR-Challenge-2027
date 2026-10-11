@@ -272,7 +272,9 @@ def _category_contribution(
     maximum = blended.max(axis=1, keepdims=True)
     blended -= maximum
     blended -= np.log(np.exp(blended).sum(axis=1, keepdims=True))
-    targets = query_targets[query_indices, category_index, indices].astype(np.float64)
+    # Select the query axis first; simultaneous advanced indexing of
+    # query_indices [Q] and state indices [S] would require broadcasting Q/S.
+    targets = query_targets[query_indices, category_index][:, indices].astype(np.float64)
     return -(targets @ blended.T)
 
 
