@@ -184,6 +184,7 @@ def _save_or_load_array(
     return value
 
 
+@torch.inference_mode()
 def _encode_global_gallery(
     model: AttriVision | AttrQueryPartialJointFinetune,
     paths: Sequence[str],
@@ -207,10 +208,11 @@ def _encode_global_gallery(
                 features = model.global_features(images.to(device, non_blocking=True))
             else:
                 features = model.encode_image(images.to(device, non_blocking=True))
-        chunks.append(features.float().cpu().numpy())
+        chunks.append(features.detach().float().cpu().numpy())
     return np.concatenate(chunks, axis=0) if chunks else np.empty((0, 512), dtype=np.float32)
 
 
+@torch.inference_mode()
 def _encode_joint_local_gallery(
     model: AttrQueryPartialJointFinetune,
     paths: Sequence[str],
@@ -231,7 +233,7 @@ def _encode_joint_local_gallery(
     for images in loader:
         with autocast(device, amp):
             scores = model.category_state_scores(images.to(device, non_blocking=True))
-        chunks.append(scores.float().cpu().numpy())
+        chunks.append(scores.detach().float().cpu().numpy())
     return (
         np.concatenate(chunks, axis=0)
         if chunks else np.empty((0, 12, 52), dtype=np.float32)
