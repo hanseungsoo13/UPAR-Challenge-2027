@@ -66,6 +66,8 @@ def configure(args: argparse.Namespace) -> None:
     args.category_temperature = 0.01
     args.validation_protocol = "native52_category_nll"
     args.retrieval_scoring = "paired_l1"
+    # Checkpoint selection is always based on the full validation protocol.
+    # Seen/unseen domain summaries are reported for analysis only.
     args.selection_metric = "mADM"
     args.paper_faithful = False
     args.domain_wise_validation = True
@@ -106,7 +108,7 @@ def evaluate_and_save(args: argparse.Namespace, checkpoint: Path) -> dict[str, A
         model, payload["attribute_names"], Path(args.data_root).resolve(),
         build_eval_transform(args.image_size, args.augmentation), device,
         args.eval_batch_size, args.num_workers, args.amp, args.max_val_samples,
-        args.category_temperature,
+        args.category_temperature, unseen_domain=args.unseen_domain,
     )
     metrics.update({
         "checkpoint": str(checkpoint),
@@ -121,17 +123,25 @@ def evaluate_and_save(args: argparse.Namespace, checkpoint: Path) -> dict[str, A
 
 
 def print_summary(metrics: dict[str, Any]) -> None:
+    unseen_domain = metrics.get("unseen_domain")
     domains = ("Market1501", "PA100k", "PETA")
-    print("\nDomain-wise validation (full gallery shared by every row)")
+    title = "Seen + unseen domain validation (domain gallery per row)" if unseen_domain else (
+        "Domain-wise validation (full gallery shared by every row)"
+    )
+    print(f"\n{title}")
     print(f"{'domain':<12} {'queries':>8} {'R1':>10} {'mADM':>10}")
-    print(f"{'Overall':<12} {int(metrics['queries']):>8} "
+    overall_name = "Overall"
+    print(f"{overall_name:<12} {int(metrics['queries']):>8} "
           f"{100 * metrics['rank1']:>9.4f}% {100 * metrics['mADM']:>9.4f}%")
     for domain in domains:
         prefix = f"domain_{domain}_"
         print(f"{domain:<12} {int(metrics[prefix + 'queries']):>8} "
               f"{100 * metrics[prefix + 'rank1']:>9.4f}% "
               f"{100 * metrics[prefix + 'mADM']:>9.4f}%")
-    print(f"{'Macro':<12} {'-':>8} {100 * metrics['domain_macro_rank1']:>9.4f}% "
+    if unseen_domain:
+        print(f"{'Seen Macro':<12} {'-':>8} {100 * metrics['seen_macro_rank1']:>9.4f}% "
+              f"{100 * metrics['seen_macro_mADM']:>9.4f}%")
+    print(f"{'All Macro':<12} {'-':>8} {100 * metrics['domain_macro_rank1']:>9.4f}% "
           f"{100 * metrics['domain_macro_mADM']:>9.4f}%")
     print(f"Worst-domain mADM: {metrics['worst_domain']} / "
           f"{100 * metrics['worst_domain_mADM']:.4f}%")

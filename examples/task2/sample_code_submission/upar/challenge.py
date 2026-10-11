@@ -21,11 +21,13 @@ _TRANSFORM: Any = None
 _ATTRIBUTE_NAMES: list[str] = []
 _INFERENCE_CONFIG: dict[str, Any] = {}
 _ATTRIVISION = False
+_ATTRQUERY_JOINTFCE = False
 
 
 def load_model() -> None:
     """Load the submission model once into module-level state."""
-    global _MODEL, _DEVICE, _TRANSFORM, _ATTRIBUTE_NAMES, _INFERENCE_CONFIG, _ATTRIVISION
+    global _MODEL, _DEVICE, _TRANSFORM, _ATTRIBUTE_NAMES, _INFERENCE_CONFIG
+    global _ATTRIVISION, _ATTRQUERY_JOINTFCE
     started = time.perf_counter()
     requested_device = os.environ.get("UPAR_DEVICE", "auto")
     device = choose_device(requested_device)
@@ -35,6 +37,11 @@ def load_model() -> None:
         from . import attrivision_challenge
         attrivision_challenge.load_model()
         _ATTRIVISION = True
+        return
+    if preview.get("architecture") == "attrivision_jointfce_submission_vit_b_32":
+        from . import attrquery_challenge
+        attrquery_challenge.load_model()
+        _ATTRQUERY_JOINTFCE = True
         return
     print(
         f"[submission] loading model: requested_device={requested_device}, "
@@ -68,8 +75,14 @@ def load_model() -> None:
 
 def predict_attributes(gallery: list[dict[str, Any]], attribute_names: list[str]) -> np.ndarray:
     """Return probabilities in the exact attribute order requested by the server."""
+    if _ATTRQUERY_JOINTFCE:
+        from . import attrquery_challenge
+        return attrquery_challenge.predict_attributes(gallery, attribute_names)
     if _MODEL is None:
         load_model()
+    if _ATTRQUERY_JOINTFCE:
+        from . import attrquery_challenge
+        return attrquery_challenge.predict_attributes(gallery, attribute_names)
     assert _MODEL is not None and _DEVICE is not None
     paths: list[str] = []
     for index, item in enumerate(gallery):
@@ -105,11 +118,14 @@ def predict_attributes(gallery: list[dict[str, Any]], attribute_names: list[str]
 
 def rank_gallery(sample: dict[str, Any]) -> dict[str, Any]:
     """Return a [queries, gallery] L1 attribute-distance matrix."""
-    if _MODEL is None and not _ATTRIVISION:
+    if _MODEL is None and not _ATTRIVISION and not _ATTRQUERY_JOINTFCE:
         load_model()
     if _ATTRIVISION:
         from . import attrivision_challenge
         return attrivision_challenge.rank_gallery(sample)
+    if _ATTRQUERY_JOINTFCE:
+        from . import attrquery_challenge
+        return attrquery_challenge.rank_gallery(sample)
     missing = {"gallery", "attribute_names", "queries"} - set(sample)
     if missing:
         raise KeyError(f"sample is missing required fields: {sorted(missing)}")

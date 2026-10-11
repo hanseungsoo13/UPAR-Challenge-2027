@@ -213,7 +213,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="binary_head",
     )
     parser.add_argument(
-        "--selection-metric", choices=("map", "mADM"), default="mADM",
+        "--selection-metric", choices=("map", "mADM", "seen_macro_mADM"), default="mADM",
         help="validation metric used for checkpoint selection (official default: mADM)",
     )
     return parser

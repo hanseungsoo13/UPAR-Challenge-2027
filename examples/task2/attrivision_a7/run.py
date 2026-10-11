@@ -1,4 +1,4 @@
-"""A7-only train, evaluation, smoke-test, and submission entry point."""
+"""AttriVision train/evaluation entry point and submission packager."""
 from __future__ import annotations
 
 import argparse
@@ -45,8 +45,8 @@ A7_LOCKED_CONFIG: dict[str, Any] = {
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "AttriVision A7-only workflow: train, evaluate, smoke-test, or build "
-            "a Codabench submission"
+            "AttriVision workflow: train, evaluate, smoke-test, or build a "
+            "Codabench submission"
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -95,6 +95,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=DEFAULT_SUBMISSION,
         help="output ZIP used by package mode",
+    )
+    parser.add_argument(
+        "--submission-model",
+        choices=("attrivision_a7", "attrquery_jointfce"),
+        default="attrivision_a7",
+        help="model adapter to package; use attrquery_jointfce for a JointFCE checkpoint",
     )
     return parser
 
@@ -207,7 +213,7 @@ def build_submission(args: argparse.Namespace) -> None:
     build_archive(
         Path(args.checkpoint).resolve(),
         args.submission_output.resolve(),
-        model="attrivision_a7",
+        model=args.submission_model,
     )
 
 

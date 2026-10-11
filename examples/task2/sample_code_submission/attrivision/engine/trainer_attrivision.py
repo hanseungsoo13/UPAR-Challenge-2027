@@ -977,17 +977,21 @@ def train(args: Any) -> Path:
                     swad_eval_model.load_state_dict(swad_average.state_dict())
                     evaluation_model = swad_eval_model
                 if getattr(args, "validation_protocol", "binary_head") == "native52_category_nll":
-                    evaluate_fn = (
-                        evaluate_native52_category_nll_domainwise
-                        if getattr(args, "domain_wise_validation", False)
-                        else evaluate_native52_category_nll
-                    )
-                    metrics = evaluate_fn(
-                        evaluation_model, table.attribute_names, data_root,
-                        build_eval_transform(args.image_size, getattr(args, "augmentation", "current")), device,
-                        args.eval_batch_size, args.num_workers, args.amp,
-                        args.max_val_samples, getattr(args, "category_temperature", 0.01),
-                    )
+                    if getattr(args, "domain_wise_validation", False):
+                        metrics = evaluate_native52_category_nll_domainwise(
+                            evaluation_model, table.attribute_names, data_root,
+                            build_eval_transform(args.image_size, getattr(args, "augmentation", "current")), device,
+                            args.eval_batch_size, args.num_workers, args.amp,
+                            args.max_val_samples, getattr(args, "category_temperature", 0.01),
+                            unseen_domain=getattr(args, "unseen_domain", None),
+                        )
+                    else:
+                        metrics = evaluate_native52_category_nll(
+                            evaluation_model, table.attribute_names, data_root,
+                            build_eval_transform(args.image_size, getattr(args, "augmentation", "current")), device,
+                            args.eval_batch_size, args.num_workers, args.amp,
+                            args.max_val_samples, getattr(args, "category_temperature", 0.01),
+                        )
                 elif getattr(args, "validation_protocol", "binary_head") == "mixed_state_nll":
                     metrics = evaluate_mixed_state_nll(
                         evaluation_model, table.attribute_names, data_root,

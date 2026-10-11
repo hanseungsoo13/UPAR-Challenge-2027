@@ -243,14 +243,17 @@ def evaluate_native52_category_nll_domainwise(
     transform: Any, device: torch.device, batch_size: int,
     num_workers: int, amp: bool, max_val_samples: int | None = None,
     attribute_temperature: float = 0.01, distance_chunk_size: int = 256,
+    unseen_domain: str | None = None,
 ) -> dict[str, Any]:
-    """Evaluate overall and query-domain metrics with one shared gallery.
+    """Evaluate overall and query-domain metrics.
 
     ``ids.csv`` maps every validation image to a retrieval query.  A query is
     included in a domain when that query has at least one positive image in the
-    domain.  The gallery is deliberately *not* filtered for domain evaluation:
-    every domain uses the complete validation gallery, matching the screening
-    protocol requested for the DG ablation.
+    domain.  With ``unseen_domain`` set, each domain is evaluated against its
+    own gallery, so the output contains both seen-source and unseen-target
+    results.  The top-level metrics always use the complete validation gallery
+    and are used for Overall checkpoint selection; ``unseen_*`` stores the
+    target-only summary.
     """
     if attribute_temperature <= 0:
         raise ValueError("Category-NLL temperature must be positive")
@@ -273,8 +276,16 @@ def evaluate_native52_category_nll_domainwise(
         queries, ids, query_names = load_retrieval_annotations(gt_path.parent, table)
     queries = reorder_columns(queries, query_names, model_attribute_names)
     labels = reorder_columns(table.labels, table.attribute_names, model_attribute_names)
+    domain_names_in_table = np.asarray(
+        [str(path).split("/", 1)[0] for path in table.image_paths], dtype=object,
+    )
+    if unseen_domain is not None and unseen_domain not in set(domain_names_in_table.tolist()):
+        raise ValueError(f"unseen-domain={unseen_domain!r} was not found in validation annotations")
+    all_gallery_indices = np.arange(len(table.image_paths), dtype=np.int64)
+    gallery_indices = all_gallery_indices
+    gallery_paths = [table.image_paths[index] for index in gallery_indices]
     gallery = encode_gallery(
-        model, table.image_paths, [data_root, gt_path.parent, REPOSITORY_ROOT],
+        model, gallery_paths, [data_root, gt_path.parent, REPOSITORY_ROOT],
         transform, device, batch_size, num_workers, amp,
     )
     mapper = CategoryPromptMapper(model_attribute_names)
@@ -288,60 +299,71 @@ def evaluate_native52_category_nll_domainwise(
     probabilities40, _ = native_state_outputs(
         gallery, state_features, mapper, 1.0 / attribute_temperature,
     )
-    binary = [_binary_metric(labels[:, index], probabilities40[:, index])
-              for index in range(labels.shape[1])]
     hard = hard_category_projection(gallery, state_features, mapper)
 
-    def summarize(query_indices: np.ndarray, gallery_ids: np.ndarray) -> dict[str, float]:
+    def summarize(
+        query_indices: np.ndarray, selected_gallery_indices: np.ndarray,
+    ) -> dict[str, float]:
         query_indices = np.asarray(query_indices, dtype=np.int64)
+        selected_gallery_indices = np.asarray(selected_gallery_indices, dtype=np.int64)
         if query_indices.size == 0:
             raise ValueError("Domain query group is empty")
+        selected_labels = labels[selected_gallery_indices]
+        selected_global_ids = ids[selected_gallery_indices]
+        selected_distances = distances[np.ix_(query_indices, selected_gallery_indices)]
         local_ids = {int(global_id): local_id for local_id, global_id in enumerate(query_indices)}
         local_gallery_ids = np.asarray(
-            [local_ids.get(int(global_id), -1) for global_id in gallery_ids],
+            [local_ids.get(int(global_id), -1) for global_id in selected_global_ids],
             dtype=np.int64,
         )
         official = official_retrieval_metrics(
-            distances[query_indices], queries[query_indices], labels,
+            selected_distances, queries[query_indices], selected_labels,
             local_gallery_ids,
         )
         return {
             "queries": float(len(query_indices)),
-            "gallery_images": float(len(gallery_ids)),
+            "gallery_images": float(len(selected_gallery_indices)),
             "rank1": official["Rank-1"],
-            "rank5": _rank_at_k(distances[query_indices], local_gallery_ids, 5),
-            "rank10": _rank_at_k(distances[query_indices], local_gallery_ids, 10),
+            "rank5": _rank_at_k(selected_distances, local_gallery_ids, 5),
+            "rank10": _rank_at_k(selected_distances, local_gallery_ids, 10),
             "map": official["mAP"],
             "mADM": official["mADM"],
             "mINP": official["mINP"],
         }
 
+    domain_query_indices_by_name = {
+        domain: np.unique(ids[domain_names_in_table == domain]).astype(np.int64)
+        for domain in sorted(set(domain_names_in_table.tolist()))
+    }
     all_query_indices = np.arange(len(queries), dtype=np.int64)
-    all_summary = summarize(all_query_indices, ids)
+    all_summary = summarize(all_query_indices, all_gallery_indices)
+    evaluation_labels = labels[all_gallery_indices]
+    evaluation_probabilities = probabilities40[all_gallery_indices]
+    evaluation_hard = hard[all_gallery_indices]
+    binary = [_binary_metric(evaluation_labels[:, index], evaluation_probabilities[:, index])
+              for index in range(evaluation_labels.shape[1])]
     result: dict[str, Any] = {
         **all_summary,
-        "images": float(len(table.image_paths)),
+        "images": float(len(all_gallery_indices)),
         "retrieval_scoring": "native52_category_nll",
         "temperature": float(attribute_temperature),
         "macro_auroc": float(np.nanmean([item["auroc"] for item in binary])),
         "macro_ap": float(np.nanmean([item["ap"] for item in binary])),
     }
-    result.update(hard_prediction_metrics(labels, hard))
+    result.update(hard_prediction_metrics(evaluation_labels, evaluation_hard))
     semantic = semantic_query_metrics(distances, ids, distance_chunk_size)
     result["semantic_top1"] = semantic["semantic_query_top1"]
     result["semantic_mean_rank"] = semantic["semantic_query_mean_rank"]
 
-    domain_names = tuple(
-        sorted({str(path).split("/", 1)[0] for path in table.image_paths})
-    )
+    domain_names = tuple(domain_query_indices_by_name)
     domain_summaries: dict[str, dict[str, float]] = {}
     for domain in domain_names:
-        domain_mask = np.asarray(
-            [str(path).split("/", 1)[0] == domain for path in table.image_paths],
-            dtype=bool,
+        domain_gallery_indices = (
+            np.flatnonzero(domain_names_in_table == domain).astype(np.int64)
+            if unseen_domain is not None
+            else all_gallery_indices
         )
-        domain_query_indices = np.unique(ids[domain_mask]).astype(np.int64)
-        summary = summarize(domain_query_indices, ids)
+        summary = summarize(domain_query_indices_by_name[domain], domain_gallery_indices)
         domain_summaries[domain] = summary
         safe_name = domain.replace("-", "_")
         for key, value in summary.items():
@@ -353,6 +375,23 @@ def evaluate_native52_category_nll_domainwise(
     result["domain_macro_mADM"] = float(
         np.mean([summary["mADM"] for summary in domain_summaries.values()])
     )
+    if unseen_domain is not None:
+        source_domains = [domain for domain in domain_names if domain != unseen_domain]
+        unseen_summary = summarize(
+            domain_query_indices_by_name[unseen_domain],
+            np.flatnonzero(domain_names_in_table == unseen_domain).astype(np.int64),
+        )
+        result["unseen_domain"] = unseen_domain
+        result["unseen_rank1"] = unseen_summary["rank1"]
+        result["unseen_mADM"] = unseen_summary["mADM"]
+        result["unseen_queries"] = unseen_summary["queries"]
+        result["unseen_gallery_images"] = unseen_summary["gallery_images"]
+        result["seen_macro_rank1"] = float(
+            np.mean([domain_summaries[domain]["rank1"] for domain in source_domains])
+        )
+        result["seen_macro_mADM"] = float(
+            np.mean([domain_summaries[domain]["mADM"] for domain in source_domains])
+        )
     worst_domain = min(domain_summaries, key=lambda name: domain_summaries[name]["mADM"])
     result["worst_domain_mADM"] = float(domain_summaries[worst_domain]["mADM"])
     result["worst_domain"] = worst_domain

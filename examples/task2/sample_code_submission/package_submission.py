@@ -35,8 +35,18 @@ def load_checkpoint_metadata(source: Path | BinaryIO) -> dict[str, Any]:
     architecture = checkpoint.get("architecture")
     if architecture == "attrivision_openclip_vit_b_32":
         required = {"model_state_dict", "attribute_names", "model_name", "prompt_mode"}
+    elif architecture == "attrquery_fromscratch_jointfce":
+        required = {
+            "model_state_dict", "attribute_names", "base_model_name",
+            "category_groups", "num_heads", "dropout", "use_ffn",
+        }
     elif architecture == "attrivision_submission_vit_b_32":
         required = {"visual_state_dict", "text_features", "semantic_keys", "attribute_names"}
+    elif architecture == "attrivision_jointfce_submission_vit_b_32":
+        required = {
+            "visual_state_dict", "local_head_state_dict", "text_features",
+            "semantic_keys", "attribute_names", "category_groups",
+        }
     else:
         required = CONVNEXT_CHECKPOINT_KEYS
     missing = required - set(checkpoint)
@@ -53,6 +63,100 @@ def load_checkpoint_metadata(source: Path | BinaryIO) -> dict[str, Any]:
     }
 
 
+def _jointfce_submission_checkpoint(
+    checkpoint: Path,
+    category_temperature: float,
+    augmentation: str,
+    fusion_alpha: float = 0.5,
+    retrieval_scoring: str = "native52_joint_fusion",
+) -> tuple[bytes, dict[str, Any]]:
+    """Convert a research JointFCE checkpoint to a dependency-free payload."""
+    from attrivision.datasets.attribute_prompts import CategoryPromptMapper
+    from attrivision.models.attrivision import AttriVision
+
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    if payload.get("architecture") != "attrquery_fromscratch_jointfce":
+        raise ValueError("JointFCE packaging requires an attrquery_fromscratch_jointfce checkpoint")
+    initialization = payload.get("initialization") or {}
+    if initialization.get("a7_checkpoint_used") or initialization.get("attrquery_checkpoint_used"):
+        raise ValueError("JointFCE submission packaging rejects A7/AttrQuery-initialized checkpoints")
+    if category_temperature <= 0 or not 0.0 <= fusion_alpha <= 1.0:
+        raise ValueError("Invalid JointFCE category temperature or fusion alpha")
+    if retrieval_scoring not in {
+        "native52_joint_fusion", "native52_global", "native52_local",
+    }:
+        raise ValueError(f"Unknown JointFCE retrieval scoring: {retrieval_scoring}")
+    if augmentation not in {"center_crop", "resize_pad_crop"}:
+        raise ValueError(f"Unknown JointFCE submission augmentation: {augmentation}")
+
+    state = payload["model_state_dict"]
+    base_state = {
+        key.removeprefix("base."): value
+        for key, value in state.items()
+        if key.startswith("base.")
+    }
+    visual_state = {
+        key.removeprefix("base.clip.visual."): value.detach().cpu()
+        for key, value in state.items()
+        if key.startswith("base.clip.visual.")
+    }
+    local_state = {
+        key.removeprefix("local_head."): value.detach().cpu()
+        for key, value in state.items()
+        if key.startswith("local_head.")
+    }
+    if not visual_state or not local_state:
+        raise ValueError("JointFCE checkpoint lacks visual or local-head weights")
+
+    base = AttriVision(pretrained=None, model_name=payload["base_model_name"])
+    missing, unexpected = base.load_state_dict(base_state, strict=True)
+    if missing or unexpected:
+        raise ValueError(
+            f"JointFCE base checkpoint mismatch: missing={missing}, unexpected={unexpected}"
+        )
+    base.eval()
+    mapper = CategoryPromptMapper(payload["attribute_names"])
+    with torch.inference_mode():
+        text_features = base.encode_text(
+            base.tokenize(mapper.prompts),
+        ).float().cpu()
+    converted = {
+        "format_version": 1,
+        "architecture": "attrivision_jointfce_submission_vit_b_32",
+        "quick_gelu": payload["base_model_name"].endswith("-quickgelu"),
+        "visual_state_dict": visual_state,
+        "local_head_state_dict": local_state,
+        "text_features": text_features,
+        "semantic_keys": list(mapper.keys),
+        "attribute_names": list(payload["attribute_names"]),
+        "category_groups": [list(group) for group in mapper.category_indices()],
+        "visual_dim": int(payload.get("visual_dim", 768)),
+        "text_dim": int(payload.get("text_dim", 512)),
+        "num_categories": int(payload.get("num_categories", 12)),
+        "num_states": int(payload.get("num_states", 52)),
+        "num_heads": int(payload.get("num_heads", 8)),
+        "dropout": float(payload.get("dropout", 0.1)),
+        "use_ffn": bool(payload.get("use_ffn", True)),
+        "retrieval_scoring": retrieval_scoring,
+        "fusion_alpha": float(fusion_alpha),
+        "category_temperature": float(category_temperature),
+        "augmentation": augmentation,
+        "epoch": payload.get("epoch"),
+        "metrics": payload.get("metrics", {}),
+        "source_architecture": payload.get("architecture"),
+    }
+    stream = BytesIO()
+    torch.save(converted, stream)
+    metadata = {
+        "epoch": payload.get("epoch"),
+        "model_kind": "attrquery_fromscratch_jointfce",
+        "metrics": payload.get("metrics", {}),
+        "architecture": payload.get("architecture"),
+        "packaged_architecture": converted["architecture"],
+    }
+    return stream.getvalue(), metadata
+
+
 def submission_checkpoint(
     checkpoint: Path,
     retrieval_scoring: str = "cosine_set",
@@ -64,6 +168,22 @@ def submission_checkpoint(
     """Convert research AttriVision weights to a dependency-free inference payload."""
     metadata = load_checkpoint_metadata(checkpoint)
     architecture = metadata["architecture"]
+    if model == "attrquery_jointfce" or architecture == "attrquery_fromscratch_jointfce":
+        if model not in {"auto", "attrquery_jointfce"}:
+            raise ValueError("The selected model preset does not accept a JointFCE checkpoint")
+        if augmentation == "center_crop":
+            # JointFCE validation and A7 comparison use resize_pad_crop.
+            augmentation = "resize_pad_crop"
+        if retrieval_scoring == "cosine_set":
+            retrieval_scoring = "native52_joint_fusion"
+        if retrieval_scoring not in {
+            "native52_joint_fusion", "native52_global", "native52_local",
+        }:
+            raise ValueError("JointFCE packaging requires a Native52 JointFCE ranking mode")
+        return _jointfce_submission_checkpoint(
+            checkpoint, category_temperature, augmentation,
+            retrieval_scoring=retrieval_scoring,
+        )
     if model == "convnext" and architecture in {
         "attrivision_openclip_vit_b_32", "attrivision_submission_vit_b_32",
     }:
@@ -249,14 +369,17 @@ def main() -> None:
         help="output zip path (default: submissions/upar_task2_YYYYMMDD_HHMMSS.zip)",
     )
     parser.add_argument(
-        "--model", choices=("auto", "convnext", "attrivision_a7"), default="auto",
+        "--model", choices=("auto", "convnext", "attrivision_a7", "attrquery_jointfce"), default="auto",
         help="submission preset; auto preserves the checkpoint's architecture",
     )
     parser.add_argument(
         "--retrieval-scoring",
-        choices=("cosine_set", "paired_l1", "native52_category_nll"),
+        choices=(
+            "cosine_set", "paired_l1", "native52_category_nll",
+            "native52_joint_fusion", "native52_global", "native52_local",
+        ),
         default="cosine_set",
-        help="AttriVision submission ranking method",
+        help="Submission ranking method; JointFCE uses Native52 category scores",
     )
     parser.add_argument(
         "--attribute-temperature", type=float,
