@@ -26,7 +26,6 @@ from .models.attrquery_fromscratch_jointfce import (
     category_names,
     validate_mapper,
 )
-from .native52_retrieval_ablation import category_nll
 from .transforms import build_eval_transform
 from upar.config import REPOSITORY_ROOT
 from upar.data import (
@@ -45,6 +44,33 @@ from upar.retrieval import (
 
 
 ALPHAS = (0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0)
+
+
+def category_nll(
+    queries52: np.ndarray,
+    probabilities52: np.ndarray,
+    groups: Sequence[np.ndarray],
+    epsilon: float = 1e-12,
+) -> np.ndarray:
+    """Dependency-free copy of the established Native52 Category-NLL.
+
+    Importing ``native52_retrieval_ablation`` here would activate its legacy
+    compare/diagnose/engine import chain and create a circular import before
+    the training CLI has finished loading.  The numerical definition remains
+    identical to that established evaluator: average category cross-entropy
+    over the 12 category partitions.
+    """
+    result = np.zeros((len(queries52), len(probabilities52)), dtype=np.float32)
+    log_probabilities = np.log(np.clip(probabilities52, epsilon, 1.0))
+    for indices in groups:
+        targets = queries52[:, indices].astype(np.float32)
+        counts = targets.sum(axis=1, keepdims=True)
+        if np.any(counts == 0):
+            raise ValueError("Every query category must contain at least one active state")
+        targets /= counts
+        result -= targets @ log_probabilities[:, indices].T
+    result /= len(groups)
+    return result
 
 
 def atomic_json(path: Path, value: Any) -> None:
