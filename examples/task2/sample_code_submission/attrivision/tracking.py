@@ -7,11 +7,15 @@ from typing import Any
 
 
 FIELDS = (
-    "epoch", "total_loss", "fce_loss", "category_ce_loss", "bce_loss", "prototype_loss", "set_loss", "single_ce_loss", "multi_bce_loss", "consistency_loss", "i2t_loss", "t2i_loss", "learning_rate",
+    "epoch", "total_loss", "fce_loss", "category_ce_loss", "bce_loss", "distill_loss", "rsc_dropped_fraction", "prototype_loss", "set_loss", "single_ce_loss", "multi_bce_loss", "consistency_loss", "i2t_loss", "t2i_loss", "learning_rate",
     "rank1", "rank5", "rank10", "map", "mADM", "mINP", "best_map", "best_score",
     "selection_metric", "best_epoch",
     "macro_auroc", "macro_ap", "instance_f1", "mean_hamming_error", "exact_match",
     "semantic_top1",
+    "domain_Market1501_queries", "domain_Market1501_rank1", "domain_Market1501_mADM",
+    "domain_PA100k_queries", "domain_PA100k_rank1", "domain_PA100k_mADM",
+    "domain_PETA_queries", "domain_PETA_rank1", "domain_PETA_mADM",
+    "domain_macro_rank1", "domain_macro_mADM", "worst_domain_mADM", "worst_domain",
     "stale_evaluations", "elapsed_seconds",
     "train_batches", "average_batch_size", "cuda_peak_allocated_gib",
     "cuda_peak_reserved_gib",

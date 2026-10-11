@@ -173,6 +173,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--minimum-training-epochs", type=int, default=50)
     parser.add_argument("--early-stopping-patience", type=int, default=20)
     parser.add_argument("--retrieval-interval", type=int, default=1)
+    parser.add_argument(
+        "--dg-method", choices=("none", "miro", "partial", "swad", "rsc"),
+        default="none",
+        help="Domain-generalization ablation; the base A7 recipe remains unchanged.",
+    )
+    parser.add_argument(
+        "--distill-weight", type=float, default=0.1,
+        help="MIRO-inspired frozen-teacher cosine feature loss weight.",
+    )
+    parser.add_argument(
+        "--rsc-drop-ratio", type=float, default=0.25,
+        help="Fraction of high-gradient image-feature dimensions dropped by RSC.",
+    )
+    parser.add_argument(
+        "--swad-start-epoch", type=int, default=3,
+        help="First epoch included in the uniform SWAD running average.",
+    )
+    parser.add_argument(
+        "--domain-wise-validation", action=argparse.BooleanOptionalAction, default=False,
+        help="Also score domain query groups with the complete validation gallery.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--debug", action="store_true")
@@ -276,6 +297,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("balance-max-weight must be at least 1")
     if args.attribute_temperature is not None and args.attribute_temperature <= 0:
         raise ValueError("attribute-temperature must be positive")
+    if args.distill_weight < 0:
+        raise ValueError("distill-weight cannot be negative")
+    if not 0 <= args.rsc_drop_ratio < 1:
+        raise ValueError("rsc-drop-ratio must be in [0, 1)")
+    if args.swad_start_epoch < 1:
+        raise ValueError("swad-start-epoch must be positive")
     if args.resume == "__LAST__":
         args.resume = str(Path(args.output_dir) / "checkpoint_last.pth")
     if args.resume and args.mode not in {"train", "train_eval"}:

@@ -1,6 +1,7 @@
 """Fine-tuning loop for the AttriVision CLIP baseline."""
 from __future__ import annotations
 
+import copy
 import json
 import math
 import time
@@ -9,6 +10,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from upar.config import REPOSITORY_ROOT, choose_device, set_seed
@@ -36,7 +38,7 @@ from ..tracking import RunLogger
 from ..transforms import build_eval_transform, build_train_transform
 from .evaluator_abpr import (
     evaluate_abpr, evaluate_binary_head, evaluate_native52,
-    evaluate_native52_category_nll,
+    evaluate_native52_category_nll, evaluate_native52_category_nll_domainwise,
 )
 from .evaluator_mixed import evaluate_mixed_state_nll
 
@@ -107,13 +109,24 @@ def train_one_epoch_paper(
     category_criterion: CategoryStructuredCELoss | None = None,
     prototype_tokens: torch.Tensor | None = None,
     category_mode: str = "off", category_weight: float = 1.0,
+    teacher_model: AttriVision | None = None, distill_weight: float = 0.0,
+    rsc_drop_ratio: float = 0.0,
 ) -> dict[str, float]:
     model.train()
     if category_mode not in {"off", "only", "combined"}:
         raise ValueError(f"Unknown Category CE mode: {category_mode}")
     if category_mode != "off" and (category_criterion is None or prototype_tokens is None):
         raise ValueError("Category CE requires its criterion and all 52 prototype tokens")
+    if teacher_model is not None and distill_weight <= 0:
+        raise ValueError("distill_weight must be positive when a teacher is enabled")
+    if not 0 <= rsc_drop_ratio < 1:
+        raise ValueError("rsc_drop_ratio must be in [0, 1)")
+    if rsc_drop_ratio > 0 and category_mode == "only":
+        raise ValueError("RSC requires the FCE logits and cannot use category_mode=only")
+    if teacher_model is not None:
+        teacher_model.eval()
     totals = {"loss": 0.0, "fce": 0.0, "category_ce": 0.0, "bce": 0.0,
+              "distill": 0.0, "rsc_dropped": 0.0,
               "i2t": 0.0, "t2i": 0.0, "samples": 0.0, "batches": 0.0}
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -128,6 +141,11 @@ def train_one_epoch_paper(
         text_owners = batch.text_owners.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
         with autocast(device, amp):
+            teacher_features = None
+            rsc_dropped = 0.0
+            if teacher_model is not None:
+                with torch.no_grad():
+                    teacher_features = teacher_model.encode_image(images)
             if category_mode == "only":
                 image_features = model.encode_image(images)
                 text_features = None
@@ -138,7 +156,33 @@ def train_one_epoch_paper(
             else:
                 image_features, text_features, logits = model(images, tokens)
                 result = criterion(logits, semantic_labels, selected, text_owners)
+                if rsc_drop_ratio > 0:
+                    feature_grad = torch.autograd.grad(
+                        result.loss, image_features, retain_graph=True,
+                        create_graph=False,
+                    )[0]
+                    importance = (feature_grad.detach() * image_features.detach()).abs()
+                    drop_count = max(1, int(round(importance.shape[1] * rsc_drop_ratio)))
+                    drop_indices = importance.topk(drop_count, dim=1, largest=True).indices
+                    keep = torch.ones_like(image_features)
+                    keep.scatter_(1, drop_indices, 0.0)
+                    challenged_features = F.normalize(image_features * keep, dim=-1)
+                    scale = model.logit_scale.exp().clamp(max=100.0)
+                    challenged_logits = scale * challenged_features @ text_features.T
+                    result = criterion(
+                        challenged_logits, semantic_labels, selected, text_owners,
+                    )
+                    image_features = challenged_features
+                    rsc_dropped = float((1.0 - keep).mean().detach())
+                else:
+                    rsc_dropped = 0.0
                 fce, i2t, t2i = result.loss, result.i2t, result.t2i
+            if teacher_features is not None:
+                distill = 1.0 - F.cosine_similarity(
+                    image_features.float(), teacher_features.float(), dim=-1,
+                ).mean()
+            else:
+                distill = image_features.new_zeros(())
             if category_mode != "off":
                 state_features = model.encode_text(prototype_tokens)
                 category_ce = category_criterion(
@@ -147,7 +191,7 @@ def train_one_epoch_paper(
             else:
                 category_ce = image_features.new_zeros(())
             bce = attr_weight * binary_criterion(model.binary_logits_from_features(image_features), labels.float()) if binary_criterion is not None else image_features.new_zeros(())
-            total = fce + category_weight * category_ce + bce
+            total = fce + category_weight * category_ce + bce + distill_weight * distill
         if diagnostics and batch_index == 0 and category_mode != "only":
             assert logits is not None
             positive_mask = criterion.positive_mask(
@@ -175,6 +219,8 @@ def train_one_epoch_paper(
         totals["fce"] += float(fce.detach()) * count
         totals["category_ce"] += float(category_ce.detach()) * count
         totals["bce"] += float(bce.detach()) * count
+        totals["distill"] += float(distill.detach()) * count
+        totals["rsc_dropped"] += rsc_dropped * count
         totals["i2t"] += float(i2t.detach()) * count
         totals["t2i"] += float(t2i.detach()) * count
         totals["samples"] += count
@@ -465,6 +511,40 @@ def _configure_trainability(model: AttriVision, args: Any) -> None:
                         parameter.requires_grad_(True)
 
 
+class _UniformWeightAverage:
+    """Small SWAD-style uniform average over post-burn-in model snapshots."""
+
+    def __init__(self, start_epoch: int) -> None:
+        self.start_epoch = int(start_epoch)
+        self.count = 0
+        self._state: dict[str, torch.Tensor] | None = None
+
+    def update(self, model: nn.Module, epoch: int) -> bool:
+        if epoch < self.start_epoch:
+            return False
+        current = model.state_dict()
+        if self._state is None:
+            self._state = {
+                key: value.detach().cpu().clone() for key, value in current.items()
+            }
+            self.count = 1
+            return True
+        self.count += 1
+        for key, value in current.items():
+            if self._state[key].is_floating_point():
+                self._state[key].add_(
+                    (value.detach().cpu() - self._state[key]) / self.count
+                )
+            else:
+                self._state[key] = value.detach().cpu().clone()
+        return True
+
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        if self._state is None:
+            raise RuntimeError("SWAD average is not initialized")
+        return self._state
+
+
 def train(args: Any) -> Path:
     set_seed(args.seed, args.deterministic)
     device = choose_device(args.device)
@@ -484,6 +564,16 @@ def train(args: Any) -> Path:
         missing, unexpected = model.load_state_dict(init_state, strict=False)
         if set(missing) - {"binary_head.weight", "binary_head.bias"} or unexpected:
             raise ValueError(f"Invalid init checkpoint mismatch: missing={missing}, unexpected={unexpected}")
+    teacher_model: AttriVision | None = None
+    if getattr(args, "dg_method", "none") == "miro":
+        if args.no_pretrained:
+            raise ValueError("MIRO-inspired distillation requires the pretrained CLIP teacher")
+        teacher_model = AttriVision(
+            pretrained=args.pretrained_tag, model_name=args.clip_model,
+        ).to(device)
+        for parameter in teacher_model.parameters():
+            parameter.requires_grad_(False)
+        teacher_model.eval()
     _configure_trainability(model, args)
     if getattr(args, "freeze_binary_head", False):
         for parameter in model.binary_head.parameters():
@@ -653,6 +743,11 @@ def train(args: Any) -> Path:
         "augmentation": getattr(args, "augmentation", "current"),
         "selection_metric": getattr(args, "selection_metric", "map"),
         "paper_faithful": bool(getattr(args, "paper_faithful", False)),
+        "dg_method": getattr(args, "dg_method", "none"),
+        "distill_weight": getattr(args, "distill_weight", 0.0),
+        "rsc_drop_ratio": getattr(args, "rsc_drop_ratio", 0.0),
+        "swad_start_epoch": getattr(args, "swad_start_epoch", 3),
+        "domain_wise_validation": getattr(args, "domain_wise_validation", False),
         "positive_rates": positive_rates.tolist(),
     }
     optimizer = torch.optim.AdamW(
@@ -714,6 +809,15 @@ def train(args: Any) -> Path:
                 f"Best checkpoint is missing: {best_path}. Resume with its original output directory."
             )
 
+    swad_average = (
+        _UniformWeightAverage(getattr(args, "swad_start_epoch", 3))
+        if getattr(args, "dg_method", "none") == "swad" else None
+    )
+    swad_eval_model = copy.deepcopy(model).to(device) if swad_average is not None else None
+    if swad_eval_model is not None:
+        for parameter in swad_eval_model.parameters():
+            parameter.requires_grad_(False)
+
     logger.log(json.dumps({**vars(args), "resolved_device": str(device)}, indent=2, default=str))
     logger.log(
         f"Initialization checkpoint: {args.init_checkpoint if args.init_checkpoint else 'pretrained/default'}; "
@@ -726,6 +830,13 @@ def train(args: Any) -> Path:
         f"trainable_vision_blocks={getattr(args, 'trainable_vision_blocks', 0)}, "
         f"visual_lr={getattr(args, 'visual_learning_rate', None)}, "
         f"text_lr={getattr(args, 'text_learning_rate', None)}"
+    )
+    logger.log(
+        f"DG ablation: method={getattr(args, 'dg_method', 'none')}, "
+        f"distill_weight={getattr(args, 'distill_weight', 0.0):g}, "
+        f"rsc_drop_ratio={getattr(args, 'rsc_drop_ratio', 0.0):g}, "
+        f"swad_start_epoch={getattr(args, 'swad_start_epoch', 3)}, "
+        f"domain_wise_validation={getattr(args, 'domain_wise_validation', False)}"
     )
     logger.log(f"Training samples={len(dataset)}, attributes={len(table.attribute_names)}")
     total_parameters = sum(parameter.numel() for parameter in model.parameters())
@@ -830,34 +941,50 @@ def train(args: Any) -> Path:
                     prototype_tokens=prototype_tokens,
                     category_mode=category_mode,
                     category_weight=getattr(args, "category_ce_weight", 1.0),
+                    teacher_model=teacher_model,
+                    distill_weight=getattr(args, "distill_weight", 0.0),
+                    rsc_drop_ratio=(
+                        getattr(args, "rsc_drop_ratio", 0.0)
+                        if getattr(args, "dg_method", "none") == "rsc" else 0.0
+                    ),
                 )
             metrics: dict[str, float] = {}
             should_stop = False
             if epoch % args.retrieval_interval == 0 or epoch == args.epochs:
+                evaluation_model = model
+                if swad_average is not None and swad_average.update(model, epoch):
+                    assert swad_eval_model is not None
+                    swad_eval_model.load_state_dict(swad_average.state_dict())
+                    evaluation_model = swad_eval_model
                 if getattr(args, "validation_protocol", "binary_head") == "native52_category_nll":
-                    metrics = evaluate_native52_category_nll(
-                        model, table.attribute_names, data_root,
+                    evaluate_fn = (
+                        evaluate_native52_category_nll_domainwise
+                        if getattr(args, "domain_wise_validation", False)
+                        else evaluate_native52_category_nll
+                    )
+                    metrics = evaluate_fn(
+                        evaluation_model, table.attribute_names, data_root,
                         build_eval_transform(args.image_size, getattr(args, "augmentation", "current")), device,
                         args.eval_batch_size, args.num_workers, args.amp,
                         args.max_val_samples, getattr(args, "category_temperature", 0.01),
                     )
                 elif getattr(args, "validation_protocol", "binary_head") == "mixed_state_nll":
                     metrics = evaluate_mixed_state_nll(
-                        model, table.attribute_names, data_root,
+                        evaluation_model, table.attribute_names, data_root,
                         build_eval_transform(args.image_size, getattr(args, "augmentation", "current")), device,
                         args.eval_batch_size, args.num_workers, args.amp,
                         args.max_val_samples, getattr(args, "category_temperature", 0.01),
                     )
                 elif getattr(args, "validation_protocol", "binary_head") == "native52":
                     metrics = evaluate_native52(
-                        model, table.attribute_names, data_root,
+                        evaluation_model, table.attribute_names, data_root,
                         build_eval_transform(args.image_size, getattr(args, "augmentation", "current")), device,
                         args.eval_batch_size, args.num_workers, args.amp,
                         args.max_val_samples, args.attribute_temperature,
                     )
                 elif getattr(args, "validation_protocol", "binary_head") == "paired_l1":
                     metrics = evaluate_abpr(
-                        model, table.attribute_names, data_root,
+                        evaluation_model, table.attribute_names, data_root,
                         build_eval_transform(args.image_size, getattr(args, "augmentation", "current")), device,
                         args.eval_batch_size, args.num_workers, args.amp,
                         args.max_val_samples, args.prompt_mode,
@@ -865,7 +992,7 @@ def train(args: Any) -> Path:
                     )
                 else:
                     metrics = evaluate_binary_head(
-                        model, table.attribute_names, data_root,
+                        evaluation_model, table.attribute_names, data_root,
                         build_eval_transform(args.image_size, getattr(args, "augmentation", "current")), device,
                         args.eval_batch_size, args.num_workers, args.amp,
                         args.max_val_samples,
@@ -873,7 +1000,7 @@ def train(args: Any) -> Path:
                 if validation_fce_loader is not None:
                     assert isinstance(criterion, FocalCLIPLoss)
                     metrics.update(evaluate_paper_fce(
-                        model, validation_fce_loader, criterion, device, args.amp,
+                        evaluation_model, validation_fce_loader, criterion, device, args.amp,
                     ))
                 if selection_key not in metrics:
                     raise RuntimeError(
@@ -887,7 +1014,7 @@ def train(args: Any) -> Path:
                     best_epoch = epoch
                     stale = 0
                     save_best(
-                        best_path, model, table.attribute_names, epoch,
+                        best_path, evaluation_model, table.attribute_names, epoch,
                         {**losses, **metrics}, args.prompt_mode, training_config,
                     )
                     logger.log(
@@ -913,6 +1040,8 @@ def train(args: Any) -> Path:
                    f"multi_bce={losses.get('multi_bce', 0.0):.6f}, "
                    f"consistency={losses.get('consistency', 0.0):.6f}, "
                    if args.training_objective in {"a7_mixed", "a7_fce_mixed_aux"} else "")
+                + f"distill={losses.get('distill', 0.0):.6f}, "
+                + f"rsc_drop={losses.get('rsc_dropped', 0.0):.4f}, "
                 + f"i2t={losses['i2t']:.6f}, t2i={losses['t2i']:.6f}, lr={lr:.3e}"
                 + (f", AUROC={metrics.get('macro_auroc', float('nan')):.4f}, "
                    f"AP={metrics.get('macro_ap', float('nan')):.4f}, "
@@ -924,6 +1053,10 @@ def train(args: Any) -> Path:
                    f"mAP={100 * metrics['map']:.2f}%, "
                    f"mADM={100 * metrics.get('mADM', float('nan')):.2f}%, "
                    f"SemTop1={100 * metrics['semantic_top1']:.2f}%"
+                   + (f", DomainMacro R1={100 * metrics['domain_macro_rank1']:.2f}%, "
+                      f"mADM={100 * metrics['domain_macro_mADM']:.2f}%, "
+                      f"Worst={100 * metrics['worst_domain_mADM']:.2f}%"
+                      if "domain_macro_mADM" in metrics else "")
                    if metrics else "")
                 + (f", batch_avg={losses['average_batch_size']:.1f}, "
                    f"VRAM={losses['cuda_peak_allocated_gib']:.2f}/"
@@ -937,6 +1070,8 @@ def train(args: Any) -> Path:
                 "fce_loss": metrics.get("fce_loss", losses.get("fce", 0.0)),
                 "category_ce_loss": losses.get("category_ce", 0.0),
                 "bce_loss": losses.get("bce", 0.0), "learning_rate": lr,
+                "distill_loss": losses.get("distill", 0.0),
+                "rsc_dropped_fraction": losses.get("rsc_dropped", 0.0),
                 "prototype_loss": losses.get("prototype", ""),
                 "set_loss": losses.get("set", ""),
                 "single_ce_loss": losses.get("single_ce", ""),

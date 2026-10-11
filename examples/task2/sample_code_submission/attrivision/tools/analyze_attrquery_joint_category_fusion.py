@@ -217,8 +217,13 @@ def _category_log_probabilities(
         result[:, category_index, indices] = shifted - np.log(
             np.exp(shifted).sum(axis=1, keepdims=True),
         )
-    if not np.isfinite(result).all():
-        raise RuntimeError("Category log probabilities contain NaN or Inf")
+    # States outside a category are intentionally left at -inf.  Validate
+    # only the state block that belongs to each category.
+    for category_index, indices in enumerate(groups):
+        if not np.isfinite(result[:, category_index, indices]).all():
+            raise RuntimeError(
+                f"Category {category_index} log probabilities contain NaN or Inf"
+            )
     return result.astype(np.float32)
 
 

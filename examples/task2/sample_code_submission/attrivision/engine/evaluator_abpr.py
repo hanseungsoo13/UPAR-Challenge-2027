@@ -238,6 +238,128 @@ def evaluate_native52_category_nll(
 
 
 @torch.inference_mode()
+def evaluate_native52_category_nll_domainwise(
+    model: Any, model_attribute_names: Sequence[str], data_root: Path,
+    transform: Any, device: torch.device, batch_size: int,
+    num_workers: int, amp: bool, max_val_samples: int | None = None,
+    attribute_temperature: float = 0.01, distance_chunk_size: int = 256,
+) -> dict[str, Any]:
+    """Evaluate overall and query-domain metrics with one shared gallery.
+
+    ``ids.csv`` maps every validation image to a retrieval query.  A query is
+    included in a domain when that query has at least one positive image in the
+    domain.  The gallery is deliberately *not* filtered for domain evaluation:
+    every domain uses the complete validation gallery, matching the screening
+    protocol requested for the DG ablation.
+    """
+    if attribute_temperature <= 0:
+        raise ValueError("Category-NLL temperature must be positive")
+    from ..compare_inference import encode_texts, native_state_outputs
+    from ..evaluate_native52_hard import (
+        hard_category_projection, hard_prediction_metrics, semantic_query_metrics,
+    )
+    from ..native52_retrieval_ablation import category_nll, category_softmax
+
+    gt_path = find_annotation_file(data_root, "val")
+    table = read_gt_csv(gt_path)
+    if max_val_samples is not None:
+        count = min(max_val_samples, len(table.image_paths))
+        table = AnnotationTable(
+            table.image_paths[:count], table.labels[:count], table.attribute_names,
+        )
+        queries, ids = np.unique(table.labels, axis=0, return_inverse=True)
+        query_names = table.attribute_names
+    else:
+        queries, ids, query_names = load_retrieval_annotations(gt_path.parent, table)
+    queries = reorder_columns(queries, query_names, model_attribute_names)
+    labels = reorder_columns(table.labels, table.attribute_names, model_attribute_names)
+    gallery = encode_gallery(
+        model, table.image_paths, [data_root, gt_path.parent, REPOSITORY_ROOT],
+        transform, device, batch_size, num_workers, amp,
+    )
+    mapper = CategoryPromptMapper(model_attribute_names)
+    state_features = encode_texts(model, mapper.prompts, device, amp)
+    groups = [np.asarray(group, dtype=np.int64) for group in mapper.category_indices()]
+    raw_logits = (gallery.float() @ state_features.float().T).numpy()
+    probabilities52 = category_softmax(raw_logits / attribute_temperature, groups)
+    queries52 = mapper.encode(torch.from_numpy(queries).float()).numpy()
+    distances = category_nll(queries52, probabilities52, groups)
+
+    probabilities40, _ = native_state_outputs(
+        gallery, state_features, mapper, 1.0 / attribute_temperature,
+    )
+    binary = [_binary_metric(labels[:, index], probabilities40[:, index])
+              for index in range(labels.shape[1])]
+    hard = hard_category_projection(gallery, state_features, mapper)
+
+    def summarize(query_indices: np.ndarray, gallery_ids: np.ndarray) -> dict[str, float]:
+        query_indices = np.asarray(query_indices, dtype=np.int64)
+        if query_indices.size == 0:
+            raise ValueError("Domain query group is empty")
+        local_ids = {int(global_id): local_id for local_id, global_id in enumerate(query_indices)}
+        local_gallery_ids = np.asarray(
+            [local_ids.get(int(global_id), -1) for global_id in gallery_ids],
+            dtype=np.int64,
+        )
+        official = official_retrieval_metrics(
+            distances[query_indices], queries[query_indices], labels,
+            local_gallery_ids,
+        )
+        return {
+            "queries": float(len(query_indices)),
+            "gallery_images": float(len(gallery_ids)),
+            "rank1": official["Rank-1"],
+            "rank5": _rank_at_k(distances[query_indices], local_gallery_ids, 5),
+            "rank10": _rank_at_k(distances[query_indices], local_gallery_ids, 10),
+            "map": official["mAP"],
+            "mADM": official["mADM"],
+            "mINP": official["mINP"],
+        }
+
+    all_query_indices = np.arange(len(queries), dtype=np.int64)
+    all_summary = summarize(all_query_indices, ids)
+    result: dict[str, Any] = {
+        **all_summary,
+        "images": float(len(table.image_paths)),
+        "retrieval_scoring": "native52_category_nll",
+        "temperature": float(attribute_temperature),
+        "macro_auroc": float(np.nanmean([item["auroc"] for item in binary])),
+        "macro_ap": float(np.nanmean([item["ap"] for item in binary])),
+    }
+    result.update(hard_prediction_metrics(labels, hard))
+    semantic = semantic_query_metrics(distances, ids, distance_chunk_size)
+    result["semantic_top1"] = semantic["semantic_query_top1"]
+    result["semantic_mean_rank"] = semantic["semantic_query_mean_rank"]
+
+    domain_names = tuple(
+        sorted({str(path).split("/", 1)[0] for path in table.image_paths})
+    )
+    domain_summaries: dict[str, dict[str, float]] = {}
+    for domain in domain_names:
+        domain_mask = np.asarray(
+            [str(path).split("/", 1)[0] == domain for path in table.image_paths],
+            dtype=bool,
+        )
+        domain_query_indices = np.unique(ids[domain_mask]).astype(np.int64)
+        summary = summarize(domain_query_indices, ids)
+        domain_summaries[domain] = summary
+        safe_name = domain.replace("-", "_")
+        for key, value in summary.items():
+            result[f"domain_{safe_name}_{key}"] = value
+
+    result["domain_macro_rank1"] = float(
+        np.mean([summary["rank1"] for summary in domain_summaries.values()])
+    )
+    result["domain_macro_mADM"] = float(
+        np.mean([summary["mADM"] for summary in domain_summaries.values()])
+    )
+    worst_domain = min(domain_summaries, key=lambda name: domain_summaries[name]["mADM"])
+    result["worst_domain_mADM"] = float(domain_summaries[worst_domain]["mADM"])
+    result["worst_domain"] = worst_domain
+    return result
+
+
+@torch.inference_mode()
 def encode_gallery(model: Any, paths: Sequence[str], roots: Sequence[Path], transform: Any,
                    device: torch.device, batch_size: int, num_workers: int,
                    amp: bool, progress_every: int = 0,
