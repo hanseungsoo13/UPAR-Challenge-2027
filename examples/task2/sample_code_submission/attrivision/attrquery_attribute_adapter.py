@@ -989,6 +989,14 @@ def build_eval_parser() -> argparse.ArgumentParser:
     parser.add_argument("--a7-checkpoint", default="outputs/attrivision_ablation_mADM/A7/checkpoint_best.pth")
     parser.add_argument("--attrquery-checkpoint", default="outputs/AttrQuery-FrozenCLIP-LocalFCE/checkpoint_best.pth")
     parser.add_argument("--checkpoint", action="append", type=_parse_architecture_checkpoint, default=[], metavar="ARCH=PATH")
+    parser.add_argument(
+        "--stage2-noadapter-checkpoint", type=Path,
+        help="Optional Stage 2 NoAdapter checkpoint; reported separately from the original NoAdapter baseline",
+    )
+    parser.add_argument(
+        "--stage2-patchfilm-checkpoint", type=Path,
+        help="Optional Stage 2 PatchFiLM checkpoint; reported separately from the other PatchFiLM condition",
+    )
     parser.add_argument("--data-root", default=str(REPOSITORY_ROOT / "data"))
     parser.add_argument("--output-dir", default="outputs/AttrQuery-AttributeAdapter/evaluation")
     parser.add_argument("--device", default="auto")
@@ -1048,6 +1056,14 @@ def eval_main(argv: Sequence[str] | None = None) -> None:
         "tuning_queries": int(len(tuning_indices)), "evaluation_queries": int(len(evaluation_indices)),
         "gallery_images": int(len(table.image_paths)), "a7_checkpoint": str(a7_checkpoint),
         "attrquery_checkpoint": str(attrquery_checkpoint),
+        "stage2_noadapter_checkpoint": (
+            str(args.stage2_noadapter_checkpoint.resolve())
+            if args.stage2_noadapter_checkpoint is not None else None
+        ),
+        "stage2_patchfilm_checkpoint": (
+            str(args.stage2_patchfilm_checkpoint.resolve())
+            if args.stage2_patchfilm_checkpoint is not None else None
+        ),
     }
     _atomic_json(output_dir / "protocol.json", protocol)
 
@@ -1072,6 +1088,26 @@ def eval_main(argv: Sequence[str] | None = None) -> None:
     missing = [architecture for architecture in ADAPTER_ARCHITECTURES if architecture not in checkpoint_map]
     if missing:
         raise ValueError(f"Missing checkpoints for architectures: {missing}; pass --checkpoint ARCH=PATH")
+    conditions = [
+        {
+            "name": architecture,
+            "model_architecture": architecture,
+            "checkpoint": checkpoint_map[architecture],
+            "kind": "initial" if architecture == "NoAdapter" else "adapter_checkpoint",
+        }
+        for architecture in ADAPTER_ARCHITECTURES
+    ]
+    for condition_name, model_architecture, checkpoint_path in (
+        ("NoAdapter-Stage2", "NoAdapter", args.stage2_noadapter_checkpoint),
+        ("PatchFiLM-Stage2", "PatchFiLM", args.stage2_patchfilm_checkpoint),
+    ):
+        if checkpoint_path is not None:
+            conditions.append({
+                "name": condition_name,
+                "model_architecture": model_architecture,
+                "checkpoint": checkpoint_path.resolve(),
+                "kind": "stage2_checkpoint",
+            })
 
     summary_rows: list[dict[str, Any]] = []
     category_rows: list[dict[str, Any]] = []
@@ -1079,42 +1115,49 @@ def eval_main(argv: Sequence[str] | None = None) -> None:
     sweep_rows: list[dict[str, Any]] = []
     attention_rows: list[dict[str, Any]] = []
     local_logs_by_arch: dict[str, np.ndarray] = {}
-    for architecture in ADAPTER_ARCHITECTURES:
-        checkpoint = checkpoint_map[architecture]
-        if architecture == "NoAdapter":
+    for condition in conditions:
+        condition_name = str(condition["name"])
+        model_architecture = str(condition["model_architecture"])
+        checkpoint = Path(condition["checkpoint"])
+        if condition["kind"] == "initial":
             model, init_protocol = build_initial_model(
-                a7_checkpoint, checkpoint, attributes, architecture, device, args.amp,
+                a7_checkpoint, checkpoint, attributes, model_architecture, device, args.amp,
                 args.bottleneck_ratio, args.patchfilm_delta, args.patchfilm_category_chunk_size,
             )
         else:
             model, checkpoint_payload = load_adapter_checkpoint(checkpoint, device)
-            if checkpoint_payload.get("adapter_architecture") != architecture:
-                raise ValueError(f"{checkpoint} contains {checkpoint_payload.get('adapter_architecture')}, expected {architecture}")
+            if checkpoint_payload.get("adapter_architecture") != model_architecture:
+                raise ValueError(
+                    f"{checkpoint} contains {checkpoint_payload.get('adapter_architecture')}, "
+                    f"expected {model_architecture} for {condition_name}"
+                )
+            if condition["kind"] == "stage2_checkpoint" and int(checkpoint_payload.get("stage", -1)) != 2:
+                raise ValueError(f"{checkpoint} is not a Stage 2 checkpoint")
             init_protocol = checkpoint_payload.get("training_config", {}).get("initialization", {})
             if list(model.attribute_names) != attributes:
-                raise ValueError(f"{architecture} checkpoint attribute order differs from validation annotations")
-        cache = output_dir / f"gallery_scores_{_safe_name(architecture)}.npy"
-        manifest = {"checkpoint": str(checkpoint.resolve()), "images": list(table.image_paths), "kind": architecture}
+                raise ValueError(f"{condition_name} checkpoint attribute order differs from validation annotations")
+        cache = output_dir / f"gallery_scores_{_safe_name(condition_name)}.npy"
+        manifest = {"checkpoint": str(checkpoint.resolve()), "images": list(table.image_paths), "kind": condition_name}
         local_scores = _load_score_cache(cache, (len(table.image_paths), 12, 52), manifest)
         if local_scores is None:
-            local_scores = _encode_local_scores(model, table, gt_path, data_root, device, args.eval_batch_size, args.num_workers, args.amp, architecture)
+            local_scores = _encode_local_scores(model, table, gt_path, data_root, device, args.eval_batch_size, args.num_workers, args.amp, condition_name)
             _save_score_cache(cache, local_scores, manifest)
         local_logs = _category_logs(local_scores, groups, args.category_temperature)
-        local_logs_by_arch[architecture] = local_logs
+        local_logs_by_arch[condition_name] = local_logs
         local_distances = _category_nll_distances(query_targets, local_logs, groups)
         fixed_logs = _fuse_logs(global_logs, local_logs, args.fixed_alpha)
         fixed_distances = _category_nll_distances(query_targets, fixed_logs, groups)
         for split_name, indices in (("tuning", tuning_indices), ("evaluation", evaluation_indices)):
-            summary_rows.append({"architecture": architecture, "method": "Local-only", "split": split_name, **_subset_metrics(local_distances, indices, queries, labels, ids)})
-            summary_rows.append({"architecture": architecture, "method": f"Global+Local(alpha={args.fixed_alpha:g})", "split": split_name, **_subset_metrics(fixed_distances, indices, queries, labels, ids)})
-        category_rows.extend(_category_rows(global_logs, local_logs, target52, groups, names, args.ece_bins, architecture, args.fixed_alpha))
+            summary_rows.append({"architecture": condition_name, "method": "Local-only", "split": split_name, **_subset_metrics(local_distances, indices, queries, labels, ids)})
+            summary_rows.append({"architecture": condition_name, "method": f"Global+Local(alpha={args.fixed_alpha:g})", "split": split_name, **_subset_metrics(fixed_distances, indices, queries, labels, ids)})
+        category_rows.extend(_category_rows(global_logs, local_logs, target52, groups, names, args.ece_bins, condition_name, args.fixed_alpha))
         transition_rows.append(_transition_rows(
             _category_nll_distances(query_targets, global_logs, groups), local_distances,
-            evaluation_indices, queries, labels, architecture, "Local-only",
+            evaluation_indices, queries, labels, condition_name, "Local-only",
         ))
         transition_rows.append(_transition_rows(
             _category_nll_distances(query_targets, global_logs, groups), fixed_distances,
-            evaluation_indices, queries, labels, architecture, f"Global+Local(alpha={args.fixed_alpha:g})",
+            evaluation_indices, queries, labels, condition_name, f"Global+Local(alpha={args.fixed_alpha:g})",
         ))
         alpha_tuning: list[dict[str, Any]] = []
         for alpha in args.alpha_grid:
@@ -1122,16 +1165,16 @@ def eval_main(argv: Sequence[str] | None = None) -> None:
             distances = _category_nll_distances(query_targets, fused, groups)
             tuning_metrics = _subset_metrics(distances, tuning_indices, queries, labels, ids)
             evaluation_metrics = _subset_metrics(distances, evaluation_indices, queries, labels, ids)
-            alpha_tuning.append({"architecture": architecture, "alpha": float(alpha), "scope": "tuning", **tuning_metrics})
-            sweep_rows.append({"architecture": architecture, "alpha": float(alpha), "scope": "tuning", **tuning_metrics})
-            sweep_rows.append({"architecture": architecture, "alpha": float(alpha), "scope": "evaluation", **evaluation_metrics})
+            alpha_tuning.append({"architecture": condition_name, "alpha": float(alpha), "scope": "tuning", **tuning_metrics})
+            sweep_rows.append({"architecture": condition_name, "alpha": float(alpha), "scope": "tuning", **tuning_metrics})
+            sweep_rows.append({"architecture": condition_name, "alpha": float(alpha), "scope": "evaluation", **evaluation_metrics})
         best = max(alpha_tuning, key=lambda row: (row["mADM"], -row["alpha"]))
         best_alpha = float(best["alpha"])
         tuned_logs = _fuse_logs(global_logs, local_logs, best_alpha)
         tuned_distances = _category_nll_distances(query_targets, tuned_logs, groups)
-        summary_rows.append({"architecture": architecture, "method": f"Global+Local(tuning_alpha={best_alpha:g})", "split": "evaluation", "selected_alpha": best_alpha, **_subset_metrics(tuned_distances, evaluation_indices, queries, labels, ids)})
+        summary_rows.append({"architecture": condition_name, "method": f"Global+Local(tuning_alpha={best_alpha:g})", "split": "evaluation", "selected_alpha": best_alpha, **_subset_metrics(tuned_distances, evaluation_indices, queries, labels, ids)})
         attention_rows.append(_attention_diagnostics(
-            output_dir, architecture, model, table, gt_path, data_root, device,
+            output_dir, condition_name, model, table, gt_path, data_root, device,
             args.eval_batch_size, args.num_workers, args.amp, args.attention_samples,
         ))
         del model
@@ -1156,9 +1199,13 @@ def eval_main(argv: Sequence[str] | None = None) -> None:
         "output_dir": str(output_dir), "evaluation_metrics": [
             row for row in summary_rows if row["split"] == "evaluation"
         ], "selected_alphas": {
-            architecture: max(
-                (row for row in sweep_rows if row["architecture"] == architecture and row["scope"] == "tuning"),
+            condition["name"]: max(
+                (
+                    row for row in sweep_rows
+                    if row["architecture"] == condition["name"] and row["scope"] == "tuning"
+                ),
                 key=lambda row: (row["mADM"], -row["alpha"]),
-            )["alpha"] for architecture in ADAPTER_ARCHITECTURES
+            )["alpha"]
+            for condition in conditions
         },
     }, indent=2, ensure_ascii=False))
