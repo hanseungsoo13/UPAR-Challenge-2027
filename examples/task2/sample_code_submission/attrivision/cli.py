@@ -198,6 +198,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--unseen-domain", default=None,
         help="Exclude this image-path domain prefix from training (e.g. Market1501).",
     )
+    parser.add_argument(
+        "--domain-sampling", choices=("natural", "sqrt"), default="natural",
+        help="sample domains naturally or target P(domain) proportional to sqrt(domain size)",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--debug", action="store_true")

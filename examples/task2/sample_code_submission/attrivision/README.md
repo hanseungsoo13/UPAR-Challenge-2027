@@ -135,6 +135,50 @@ CUDA_VISIBLE_DEVICES=6 python examples/task2/sample_code_submission/attrivision/
   --output-dir outputs/attrivision_task2_hybrid
 ```
 
+### E1-A: Domain-balanced + SWAD 및 WiSE-FT
+
+두 조건은 같은 pretrained OpenAI CLIP ViT-B/32와 E1-A의 FCE 학습·평가 레시피를
+사용한다. `domain_swad`는 각 데이터셋의 image-path prefix를 domain으로 보고
+`P(d) ∝ N_d^0.5`로 샘플링하며, epoch 3 이후 모델 가중치를 SWAD 방식으로 평균한다.
+검증 checkpoint 선택은 전체 validation mADM이고, domain별 mADM도 함께 저장한다.
+
+```bash
+python examples/task2/sample_code_submission/attrivision/run_e1a_clip_preservation.py \
+  --experiment domain_swad \
+  --device cuda:0 \
+  --output-root outputs/E1A_CLIP_Preservation
+```
+
+`wise_ft`는 자연 분포로 E1-A fine-tuning을 먼저 수행하고,
+`α × fine-tuned + (1 − α) × pretrained`의 alpha sweep을 평가한다. 기본 alpha는
+`0.2, 0.4, 0.6, 0.8, 1.0`이며 `--wise-alphas`로 바꿀 수 있다. 학습된 E1-A
+checkpoint가 이미 있으면 `--finetuned-checkpoint`로 전달해 fine-tuning을
+건너뛸 수 있다.
+
+```bash
+python examples/task2/sample_code_submission/attrivision/run_e1a_clip_preservation.py \
+  --experiment wise_ft \
+  --device cuda:0 \
+  --output-root outputs/E1A_CLIP_Preservation \
+  --wise-alphas 0.2 0.4 0.6 0.8 1.0
+```
+
+각 WiSE-FT checkpoint는 `E1A_WiSEFT/alpha_*/checkpoint_wise.pth`에 저장된다.
+E1-B query 성능을 공정하게 비교하려면 alpha별 checkpoint에서 query를 각각 새로
+학습한다. 기존 PartialJointFinetune 설정과 seed를 그대로 사용하고 출력 폴더만
+분리한다.
+
+```bash
+for alpha in 0.20 0.40 0.60 0.80 1.00; do
+  python examples/task2/sample_code_submission/attrivision/train_attrquery_partial_joint_finetune.py \
+    --a7-checkpoint "outputs/E1A_CLIP_Preservation/E1A_WiSEFT/alpha_${alpha}/checkpoint_wise.pth" \
+    --output-dir "outputs/E1B_WiSEFT/alpha_${alpha}"
+done
+```
+
+모든 alpha에서 동일한 query 학습 설정과 seed를 사용한다. alpha는 fine-tuned CLIP
+가중치의 비율이며, `1.0`은 보간 전 fine-tuned checkpoint다.
+
 ### 논문식 재현 preset
 
 논문에 맞춘 설정을 개별 옵션으로 다시 조합하지 않도록 preset을 제공한다.

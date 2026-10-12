@@ -12,7 +12,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 
 from upar.config import REPOSITORY_ROOT, choose_device, set_seed
 from upar.data import AnnotationTable, find_annotation_file, read_gt_csv
@@ -99,6 +99,43 @@ def _optimizer_step(
     scaler.update()
     if float(scaler.get_scale()) >= previous_scale:
         scheduler.step()
+
+
+class DomainBalancedSampler(Sampler[int]):
+    """Sample images so domain probability is proportional to sqrt(domain size)."""
+
+    def __init__(self, image_paths: list[str], seed: int) -> None:
+        if not image_paths:
+            raise ValueError("Domain-balanced sampling requires at least one image")
+        domains = [str(path).replace("\\", "/").split("/", 1)[0] for path in image_paths]
+        counts: dict[str, int] = {}
+        for domain in domains:
+            counts[domain] = counts.get(domain, 0) + 1
+        target_mass = {domain: count ** 0.5 for domain, count in counts.items()}
+        target_total = sum(target_mass.values())
+        self.target_probabilities = {
+            domain: mass / target_total for domain, mass in target_mass.items()
+        }
+        # Each image receives P(domain)/N_domain, which is proportional to
+        # N_domain^-0.5 when P(domain) is proportional to N_domain^0.5.
+        self.weights = torch.tensor(
+            [counts[domain] ** -0.5 for domain in domains], dtype=torch.double,
+        )
+        self.domain_counts = counts
+        self.seed = int(seed)
+        self.epoch = 0
+
+    def __iter__(self):
+        generator = torch.Generator().manual_seed(self.seed + self.epoch)
+        self.epoch += 1
+        indices = torch.multinomial(
+            self.weights, num_samples=len(self.weights), replacement=True,
+            generator=generator,
+        )
+        yield from indices.tolist()
+
+    def __len__(self) -> int:
+        return len(self.weights)
 
 
 def train_one_epoch_paper(
@@ -605,6 +642,13 @@ def train(args: Any) -> Path:
     collator = None
     sampler = None
     loader_options: dict[str, Any] = {}
+    domain_sampling = getattr(args, "domain_sampling", "natural")
+    if domain_sampling not in {"natural", "sqrt"}:
+        raise ValueError(f"Unknown domain sampling strategy: {domain_sampling}")
+    domain_sampler = (
+        DomainBalancedSampler(dataset.image_paths, args.seed)
+        if domain_sampling == "sqrt" else None
+    )
     semantic_labels = semantic_label_matrix(
         torch.from_numpy(dataset.labels.copy()), table.attribute_names, args.prompt_mode,
     )
@@ -637,6 +681,8 @@ def train(args: Any) -> Path:
         args.use_fce and args.training_objective in {"paper_fce", "a7_fce_mixed_aux"}
         and args.unique_prompts and args.prompt_mode != "paper_binary"
     ):
+        if domain_sampler is not None:
+            raise ValueError("Domain-balanced sampling cannot be combined with unique-prompt batch sampling")
         prompts_per_image = 1 if args.text_sampling == "single" else args.multi_attributes
         sampler = UniquePromptBatchSampler(
             semantic_labels, args.batch_size, prompts_per_image, args.seed,
@@ -646,10 +692,15 @@ def train(args: Any) -> Path:
     else:
         loader_options.update({
             "batch_size": args.batch_size,
-            "shuffle": True,
-            "generator": torch.Generator().manual_seed(args.seed),
             "drop_last": len(dataset) >= args.batch_size,
         })
+        if domain_sampler is None:
+            loader_options.update({
+                "shuffle": True,
+                "generator": torch.Generator().manual_seed(args.seed),
+            })
+        else:
+            loader_options["sampler"] = domain_sampler
     loader = DataLoader(
         dataset,
         num_workers=args.num_workers,
@@ -767,6 +818,10 @@ def train(args: Any) -> Path:
         "unseen_domain": unseen_domain,
         "positive_rates": positive_rates.tolist(),
     }
+    # Keep legacy natural-sampling resume checkpoints compatible. Non-default
+    # sampling changes are recorded and checked as part of resume metadata.
+    if domain_sampling != "natural":
+        training_config["domain_sampling"] = domain_sampling
     optimizer = torch.optim.AdamW(
         _optimizer_groups(
             model, args.weight_decay, args.learning_rate,
@@ -859,6 +914,12 @@ def train(args: Any) -> Path:
         f"Training samples={len(dataset)}, attributes={len(table.attribute_names)}, "
         f"unseen_domain={unseen_domain or 'none'}"
     )
+    if domain_sampler is not None:
+        logger.log(
+            "Domain-balanced sampler: target_probabilities="
+            f"{json.dumps(domain_sampler.target_probabilities, sort_keys=True)}, "
+            f"image_counts={json.dumps(domain_sampler.domain_counts, sort_keys=True)}"
+        )
     total_parameters = sum(parameter.numel() for parameter in model.parameters())
     trainable_parameters = sum(
         parameter.numel() for parameter in model.parameters() if parameter.requires_grad
@@ -915,6 +976,8 @@ def train(args: Any) -> Path:
         )
     try:
         for epoch in range(start_epoch, args.epochs + 1):
+            if domain_sampler is not None:
+                domain_sampler.epoch = epoch - 1
             started = time.time()
             if not args.use_fce:
                 losses = train_one_epoch_binary(
