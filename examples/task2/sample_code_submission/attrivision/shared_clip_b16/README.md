@@ -36,10 +36,12 @@ FCE`. E1-D also starts from E1-B, then jointly fine-tunes every CLIP B/16
 parameter (vision tower, text tower, and global temperature) plus the complete
 local decoder. It uses separate 1e-5 vision/text and 1e-4 decoder learning
 rates with the same global/local objective. Both E1-D losses are checked on the
-first training batch to confirm gradients reach both CLIP towers.
+first training batch to confirm gradients reach both CLIP towers. E1-E uses
+the same full-joint training but starts directly from OpenAI pretrained B/16
+with a new local decoder, so it does not depend on E1-A or E1-B.
 
 Training writes an independent configuration sidecar (`experiment_config.json`
-for E1-A and `config.json` for E1-0/B/C/D), parameter counts, epoch metrics,
+for E1-A and `config.json` for E1-0/B/C/D/E), parameter counts, epoch metrics,
 `checkpoint_best.pth`, resumable `checkpoint_last.pth`, and
 `evaluation_val.json` files under `outputs/BackboneUpgrade/E1_SharedCLIP_B16/`.
 All shared-model checkpoints record their model dimensions, initialization, and
@@ -181,6 +183,36 @@ CUDA_VISIBLE_DEVICES=0 python examples/task2/sample_code_submission/attrivision/
   --output-dir outputs/BackboneUpgrade/E1_SharedCLIP_B16/E1-D
 ```
 
+### E1-E — direct pretrained full-joint training
+
+If E1-A is still running and the goal is to jointly train all of CLIP and the
+local decoder without waiting for E1-A/B, use E1-E. It loads OpenAI pretrained
+CLIP B/16, randomly initializes the local decoder, then trains both CLIP towers
+and the complete decoder from the first epoch with the same global/local
+objectives. It has an independent output directory and can run without any E1
+checkpoint:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python examples/task2/sample_code_submission/attrivision/shared_clip_b16/run.py train \
+  --stage full \
+  --config examples/task2/sample_code_submission/attrivision/configs/e1_shared_clip_b16.json \
+  --data-root data \
+  --device cuda:0 \
+  --output-dir outputs/BackboneUpgrade/E1_SharedCLIP_B16/E1-E
+```
+
+To resume E1-E, use its latest checkpoint and keep the same output directory:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python examples/task2/sample_code_submission/attrivision/shared_clip_b16/run.py train \
+  --stage full \
+  --resume outputs/BackboneUpgrade/E1_SharedCLIP_B16/E1-E/checkpoint_last.pth \
+  --config examples/task2/sample_code_submission/attrivision/configs/e1_shared_clip_b16.json \
+  --data-root data \
+  --device cuda:0 \
+  --output-dir outputs/BackboneUpgrade/E1_SharedCLIP_B16/E1-E
+```
+
 ### E1-0 — pretrained frozen B/16 control
 
 ```bash
@@ -233,6 +265,16 @@ CUDA_VISIBLE_DEVICES=0 python examples/task2/sample_code_submission/attrivision/
   --device cuda:0
 ```
 
+Standalone E1-E evaluation:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python examples/task2/sample_code_submission/attrivision/shared_clip_b16/run.py eval \
+  --experiment E1-E \
+  --checkpoint outputs/BackboneUpgrade/E1_SharedCLIP_B16/E1-E/checkpoint_best.pth \
+  --data-root data \
+  --device cuda:0
+```
+
 ### Comparison CSV and Markdown
 
 This uses the existing A7-B/32 validation result and each generated E1 result.
@@ -248,10 +290,10 @@ python examples/task2/sample_code_submission/attrivision/shared_clip_b16/compare
   --e1-b outputs/BackboneUpgrade/E1_SharedCLIP_B16/E1-B/evaluation_val.json \
   --e1-c outputs/BackboneUpgrade/E1_SharedCLIP_B16/E1-C/evaluation_val.json \
   --e1-d outputs/BackboneUpgrade/E1_SharedCLIP_B16/E1-D/evaluation_val.json \
+  --e1-e outputs/BackboneUpgrade/E1_SharedCLIP_B16/E1-E/evaluation_val.json \
   --output-dir outputs/BackboneUpgrade/E1_SharedCLIP_B16/Comparison
 ```
 
-The outputs are `comparison.csv`, `deltas.csv`, and `comparison.md`. The
-reported deltas are E1-A vs A7-B/32, E1-B vs E1-A, E1-C vs E1-B, E1-D vs
-E1-C, E1-D vs E1-B, and E1-B vs E1-0. E1-0 can run independently; E1-A →
-E1-B is the prerequisite chain for E1-C and E1-D.
+The outputs are `comparison.csv`, `deltas.csv`, and `comparison.md`. E1-E can
+run independently from pretrained CLIP; the staged path is E1-A → E1-B → E1-C
+or E1-D.

@@ -180,8 +180,8 @@ def _new_model(
             raise ValueError("Resume checkpoint attribute order differs from the dataset")
         base = AttriVision(pretrained=None, model_name=MODEL_NAME)
     elif init_source == "pretrained":
-        if stage != "local":
-            raise ValueError("Direct pretrained initialization is only valid for E1-0/local")
+        if stage not in {"local", "full"}:
+            raise ValueError("Direct pretrained initialization is valid for E1-0/local or full joint training")
         base = AttriVision(
             pretrained=str(config.get("pretrained_tag", "openai")),
             model_name=MODEL_NAME,
@@ -214,6 +214,10 @@ def _new_model(
         if list(prior_payload.get("attribute_names", [])) != list(attributes):
             raise ValueError("E1-B checkpoint attribute order differs from the dataset")
         model.load_state_dict(prior_payload["model_state_dict"], strict=True)
+    elif init_source == "pretrained":
+        # The CLIP towers were loaded above; the local decoder keeps its fresh
+        # random initialization for E1-0 and direct full-joint E1-E.
+        pass
     else:
         raise ValueError(f"Unsupported initialization source: {init_source!r}")
     model.to(device)
@@ -531,9 +535,12 @@ def train_shared(
         if init_source != "shared":
             raise ValueError("E1-C requires --init-source shared and an E1-B checkpoint")
     elif stage == "full":
-        experiment = "E1-D"
-        if init_source != "shared":
-            raise ValueError("E1-D requires --init-source shared and an E1-B checkpoint")
+        if init_source == "shared":
+            experiment = "E1-D"
+        elif init_source == "pretrained":
+            experiment = "E1-E"
+        else:
+            raise ValueError("Full joint training requires shared E1-B or pretrained CLIP initialization")
     elif init_source == "pretrained":
         experiment = "E1-0"
         if stage != "local":

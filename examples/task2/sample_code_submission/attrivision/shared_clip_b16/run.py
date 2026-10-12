@@ -109,12 +109,12 @@ def _run_train(argv: list[str]) -> None:
         if not args.init_checkpoint:
             parser.error("--stage joint requires --init-checkpoint with the E1-B best checkpoint")
         stage, init_source, experiment = "joint", "shared", "E1-C"
-    else:
-        if not args.init_checkpoint:
-            parser.error("--stage full requires --init-checkpoint with the E1-B best checkpoint")
+    elif args.init_checkpoint:
         stage, init_source, experiment = "full", "shared", "E1-D"
-    if args.resume and args.init_checkpoint is None and stage != "local":
-        parser.error("--resume must be used with the same --init-checkpoint as the original run")
+    else:
+        stage, init_source, experiment = "full", "pretrained", "E1-E"
+    if args.resume and args.stage == "joint" and args.init_checkpoint is None:
+        parser.error("--resume for E1-C requires the same --init-checkpoint as the original run")
     args.experiment_name = experiment
     config = _training_config(args)
     best = train_shared(
@@ -144,6 +144,8 @@ def _run_train(argv: list[str]) -> None:
         print("E1-C evaluation includes global-only, local-only, and alpha=0.5 fusion.", flush=True)
     if experiment == "E1-D":
         print("E1-D evaluation includes global-only, local-only, and alpha=0.5 fusion.", flush=True)
+    if experiment == "E1-E":
+        print("E1-E evaluation includes global-only, local-only, and alpha=0.5 fusion.", flush=True)
     del result
 
 
@@ -179,7 +181,7 @@ def _run_eval(argv: list[str]) -> None:
         description="Evaluate an E1 checkpoint on the UPAR validation split",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--experiment", choices=("E1-A", "E1-0", "E1-B", "E1-C", "E1-D"), required=True)
+    parser.add_argument("--experiment", choices=("E1-A", "E1-0", "E1-B", "E1-C", "E1-D", "E1-E"), required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--data-root", default="data")
     parser.add_argument("--output")
