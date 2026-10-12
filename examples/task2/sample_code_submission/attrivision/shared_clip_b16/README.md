@@ -32,10 +32,14 @@ protocol. Their only intended difference is whether the frozen B/16 encoders
 start from pretrained CLIP or E1-A. E1-C starts from E1-B, keeps the E1-A text
 tower frozen, and tunes the shared visual tower at 1e-5 plus the local
 projector/decoder at 1e-4. Its objective is `1.0 × A7 paper_fce + 0.25 × local
-FCE`.
+FCE`. E1-D also starts from E1-B, then jointly fine-tunes every CLIP B/16
+parameter (vision tower, text tower, and global temperature) plus the complete
+local decoder. It uses separate 1e-5 vision/text and 1e-4 decoder learning
+rates with the same global/local objective. Both E1-D losses are checked on the
+first training batch to confirm gradients reach both CLIP towers.
 
 Training writes an independent configuration sidecar (`experiment_config.json`
-for E1-A and `config.json` for E1-0/B/C), parameter counts, epoch metrics,
+for E1-A and `config.json` for E1-0/B/C/D), parameter counts, epoch metrics,
 `checkpoint_best.pth`, resumable `checkpoint_last.pth`, and
 `evaluation_val.json` files under `outputs/BackboneUpgrade/E1_SharedCLIP_B16/`.
 All shared-model checkpoints record their model dimensions, initialization, and
@@ -147,6 +151,36 @@ CUDA_VISIBLE_DEVICES=0 python examples/task2/sample_code_submission/attrivision/
   --output-dir outputs/BackboneUpgrade/E1_SharedCLIP_B16/E1-C
 ```
 
+### E1-D — full CLIP B/16 and local decoder joint fine-tuning
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python examples/task2/sample_code_submission/attrivision/shared_clip_b16/run.py train \
+  --stage full \
+  --init-checkpoint outputs/BackboneUpgrade/E1_SharedCLIP_B16/E1-B/checkpoint_best.pth \
+  --config examples/task2/sample_code_submission/attrivision/configs/e1_shared_clip_b16.json \
+  --data-root data \
+  --device cuda:0 \
+  --output-dir outputs/BackboneUpgrade/E1_SharedCLIP_B16/E1-D
+```
+
+This updates all parameters in both B/16 towers and the entire local decoder.
+The global A7 `paper_fce` loss backpropagates through the shared image and text
+towers; the local category FCE loss backpropagates through the same visual and
+text towers plus the local decoder. The first training batch checks that both
+losses reach both CLIP towers. To resume, keep the same E1-B initialization and
+pass the E1-D latest checkpoint:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python examples/task2/sample_code_submission/attrivision/shared_clip_b16/run.py train \
+  --stage full \
+  --init-checkpoint outputs/BackboneUpgrade/E1_SharedCLIP_B16/E1-B/checkpoint_best.pth \
+  --resume outputs/BackboneUpgrade/E1_SharedCLIP_B16/E1-D/checkpoint_last.pth \
+  --config examples/task2/sample_code_submission/attrivision/configs/e1_shared_clip_b16.json \
+  --data-root data \
+  --device cuda:0 \
+  --output-dir outputs/BackboneUpgrade/E1_SharedCLIP_B16/E1-D
+```
+
 ### E1-0 — pretrained frozen B/16 control
 
 ```bash
@@ -189,6 +223,16 @@ CUDA_VISIBLE_DEVICES=0 python examples/task2/sample_code_submission/attrivision/
   --device cuda:0
 ```
 
+Standalone E1-D evaluation:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python examples/task2/sample_code_submission/attrivision/shared_clip_b16/run.py eval \
+  --experiment E1-D \
+  --checkpoint outputs/BackboneUpgrade/E1_SharedCLIP_B16/E1-D/checkpoint_best.pth \
+  --data-root data \
+  --device cuda:0
+```
+
 ### Comparison CSV and Markdown
 
 This uses the existing A7-B/32 validation result and each generated E1 result.
@@ -203,10 +247,11 @@ python examples/task2/sample_code_submission/attrivision/shared_clip_b16/compare
   --e1-a outputs/BackboneUpgrade/E1_SharedCLIP_B16/E1-A/evaluation_val.json \
   --e1-b outputs/BackboneUpgrade/E1_SharedCLIP_B16/E1-B/evaluation_val.json \
   --e1-c outputs/BackboneUpgrade/E1_SharedCLIP_B16/E1-C/evaluation_val.json \
+  --e1-d outputs/BackboneUpgrade/E1_SharedCLIP_B16/E1-D/evaluation_val.json \
   --output-dir outputs/BackboneUpgrade/E1_SharedCLIP_B16/Comparison
 ```
 
 The outputs are `comparison.csv`, `deltas.csv`, and `comparison.md`. The
-reported deltas are E1-A vs A7-B/32, E1-B vs E1-A, E1-C vs E1-B, and E1-B vs
-E1-0. E1-0 can run independently; the main dependency order is E1-A → E1-B →
-E1-C.
+reported deltas are E1-A vs A7-B/32, E1-B vs E1-A, E1-C vs E1-B, E1-D vs
+E1-C, E1-D vs E1-B, and E1-B vs E1-0. E1-0 can run independently; E1-A →
+E1-B is the prerequisite chain for E1-C and E1-D.

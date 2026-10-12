@@ -59,6 +59,7 @@ def _add_training_overrides(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--num-workers", type=int)
     parser.add_argument("--decoder-learning-rate", type=float)
     parser.add_argument("--vision-learning-rate", type=float)
+    parser.add_argument("--text-learning-rate", type=float)
     parser.add_argument("--global-loss-weight", type=float)
     parser.add_argument("--local-loss-weight", type=float)
     parser.add_argument("--max-train-samples", type=int)
@@ -71,7 +72,7 @@ def _training_config(args: argparse.Namespace) -> dict[str, Any]:
     for key in (
         "output_root", "data_root", "device", "epochs", "batch_size",
         "eval_batch_size", "num_workers", "decoder_learning_rate",
-        "vision_learning_rate", "global_loss_weight", "local_loss_weight",
+        "vision_learning_rate", "text_learning_rate", "global_loss_weight", "local_loss_weight",
         "max_train_samples", "max_val_samples", "amp",
     ):
         value = getattr(args, key, None)
@@ -95,7 +96,7 @@ def _run_train(argv: list[str]) -> None:
         description="Train an E1 shared CLIP B/16 AttriQuery stage",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--stage", choices=("control", "local", "joint"), required=True)
+    parser.add_argument("--stage", choices=("control", "local", "joint", "full"), required=True)
     _add_training_overrides(parser)
     args = parser.parse_args(argv)
     if args.stage == "control":
@@ -104,10 +105,14 @@ def _run_train(argv: list[str]) -> None:
         if not args.init_checkpoint:
             parser.error("--stage local requires --init-checkpoint with the E1-A best checkpoint")
         stage, init_source, experiment = "local", "a7", "E1-B"
-    else:
+    elif args.stage == "joint":
         if not args.init_checkpoint:
             parser.error("--stage joint requires --init-checkpoint with the E1-B best checkpoint")
         stage, init_source, experiment = "joint", "shared", "E1-C"
+    else:
+        if not args.init_checkpoint:
+            parser.error("--stage full requires --init-checkpoint with the E1-B best checkpoint")
+        stage, init_source, experiment = "full", "shared", "E1-D"
     if args.resume and args.init_checkpoint is None and stage != "local":
         parser.error("--resume must be used with the same --init-checkpoint as the original run")
     args.experiment_name = experiment
@@ -137,6 +142,8 @@ def _run_train(argv: list[str]) -> None:
         print("E1-B evaluation includes global-only, local-only, and alpha=0.5 fusion.", flush=True)
     if experiment == "E1-C":
         print("E1-C evaluation includes global-only, local-only, and alpha=0.5 fusion.", flush=True)
+    if experiment == "E1-D":
+        print("E1-D evaluation includes global-only, local-only, and alpha=0.5 fusion.", flush=True)
     del result
 
 
@@ -172,7 +179,7 @@ def _run_eval(argv: list[str]) -> None:
         description="Evaluate an E1 checkpoint on the UPAR validation split",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--experiment", choices=("E1-A", "E1-0", "E1-B", "E1-C"), required=True)
+    parser.add_argument("--experiment", choices=("E1-A", "E1-0", "E1-B", "E1-C", "E1-D"), required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--data-root", default="data")
     parser.add_argument("--output")
@@ -246,6 +253,25 @@ def _smoke(argv: list[str]) -> None:
     assert any(value is not None and value.abs().sum() > 0 for value in global_gradient)
     assert any(value is not None and value.abs().sum() > 0 for value in local_gradient)
 
+    model.stage = "full"
+    model._set_trainability()
+    model.assert_trainability()
+    model.train()
+    global_features, local_features = model.joint_features(image)
+    text_projection = model.base.clip.text_projection
+    state_features = model.encode_text(model.base.tokenize(mapper.prompts).to(device))
+    global_loss = global_features[:, 0].sum() + state_features[:, 0].sum()
+    local_loss = local_features[..., 0].sum() + state_features[:, 1].sum()
+    for loss in (global_loss, local_loss):
+        vision_gradient, text_gradient = torch.autograd.grad(
+            loss,
+            [next(model.base.clip.visual.parameters()), text_projection],
+            retain_graph=loss is global_loss,
+            allow_unused=True,
+        )
+        assert vision_gradient is not None and vision_gradient.abs().sum() > 0
+        assert text_gradient is not None and text_gradient.abs().sum() > 0
+
     model.stage = "local"
     model._set_trainability()
     model.assert_trainability()
@@ -262,7 +288,7 @@ def _smoke(argv: list[str]) -> None:
     print(
         "Shared CLIP B/16 smoke checks passed: one vision encoder; "
         "global=[B,512], patches=[B,196,768], local=[B,12,512], text=[52,512]; "
-        "E1-C global/local gradients reach the same vision parameters; checkpoint I/O passed.",
+        "E1-C vision gradients and E1-D global/local vision/text gradients passed; checkpoint I/O passed.",
         flush=True,
     )
 

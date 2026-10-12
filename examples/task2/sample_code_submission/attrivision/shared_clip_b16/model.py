@@ -35,8 +35,9 @@ def _text_width(base: AttriVision) -> int:
 class SharedCLIPB16AttrQuery(nn.Module):
     """A single CLIP B/16 supplies both the global and local image features.
 
-    ``stage`` is ``local`` for frozen-encoder E1-0/E1-B training and ``joint``
-    for E1-C.  The local decoder follows the repository's existing
+    ``stage`` is ``local`` for frozen-encoder E1-0/E1-B training, ``joint``
+    for E1-C's vision-only update, and ``full`` for E1-D's complete CLIP
+    update. The local decoder follows the repository's existing
     12-category cross-attention head and projects its output into CLIP's text
     embedding space.
     """
@@ -52,8 +53,8 @@ class SharedCLIPB16AttrQuery(nn.Module):
         use_ffn: bool = True,
     ) -> None:
         super().__init__()
-        if stage not in {"local", "joint"}:
-            raise ValueError("stage must be 'local' or 'joint'")
+        if stage not in {"local", "joint", "full"}:
+            raise ValueError("stage must be 'local', 'joint', or 'full'")
         if base_model.model_name != MODEL_NAME:
             raise ValueError(
                 f"Shared E1 requires OpenCLIP {MODEL_NAME}, got {base_model.model_name!r}"
@@ -87,19 +88,24 @@ class SharedCLIPB16AttrQuery(nn.Module):
             parameter.requires_grad_(False)
         for parameter in self.local_head.parameters():
             parameter.requires_grad_(True)
-        if self.stage == "joint":
+        if self.stage in {"joint", "full"}:
             for parameter in self.base.clip.visual.parameters():
                 parameter.requires_grad_(True)
-            # OpenCLIP keeps CLIP's learned global temperature beside the two
-            # towers.  It is the only trainable non-vision CLIP parameter.
             self.base.clip.logit_scale.requires_grad_(True)
+        if self.stage == "full":
+            for name, parameter in self.base.clip.named_parameters():
+                if not name.startswith("visual.") and name != "logit_scale":
+                    parameter.requires_grad_(True)
 
     def train(self, mode: bool = True) -> "SharedCLIPB16AttrQuery":
         super().train(mode)
-        # Keep the frozen text tower and unused binary head deterministic.
-        # E1-C opts only the one shared visual tower into train mode.
+        # Keep the unused binary head deterministic. E1-C trains only vision;
+        # E1-D puts both CLIP towers in train mode.
         self.base.eval()
-        self.base.clip.visual.train(mode and self.stage == "joint")
+        if self.stage == "full":
+            self.base.clip.train(mode)
+        else:
+            self.base.clip.visual.train(mode and self.stage == "joint")
         self.local_head.train(mode)
         return self
 
@@ -186,9 +192,13 @@ class SharedCLIPB16AttrQuery(nn.Module):
             parameter.numel() for parameter in self.base.clip.visual.parameters()
             if parameter.requires_grad
         )
+        text_total = sum(
+            parameter.numel() for name, parameter in self.base.clip.named_parameters()
+            if not name.startswith("visual.") and name != "logit_scale"
+        )
         text_trainable = sum(
             parameter.numel() for name, parameter in self.base.clip.named_parameters()
-            if not name.startswith("visual.") and parameter.requires_grad
+            if not name.startswith("visual.") and name != "logit_scale" and parameter.requires_grad
         )
         local_total = sum(parameter.numel() for parameter in self.local_head.parameters())
         total = sum(parameter.numel() for parameter in self.parameters())
@@ -199,7 +209,9 @@ class SharedCLIPB16AttrQuery(nn.Module):
             "trainable": trainable,
             "vision_backbone_total": vision_total,
             "vision_backbone_trainable": vision_trainable,
+            "text_encoder_total": text_total,
             "text_encoder_trainable": text_trainable,
+            "logit_scale_trainable": int(self.base.clip.logit_scale.requires_grad),
             "local_decoder_trainable": local_total,
             "vision_encoder_instances": 1,
             "visual_hidden_dim": self.visual_dim,
@@ -213,11 +225,13 @@ class SharedCLIPB16AttrQuery(nn.Module):
                 raise RuntimeError("The AttriQuery local decoder must be trainable")
         visual_ids = {id(parameter) for parameter in self.base.clip.visual.parameters()}
         for name, parameter in self.base.clip.named_parameters():
-            if id(parameter) in visual_ids and parameter.requires_grad != (self.stage == "joint"):
+            if id(parameter) in visual_ids and parameter.requires_grad != (self.stage in {"joint", "full"}):
                 raise RuntimeError(f"Unexpected vision trainability for {name}")
-            if id(parameter) not in visual_ids and name != "logit_scale" and parameter.requires_grad:
-                raise RuntimeError(f"Frozen text encoder unexpectedly has trainable parameter {name}")
-        if self.base.clip.logit_scale.requires_grad != (self.stage == "joint"):
+            if id(parameter) not in visual_ids and name != "logit_scale":
+                expected = self.stage == "full"
+                if parameter.requires_grad != expected:
+                    raise RuntimeError(f"Unexpected text encoder trainability for {name}")
+        if self.base.clip.logit_scale.requires_grad != (self.stage in {"joint", "full"}):
             raise RuntimeError("Global CLIP temperature trainability does not match the stage")
         if any(parameter.requires_grad for parameter in self.base.binary_head.parameters()):
-            raise RuntimeError("The unused A7 binary head must stay frozen in E1-B/C")
+            raise RuntimeError("The unused A7 binary head must stay frozen in E1-B/C/D")

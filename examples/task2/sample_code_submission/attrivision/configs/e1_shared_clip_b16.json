@@ -15,6 +15,7 @@
   "num_workers": 4,
   "decoder_learning_rate": 0.0001,
   "vision_learning_rate": 0.00001,
+  "text_learning_rate": 0.00001,
   "weight_decay": 0.0001,
   "warmup_epochs": 2,
   "min_learning_rate": 0.000001,

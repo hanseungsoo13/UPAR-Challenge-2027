@@ -88,6 +88,7 @@ def build_comparison(args: argparse.Namespace) -> tuple[list[dict[str, Any]], li
         ("E1-A", Path(args.e1_a), "global"),
         ("E1-B", Path(args.e1_b), "fusion"),
         ("E1-C", Path(args.e1_c), "fusion"),
+        ("E1-D", Path(args.e1_d), "fusion"),
     )
     results = {
         name: _load_result(path, name, primary)
@@ -109,6 +110,7 @@ def build_comparison(args: argparse.Namespace) -> tuple[list[dict[str, Any]], li
         "E1-A": ("pretrained CLIP ViT-B/16", "A7 full fine-tuning", "global"),
         "E1-B": ("E1-A best checkpoint", "frozen encoder + local decoder", "global + local fusion"),
         "E1-C": ("E1-B best checkpoint", "shared vision + local decoder joint fine-tuning", "global + local fusion"),
+        "E1-D": ("E1-B best checkpoint", "full CLIP B/16 + full local decoder joint fine-tuning", "global + local fusion"),
     }
     rows: list[dict[str, Any]] = []
     for name, result in results.items():
@@ -149,6 +151,8 @@ def build_comparison(args: argparse.Namespace) -> tuple[list[dict[str, Any]], li
         ("E1-A vs existing A7-B/32", "E1-A", "기존 A7-B/32"),
         ("E1-B vs E1-A", "E1-B", "E1-A"),
         ("E1-C vs E1-B", "E1-C", "E1-B"),
+        ("E1-D vs E1-C", "E1-D", "E1-C"),
+        ("E1-D vs E1-B", "E1-D", "E1-B"),
         ("E1-B vs E1-0", "E1-B", "E1-0"),
     )
     deltas = [
@@ -223,6 +227,7 @@ def main() -> None:
     parser.add_argument("--e1-a", default="outputs/BackboneUpgrade/E1_SharedCLIP_B16/E1-A/evaluation_val.json")
     parser.add_argument("--e1-b", default="outputs/BackboneUpgrade/E1_SharedCLIP_B16/E1-B/evaluation_val.json")
     parser.add_argument("--e1-c", default="outputs/BackboneUpgrade/E1_SharedCLIP_B16/E1-C/evaluation_val.json")
+    parser.add_argument("--e1-d", default="outputs/BackboneUpgrade/E1_SharedCLIP_B16/E1-D/evaluation_val.json")
     parser.add_argument("--output-dir", default="outputs/BackboneUpgrade/E1_SharedCLIP_B16/Comparison")
     args = parser.parse_args()
     rows, deltas = build_comparison(args)

@@ -139,7 +139,7 @@ def _load_shared_model(
     if payload.get("model_name") != MODEL_NAME:
         raise ValueError("Shared E1 checkpoint has an unexpected CLIP model name")
     stage = str(payload.get("model_stage", ""))
-    if stage not in {"local", "joint"}:
+    if stage not in {"local", "joint", "full"}:
         raise ValueError(f"Unexpected shared E1 model stage: {stage!r}")
     training_config = payload.get("training_config", {})
     model = SharedCLIPB16AttrQuery(
@@ -169,8 +169,8 @@ def _new_model(
     device: torch.device,
     resume_payload: dict[str, Any] | None = None,
 ) -> SharedCLIPB16AttrQuery:
-    if stage not in {"local", "joint"}:
-        raise ValueError("E1 shared model stage must be local or joint")
+    if stage not in {"local", "joint", "full"}:
+        raise ValueError("E1 shared model stage must be local, joint, or full")
     if resume_payload is not None:
         if resume_payload.get("architecture") != ARCHITECTURE:
             raise ValueError("Resume checkpoint is not a shared CLIP B/16 E1 checkpoint")
@@ -205,12 +205,12 @@ def _new_model(
         _load_a7_base(base, init_checkpoint, attributes)
     elif init_source == "shared":
         if not init_checkpoint:
-            raise ValueError("E1-C/joint requires --init-checkpoint pointing to E1-B best")
+            raise ValueError("E1-C/E1-D requires --init-checkpoint pointing to E1-B best")
         prior_payload = _load_payload(init_checkpoint, map_location="cpu")
         if prior_payload.get("architecture") != ARCHITECTURE or prior_payload.get("model_name") != MODEL_NAME:
-            raise ValueError("E1-C initialization is not a shared CLIP ViT-B/16 checkpoint")
+            raise ValueError("E1-C/E1-D initialization is not a shared CLIP ViT-B/16 checkpoint")
         if prior_payload.get("model_stage") != "local" or prior_payload.get("experiment") != "E1-B":
-            raise ValueError("E1-C must initialize from an E1-B local-decoder checkpoint")
+            raise ValueError("E1-C/E1-D must initialize from an E1-B local-decoder checkpoint")
         if list(prior_payload.get("attribute_names", [])) != list(attributes):
             raise ValueError("E1-B checkpoint attribute order differs from the dataset")
         model.load_state_dict(prior_payload["model_state_dict"], strict=True)
@@ -282,6 +282,20 @@ def _optimizer_groups(
             "weight_decay": decay,
             "name": "shared_vision_encoder",
         })
+    text = [
+        parameter
+        for name, parameter in model.base.clip.named_parameters()
+        if not name.startswith("visual.")
+        and name != "logit_scale"
+        and parameter.requires_grad
+    ]
+    if text:
+        groups.append({
+            "params": text,
+            "lr": float(config["text_learning_rate"]),
+            "weight_decay": decay,
+            "name": "shared_text_encoder",
+        })
     if model.base.clip.logit_scale.requires_grad:
         groups.append({
             "params": [model.base.clip.logit_scale],
@@ -304,7 +318,8 @@ def _train_one_epoch(
     model: SharedCLIPB16AttrQuery,
     loader: DataLoader,
     mapper: CategoryPromptMapper,
-    state_features: torch.Tensor,
+    state_tokens: torch.Tensor,
+    state_features: torch.Tensor | None,
     global_criterion: FocalCLIPLoss,
     local_criterion: CategoryLocalFCELoss,
     optimizer: torch.optim.Optimizer,
@@ -317,12 +332,16 @@ def _train_one_epoch(
     model.train()
     model.assert_trainability()
     is_joint = model.stage == "joint"
+    is_full = model.stage == "full"
+    trains_encoders = is_joint or is_full
     totals = {
         "total_loss": 0.0,
         "global_loss": 0.0,
         "local_loss": 0.0,
         "global_backbone_gradient": 0.0,
         "local_backbone_gradient": 0.0,
+        "global_text_gradient": 0.0,
+        "local_text_gradient": 0.0,
         "samples": 0.0,
         "batches": 0.0,
     }
@@ -339,17 +358,25 @@ def _train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
         with autocast(device, bool(config["amp"])):
             global_features, local_features = model.joint_features(images)
+            local_state_features = (
+                model.encode_text(state_tokens).float() if is_full else state_features
+            )
+            if local_state_features is None:
+                raise RuntimeError("Frozen local training requires cached CLIP text features")
             local_output = local_criterion(
                 local_features,
-                state_features,
+                local_state_features,
                 semantic_targets,
                 valid_category_mask(semantic_targets, mapper.category_indices()),
             )
-            if is_joint:
-                # E1-C reuses A7's sampled-prompt image/text focal contrastive
-                # objective.  The E1-A text tower remains frozen.
-                with torch.no_grad():
+            if trains_encoders:
+                # E1-C tunes vision while E1-D tunes both CLIP towers. Both use
+                # A7's sampled-prompt image/text focal contrastive objective.
+                if is_full:
                     sampled_text_features = model.encode_text(tokens)
+                else:
+                    with torch.no_grad():
+                        sampled_text_features = model.encode_text(tokens)
                 logits = model.global_logits_from_features(
                     global_features, sampled_text_features,
                 )
@@ -366,17 +393,29 @@ def _train_one_epoch(
                 global_loss = global_features.new_zeros(())
                 total = local_output.loss
 
-        if batch_index == 1 and is_joint:
+        if batch_index == 1 and trains_encoders:
             if not visual_parameters:
-                raise RuntimeError("E1-C has no trainable shared visual parameters")
+                raise RuntimeError("Joint E1 training has no trainable shared visual parameters")
             global_gradient_norm = _gradient_norm(global_loss, visual_parameters)
             local_gradient_norm = _gradient_norm(local_output.loss, visual_parameters)
             if global_gradient_norm <= 0.0:
-                raise RuntimeError("E1-C global loss does not reach the shared CLIP vision encoder")
+                raise RuntimeError("Global loss does not reach the shared CLIP vision encoder")
             if local_gradient_norm <= 0.0:
-                raise RuntimeError("E1-C local loss does not reach the shared CLIP vision encoder")
+                raise RuntimeError("Local loss does not reach the shared CLIP vision encoder")
             totals["global_backbone_gradient"] += global_gradient_norm
             totals["local_backbone_gradient"] += local_gradient_norm
+            if is_full:
+                text_projection = getattr(model.base.clip, "text_projection", None)
+                if not isinstance(text_projection, nn.Parameter):
+                    raise RuntimeError("E1-D requires a trainable CLIP text projection parameter")
+                global_text_gradient_norm = _gradient_norm(global_loss, [text_projection])
+                local_text_gradient_norm = _gradient_norm(local_output.loss, [text_projection])
+                if global_text_gradient_norm <= 0.0:
+                    raise RuntimeError("E1-D global loss does not reach the CLIP text encoder")
+                if local_text_gradient_norm <= 0.0:
+                    raise RuntimeError("E1-D local loss does not reach the CLIP text encoder")
+                totals["global_text_gradient"] += global_text_gradient_norm
+                totals["local_text_gradient"] += local_text_gradient_norm
 
         scaler.scale(total).backward()
         scaler.unscale_(optimizer)
@@ -385,8 +424,14 @@ def _train_one_epoch(
         if batch_index == 1:
             if not any(parameter.grad is not None for parameter in model.local_head.parameters()):
                 raise RuntimeError("The local objective did not produce a decoder gradient")
-            if is_joint and not any(parameter.grad is not None for parameter in visual_parameters):
-                raise RuntimeError("The first E1-C update has no shared vision gradient")
+            if trains_encoders and not any(parameter.grad is not None for parameter in visual_parameters):
+                raise RuntimeError("The first joint E1 update has no shared vision gradient")
+            if is_full and not any(
+                parameter.grad is not None
+                for name, parameter in model.base.clip.named_parameters()
+                if not name.startswith("visual.") and name != "logit_scale"
+            ):
+                raise RuntimeError("The first E1-D update has no CLIP text encoder gradient")
         _optimizer_step(scaler, optimizer, scheduler)
         count = len(images)
         totals["total_loss"] += float(total.detach()) * count
@@ -399,10 +444,14 @@ def _train_one_epoch(
     batches = max(totals.pop("batches"), 1.0)
     global_gradient = totals["global_backbone_gradient"]
     local_gradient = totals["local_backbone_gradient"]
+    global_text_gradient = totals["global_text_gradient"]
+    local_text_gradient = totals["local_text_gradient"]
     result = {key: value / samples for key, value in totals.items()}
     # These two independent gradient norms are measured on the first batch.
     result["global_backbone_gradient"] = global_gradient
     result["local_backbone_gradient"] = local_gradient
+    result["global_text_gradient"] = global_text_gradient
+    result["local_text_gradient"] = local_text_gradient
     result["train_batches"] = batches
     result["average_batch_size"] = samples / batches
     result["epoch"] = epoch
@@ -481,6 +530,10 @@ def train_shared(
         experiment = "E1-C"
         if init_source != "shared":
             raise ValueError("E1-C requires --init-source shared and an E1-B checkpoint")
+    elif stage == "full":
+        experiment = "E1-D"
+        if init_source != "shared":
+            raise ValueError("E1-D requires --init-source shared and an E1-B checkpoint")
     elif init_source == "pretrained":
         experiment = "E1-0"
         if stage != "local":
@@ -512,7 +565,8 @@ def train_shared(
         "validation_protocol": "native52_category_nll",
         "selection_metric": "mADM",
         "selection_alpha": float(config["selection_alpha"]),
-        "global_objective": "paper_fce" if stage == "joint" else "frozen_global_reference",
+        "global_objective": "paper_fce" if stage in {"joint", "full"} else "frozen_global_reference",
+        "trainable_clip_towers": "vision_and_text" if stage == "full" else ("vision" if stage == "joint" else "frozen"),
         "local_objective": "category_local_fce",
         "text_sampling": "single",
         "contrastive_target": "multi_positive",
@@ -557,8 +611,11 @@ def train_shared(
     loader = _build_loader(config, train_table, model, data_root, device)
     state_tokens = model.base.tokenize(mapper.prompts).to(device)
     model.eval()
-    with torch.no_grad(), autocast(device, bool(config["amp"])):
-        state_features = model.encode_text(state_tokens).float()
+    if stage == "full":
+        state_features = None
+    else:
+        with torch.no_grad(), autocast(device, bool(config["amp"])):
+            state_features = model.encode_text(state_tokens).float()
     global_criterion = FocalCLIPLoss(
         "focal_clip", "multi_positive",
         float(config["focal_alpha"]), float(config["focal_gamma"]),
@@ -607,7 +664,7 @@ def train_shared(
     for epoch in range(start_epoch, int(config["epochs"]) + 1):
         started = time.perf_counter()
         train_metrics = _train_one_epoch(
-            model, loader, mapper, state_features,
+            model, loader, mapper, state_tokens, state_features,
             global_criterion, local_criterion, optimizer, scheduler, scaler,
             config, device, epoch,
         )
