@@ -1,0 +1,4 @@
+# DINOv3's Transformers implementation is available starting at 4.56.0.
+transformers>=4.56.0
+huggingface_hub>=0.34.0
+safetensors>=0.4.5
