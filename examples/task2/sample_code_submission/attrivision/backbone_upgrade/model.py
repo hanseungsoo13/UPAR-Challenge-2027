@@ -76,12 +76,18 @@ class HFVisualBackbone(nn.Module):
             self.register_buffer("image_mean", torch.tensor(self.processor.image_mean).view(1, 3, 1, 1))
             self.register_buffer("image_std", torch.tensor(self.processor.image_std).view(1, 3, 1, 1))
         else:
-            # SigLIP2's processor includes the tokenizer and its dynamic patch
-            # layout metadata. At the fixed 224x224 protocol we create the same
-            # row-major patch sequence after applying the processor statistics.
+            # The fixed-resolution SigLIP2 checkpoint currently resolves to a
+            # SigLIP (`model_type=siglip`) config and uses the standard 4D image
+            # API. NaFlex SigLIP2 checkpoints use a patch sequence instead.
             from transformers import AutoTokenizer
 
             self.vision = AutoModel.from_pretrained(self.model_id)
+            self.siglip_model_type = str(getattr(self.vision.config, "model_type", ""))
+            if self.siglip_model_type not in {"siglip", "siglip2"}:
+                raise ValueError(
+                    f"Unsupported SigLIP model type {self.siglip_model_type!r} "
+                    f"for {self.model_id}; expected 'siglip' or 'siglip2'"
+                )
             self.config = self.vision.config.vision_config
             self.processor = AutoProcessor.from_pretrained(self.model_id)
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_id)
@@ -119,32 +125,44 @@ class HFVisualBackbone(nn.Module):
         context = torch.enable_grad() if vision_grad else torch.no_grad()
         with context:
             if self.backbone == "siglip2_b16":
-                height, width = pixel_values.shape[-2:]
-                patch = int(self.config.patch_size)
-                if height % patch or width % patch:
-                    raise ValueError(
-                        f"SigLIP2 input {height}x{width} must be divisible by patch size {patch}"
+                if self.siglip_model_type == "siglip":
+                    # FixRes SigLIP2 checkpoints are backward-compatible with
+                    # SigLIP and expect [B,3,H,W], not flattened patch pixels.
+                    outputs = self.vision.vision_model(pixel_values=pixel_values)
+                else:
+                    height, width = pixel_values.shape[-2:]
+                    patch = int(self.config.patch_size)
+                    if height % patch or width % patch:
+                        raise ValueError(
+                            f"SigLIP2 input {height}x{width} must be divisible by patch size {patch}"
+                        )
+                    grid_h, grid_w = height // patch, width // patch
+                    # Match Siglip2ImageProcessor.convert_image_to_patches: patch
+                    # rows are flattened as (patch_y, patch_x, RGB channel).
+                    patch_grid = pixel_values.reshape(
+                        images.shape[0], 3, grid_h, patch, grid_w, patch,
+                    ).permute(0, 2, 4, 3, 5, 1).reshape(
+                        images.shape[0], grid_h * grid_w, patch * patch * 3,
                     )
-                grid_h, grid_w = height // patch, width // patch
-                # Match Siglip2ImageProcessor.convert_image_to_patches: patch
-                # rows are flattened as (patch_y, patch_x, RGB channel).
-                patch_grid = pixel_values.reshape(
-                    images.shape[0], 3, grid_h, patch, grid_w, patch,
-                ).permute(0, 2, 4, 3, 5, 1).reshape(
-                    images.shape[0], grid_h * grid_w, patch * patch * 3,
-                )
-                spatial_shapes = torch.tensor(
-                    [[grid_h, grid_w]], device=images.device, dtype=torch.long,
-                ).expand(images.shape[0], -1)
-                patch_mask = torch.ones(
-                    images.shape[0], grid_h * grid_w, device=images.device, dtype=torch.bool,
-                )
-                outputs = self.vision.vision_model(
-                    pixel_values=patch_grid,
-                    pixel_attention_mask=patch_mask,
-                    spatial_shapes=spatial_shapes,
-                )
-                patch_tokens = outputs.last_hidden_state
+                    spatial_shapes = torch.tensor(
+                        [[grid_h, grid_w]], device=images.device, dtype=torch.long,
+                    ).expand(images.shape[0], -1)
+                    patch_mask = torch.ones(
+                        images.shape[0], grid_h * grid_w, device=images.device, dtype=torch.bool,
+                    )
+                    outputs = self.vision.vision_model(
+                        pixel_values=patch_grid,
+                        pixel_attention_mask=patch_mask,
+                        spatial_shapes=spatial_shapes,
+                    )
+                sequence = outputs.last_hidden_state
+                if sequence.ndim != 3 or sequence.shape[-1] != self.hidden_dim:
+                    raise RuntimeError(
+                        f"Unexpected SigLIP spatial hidden-state shape {tuple(sequence.shape)}"
+                    )
+                patch_tokens = sequence[:, self.num_special_tokens:]
+                if outputs.pooler_output is None:
+                    raise RuntimeError("SigLIP model did not return its pooled global embedding")
                 global_features = F.normalize(outputs.pooler_output.float(), dim=-1)
             else:
                 outputs = self.vision(pixel_values=pixel_values)
