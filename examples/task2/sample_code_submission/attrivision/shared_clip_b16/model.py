@@ -158,12 +158,12 @@ class SharedCLIPB16AttrQuery(nn.Module):
 
     def joint_features_with_tokens(
         self, images: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         global_features, patch_tokens = self._capture_shared_features(images)
         local_features, attention = self.local_head(patch_tokens, return_attention=True)
         if attention.shape[-1] != patch_tokens.shape[1]:
             raise RuntimeError("Cross-attention does not cover every shared patch token")
-        return global_features, local_features, patch_tokens
+        return global_features, local_features, patch_tokens, attention
 
     def encode_text(self, tokens: torch.Tensor) -> torch.Tensor:
         return self.base.encode_text(tokens)

@@ -62,6 +62,10 @@ def _add_training_overrides(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--text-learning-rate", type=float)
     parser.add_argument("--global-loss-weight", type=float)
     parser.add_argument("--local-loss-weight", type=float)
+    parser.add_argument("--consistency-variant", choices=("B0", "B1", "B2"), default="B0")
+    parser.add_argument("--holdout-domain")
+    parser.add_argument("--feature-consistency-weight", type=float)
+    parser.add_argument("--attention-consistency-weight", type=float)
     parser.add_argument("--max-train-samples", type=int)
     parser.add_argument("--max-val-samples", type=int)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=None)
@@ -78,6 +82,19 @@ def _training_config(args: argparse.Namespace) -> dict[str, Any]:
         value = getattr(args, key, None)
         if value is not None:
             config[key] = value
+    config["consistency_variant"] = args.consistency_variant
+    config["feature_consistency_weight"] = (
+        args.feature_consistency_weight
+        if args.feature_consistency_weight is not None
+        else (0.1 if args.consistency_variant in {"B1", "B2"} else 0.0)
+    )
+    config["attention_consistency_weight"] = (
+        args.attention_consistency_weight
+        if args.attention_consistency_weight is not None
+        else (0.1 if args.consistency_variant == "B2" else 0.0)
+    )
+    if args.holdout_domain:
+        config["holdout_domain"] = args.holdout_domain
     if args.output_dir:
         config["output_dir"] = str(Path(args.output_dir).resolve())
     else:
@@ -100,18 +117,29 @@ def _run_train(argv: list[str]) -> None:
     _add_training_overrides(parser)
     args = parser.parse_args(argv)
     if args.stage == "control":
+        if args.consistency_variant != "B0" or args.holdout_domain:
+            parser.error("Consistency variants and holdout-domain apply only to --stage local")
         stage, init_source, experiment = "local", "pretrained", "E1-0"
     elif args.stage == "local":
         if not args.init_checkpoint:
             parser.error("--stage local requires --init-checkpoint with the E1-A best checkpoint")
-        stage, init_source, experiment = "local", "a7", "E1-B"
+        stage, init_source = "local", "a7"
+        experiment = {"B0": "E1-B", "B1": "E1-B1", "B2": "E1-B2"}[
+            args.consistency_variant
+        ]
     elif args.stage == "joint":
+        if args.consistency_variant != "B0" or args.holdout_domain:
+            parser.error("Consistency variants and holdout-domain apply only to --stage local")
         if not args.init_checkpoint:
             parser.error("--stage joint requires --init-checkpoint with the E1-B best checkpoint")
         stage, init_source, experiment = "joint", "shared", "E1-C"
     elif args.init_checkpoint:
+        if args.consistency_variant != "B0" or args.holdout_domain:
+            parser.error("Consistency variants and holdout-domain apply only to --stage local")
         stage, init_source, experiment = "full", "shared", "E1-D"
     else:
+        if args.consistency_variant != "B0" or args.holdout_domain:
+            parser.error("Consistency variants and holdout-domain apply only to --stage local")
         stage, init_source, experiment = "full", "pretrained", "E1-E"
     if args.resume and args.stage == "joint" and args.init_checkpoint is None:
         parser.error("--resume for E1-C requires the same --init-checkpoint as the original run")
@@ -138,8 +166,25 @@ def _run_train(argv: list[str]) -> None:
     )
     print(f"Best checkpoint: {best}", flush=True)
     print(f"Validation result: {Path(config['output_dir']) / 'evaluation_val.json'}", flush=True)
-    if experiment == "E1-B":
-        print("E1-B evaluation includes global-only, local-only, and alpha=0.5 fusion.", flush=True)
+    if experiment in {"E1-B", "E1-B1", "E1-B2"}:
+        validation = result["official_validation"]
+        stability = result["attribute_query_stability"]
+        domain_result = result["domain_retrieval"]
+        print(
+            f"Official val: mADM={validation['mADM']:.6f} "
+            f"Rank-1={validation['Rank-1']:.6f} mAP={validation['mAP']:.6f}; "
+            f"query stability={stability['attribute_query_cosine_mean']:.6f}; "
+            f"attention stability={stability['attention_cosine_mean']:.6f}",
+            flush=True,
+        )
+        if domain_result.get("holdout"):
+            holdout = domain_result["holdout"]
+            print(
+                f"Holdout {domain_result['holdout_domain']}: "
+                f"mADM={holdout['mADM']:.6f} Rank-1={holdout['rank1']:.6f} "
+                f"mAP={holdout['mAP']:.6f}",
+                flush=True,
+            )
     if experiment == "E1-C":
         print("E1-C evaluation includes global-only, local-only, and alpha=0.5 fusion.", flush=True)
     if experiment == "E1-D":
@@ -181,7 +226,7 @@ def _run_eval(argv: list[str]) -> None:
         description="Evaluate an E1 checkpoint on the UPAR validation split",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--experiment", choices=("E1-A", "E1-0", "E1-B", "E1-C", "E1-D", "E1-E"), required=True)
+    parser.add_argument("--experiment", choices=("E1-A", "E1-0", "E1-B", "E1-B1", "E1-B2", "E1-C", "E1-D", "E1-E"), required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--data-root", default="data")
     parser.add_argument("--output")
@@ -229,11 +274,12 @@ def _smoke(argv: list[str]) -> None:
     image = torch.randn(args.batch_size, 3, 224, 224, device=device)
     model.eval()
     with torch.no_grad():
-        global_features, local_features, patches = model.joint_features_with_tokens(image)
+        global_features, local_features, patches, attention = model.joint_features_with_tokens(image)
         state_features = model.encode_text(model.base.tokenize(mapper.prompts).to(device))
     assert global_features.shape == (args.batch_size, 512), tuple(global_features.shape)
     assert patches.shape == (args.batch_size, 196, 768), tuple(patches.shape)
     assert local_features.shape == (args.batch_size, 12, 512), tuple(local_features.shape)
+    assert attention.shape == (args.batch_size, 8, 12, 196), tuple(attention.shape)
     assert state_features.shape == (52, 512), tuple(state_features.shape)
     visual_names = [name for name, _module in model.named_modules() if name == "base.clip.visual"]
     assert len(visual_names) == 1, f"expected one visual encoder, got {visual_names}"

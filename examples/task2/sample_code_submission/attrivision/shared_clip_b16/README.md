@@ -26,10 +26,10 @@ checkpoints, and E2/E3 implementations are left in place.
   fusion alpha stays fixed at 0.5.
 
 The isolated configuration is
-[`e1_shared_clip_b16.json`](../configs/e1_shared_clip_b16.json). E1-0 and E1-B
+[`e1_shared_clip_b16.json`](../configs/e1_shared_clip_b16.json). E1-0 and E1-B/B0
 share the same local objective, epoch count, optimizer, decoder, and evaluation
 protocol. Their only intended difference is whether the frozen B/16 encoders
-start from pretrained CLIP or E1-A. E1-C starts from E1-B, keeps the E1-A text
+start from pretrained CLIP or E1-A. E1-C starts from the E1-B/B0 baseline, keeps the E1-A text
 tower frozen, and tunes the shared visual tower at 1e-5 plus the local
 projector/decoder at 1e-4. Its objective is `1.0 × A7 paper_fce + 0.25 × local
 FCE`. E1-D also starts from E1-B, then jointly fine-tunes every CLIP B/16
@@ -98,30 +98,66 @@ CUDA_VISIBLE_DEVICES=0 python examples/task2/sample_code_submission/attrivision/
   --output-dir outputs/BackboneUpgrade/E1_SharedCLIP_B16/E1-A
 ```
 
-### E1-B — frozen E1-A encoder plus local decoder
+### E1-B — AttriQuery consistency study
+
+All three runs load the same E1-A checkpoint, freeze both CLIP towers, start
+the local queries from the same seed (`42` by default), and keep the FCE,
+optimizer, batch size, epoch count, and validation protocol fixed. The example
+holds out `Market1501` from training; replace it with `PA100k` or `PETA` to
+screen another unseen source. The full official validation set still selects
+the best checkpoint by fused mADM. Domain metrics are reported separately using
+each source's own validation gallery.
+
+| Variant | Training objective | Output directory |
+| --- | --- | --- |
+| B0 | Local FCE | `E1-B` |
+| B1 | Local FCE + 0.1 × feature consistency | `E1-B1` |
+| B2 | Local FCE + 0.1 × feature consistency + 0.1 × attention consistency | `E1-B2` |
+
+The deterministic paired style view changes exposure and contrast only. It
+does not move pixels, so attention maps use identical 14×14 coordinates. The
+evaluation JSON records official validation and held-out domain mADM, Rank-1,
+and mAP, plus mean per-category query-feature and attention cosine similarity.
 
 ```bash
+E1A=outputs/BackboneUpgrade/E1_SharedCLIP_B16/E1-A/checkpoint_best.pth
+CONFIG=examples/task2/sample_code_submission/attrivision/configs/e1_shared_clip_b16.json
+
 CUDA_VISIBLE_DEVICES=0 python examples/task2/sample_code_submission/attrivision/shared_clip_b16/run.py train \
-  --stage local \
-  --init-checkpoint outputs/BackboneUpgrade/E1_SharedCLIP_B16/E1-A/checkpoint_best.pth \
-  --config examples/task2/sample_code_submission/attrivision/configs/e1_shared_clip_b16.json \
-  --data-root data \
-  --device cuda:0 \
+  --stage local --consistency-variant B0 --holdout-domain Market1501 \
+  --init-checkpoint "$E1A" --config "$CONFIG" --data-root data --device cuda:0 \
   --output-dir outputs/BackboneUpgrade/E1_SharedCLIP_B16/E1-B
+
+CUDA_VISIBLE_DEVICES=0 python examples/task2/sample_code_submission/attrivision/shared_clip_b16/run.py train \
+  --stage local --consistency-variant B1 --holdout-domain Market1501 \
+  --init-checkpoint "$E1A" --config "$CONFIG" --data-root data --device cuda:0 \
+  --output-dir outputs/BackboneUpgrade/E1_SharedCLIP_B16/E1-B1
+
+CUDA_VISIBLE_DEVICES=0 python examples/task2/sample_code_submission/attrivision/shared_clip_b16/run.py train \
+  --stage local --consistency-variant B2 --holdout-domain Market1501 \
+  --init-checkpoint "$E1A" --config "$CONFIG" --data-root data --device cuda:0 \
+  --output-dir outputs/BackboneUpgrade/E1_SharedCLIP_B16/E1-B2
 ```
 
-E1-B validation reports global-only, local-only, and fixed alpha=0.5 fusion.
-To resume the same run, pass both its original initialization and latest
-checkpoint:
+Consistency strengths can be overridden with `--feature-consistency-weight`
+and `--attention-consistency-weight`. B0 requires both to be zero; B1 requires
+a positive feature weight and zero attention weight; B2 requires both weights
+to be positive. Each run writes `evaluation_val.json`, `metrics.csv`, and
+`checkpoint_best.pth` in its output directory. B0 keeps the established E1-B
+checkpoint name so E1-C and E1-D can continue to initialize from that baseline.
+
+To resume a run, pass its original `--consistency-variant`, `--holdout-domain`,
+initial E1-A checkpoint, and output directory together with its
+`checkpoint_last.pth`:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python examples/task2/sample_code_submission/attrivision/shared_clip_b16/run.py train \
-  --stage local \
+  --stage local --consistency-variant B0 --holdout-domain Market1501 \
   --init-checkpoint outputs/BackboneUpgrade/E1_SharedCLIP_B16/E1-A/checkpoint_best.pth \
-  --resume outputs/BackboneUpgrade/E1_SharedCLIP_B16/E1-B/checkpoint_last.pth \
   --config examples/task2/sample_code_submission/attrivision/configs/e1_shared_clip_b16.json \
   --data-root data \
   --device cuda:0 \
+  --resume outputs/BackboneUpgrade/E1_SharedCLIP_B16/E1-B/checkpoint_last.pth \
   --output-dir outputs/BackboneUpgrade/E1_SharedCLIP_B16/E1-B
 ```
 

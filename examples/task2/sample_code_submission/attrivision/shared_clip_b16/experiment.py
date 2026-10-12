@@ -13,6 +13,7 @@ from typing import Any, Sequence
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from ..checkpoint import load_model as load_attrivision_checkpoint
@@ -30,14 +31,15 @@ from ..models.attrivision import AttriVision
 from ..transforms import build_eval_transform, build_train_transform
 from ..attrquery_fromscratch_jointfce import (
     category_names,
+    category_nll,
     evaluate_model,
     restore_rng,
     rng_state,
     valid_category_mask,
 )
 from upar.config import REPOSITORY_ROOT, choose_device, set_seed
-from upar.data import find_annotation_file, read_gt_csv
-from upar.retrieval import autocast
+from upar.data import ImagePathDataset, find_annotation_file, read_gt_csv
+from upar.retrieval import autocast, official_retrieval_metrics
 from .model import ARCHITECTURE, MODEL_NAME, SharedCLIPB16AttrQuery
 
 
@@ -264,6 +266,150 @@ def _build_loader(
     )
 
 
+def _image_domain(path: str) -> str:
+    return str(path).replace("\\", "/").split("/", 1)[0]
+
+
+def _style_view(images: torch.Tensor) -> torch.Tensor:
+    """Apply a fixed, geometry-preserving exposure/contrast style change."""
+    mean = images.new_tensor((0.48145466, 0.4578275, 0.40821073)).view(1, 3, 1, 1)
+    std = images.new_tensor((0.26862954, 0.26130258, 0.27577711)).view(1, 3, 1, 1)
+    rgb = (images * std + mean).clamp(0.0, 1.0)
+    rgb = ((rgb - 0.5) * 1.08 + 0.5) * 0.92
+    return (rgb.clamp(0.0, 1.0) - mean) / std
+
+
+def _domain_retrieval_report(
+    details: dict[str, Any], holdout_domain: str | None,
+) -> dict[str, Any]:
+    table = details["table"]
+    queries = details["queries"]
+    labels = details["labels"]
+    ids = np.asarray(details["ids"], dtype=np.int64)
+    domains = np.asarray([_image_domain(path) for path in table.image_paths], dtype=object)
+    domain_names = sorted(set(domains.tolist()))
+    if holdout_domain and holdout_domain not in domain_names:
+        raise ValueError(
+            f"holdout-domain={holdout_domain!r} was not found in validation annotations; "
+            f"available domains: {domain_names}"
+        )
+    fused_log_probabilities = details["fusion_scores"]["alpha_0.500"]
+    fused_probabilities = np.exp(fused_log_probabilities).astype(np.float32)
+    mapper = CategoryPromptMapper(details["model_attribute_names"])
+    groups = details["groups"]
+    queries52 = mapper.encode(torch.from_numpy(queries).float()).numpy()
+    distances = category_nll(queries52, fused_probabilities, groups)
+
+    def summarize(domain: str) -> dict[str, float]:
+        gallery_indices = np.flatnonzero(domains == domain).astype(np.int64)
+        query_indices = np.unique(ids[gallery_indices]).astype(np.int64)
+        local_id_by_global = {
+            int(query_id): local_id for local_id, query_id in enumerate(query_indices)
+        }
+        local_gallery_ids = np.asarray(
+            [local_id_by_global[int(query_id)] for query_id in ids[gallery_indices]],
+            dtype=np.int64,
+        )
+        official = official_retrieval_metrics(
+            distances[np.ix_(query_indices, gallery_indices)],
+            queries[query_indices], labels[gallery_indices], local_gallery_ids,
+        )
+        return {
+            "queries": float(len(query_indices)),
+            "gallery_images": float(len(gallery_indices)),
+            "rank1": float(official["Rank-1"]),
+            "mAP": float(official["mAP"]),
+            "mADM": float(official["mADM"]),
+        }
+
+    per_domain = {domain: summarize(domain) for domain in domain_names}
+    result: dict[str, Any] = {
+        "protocol": "domain-query retrieval against the same-domain gallery",
+        "domains": per_domain,
+        "holdout_domain": holdout_domain,
+    }
+    if holdout_domain:
+        result["holdout"] = per_domain[holdout_domain]
+        seen_domains = [domain for domain in domain_names if domain != holdout_domain]
+        if seen_domains:
+            result["seen_domain_macro"] = {
+                key: float(np.mean([per_domain[domain][key] for domain in seen_domains]))
+                for key in ("rank1", "mAP", "mADM")
+            }
+    return result
+
+
+@torch.inference_mode()
+def _attribute_query_stability(
+    model: SharedCLIPB16AttrQuery,
+    data_root: Path,
+    device: torch.device,
+    batch_size: int,
+    num_workers: int,
+    amp: bool,
+    max_val_samples: int | None,
+) -> dict[str, Any]:
+    annotation_path = find_annotation_file(data_root, "val")
+    table = read_gt_csv(annotation_path)
+    if max_val_samples is not None:
+        count = min(max_val_samples, len(table.image_paths))
+        table = type(table)(table.image_paths[:count], table.labels[:count], table.attribute_names)
+    loader = DataLoader(
+        ImagePathDataset(
+            table.image_paths,
+            [data_root, annotation_path.parent, REPOSITORY_ROOT],
+            build_eval_transform(224, "resize_pad_crop"),
+        ),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=device.type == "cuda",
+        persistent_workers=num_workers > 0,
+    )
+    feature_sums: torch.Tensor | None = None
+    attention_sums: torch.Tensor | None = None
+    image_count = 0
+    model.eval()
+    for images in loader:
+        images = images.to(device, non_blocking=True)
+        with autocast(device, amp):
+            _, queries, _, attention = model.joint_features_with_tokens(images)
+            _, styled_queries, _, styled_attention = model.joint_features_with_tokens(
+                _style_view(images),
+            )
+        query_cosine = F.cosine_similarity(
+            queries.float(), styled_queries.float(), dim=-1,
+        )
+        attention_cosine = F.cosine_similarity(
+            attention.float(), styled_attention.float(), dim=-1,
+        ).mean(dim=1)
+        if feature_sums is None:
+            feature_sums = torch.zeros(query_cosine.shape[-1], dtype=torch.float64)
+            attention_sums = torch.zeros(attention_cosine.shape[-1], dtype=torch.float64)
+        feature_sums += query_cosine.double().sum(dim=0).cpu()
+        attention_sums += attention_cosine.double().sum(dim=0).cpu()
+        image_count += len(images)
+    if image_count == 0 or feature_sums is None or attention_sums is None:
+        raise ValueError("Cannot compute query stability on an empty validation split")
+    feature_by_category = (feature_sums / image_count).tolist()
+    attention_by_category = (attention_sums / image_count).tolist()
+    labels = category_names(model.mapper)
+    return {
+        "style_transform": {
+            "type": "fixed exposure and contrast",
+            "brightness_scale": 0.92,
+            "contrast_scale": 1.08,
+            "spatial_transform": "none",
+        },
+        "images": image_count,
+        "attribute_query_cosine_mean": float(np.mean(feature_by_category)),
+        "attribute_query_cosine_by_category": dict(zip(labels, feature_by_category)),
+        "attention_cosine_mean": float(np.mean(attention_by_category)),
+        "attention_cosine_by_category": dict(zip(labels, attention_by_category)),
+        "attention_alignment": "identity; the style transform preserves the 14x14 patch coordinates",
+    }
+
+
 def _optimizer_groups(
     model: SharedCLIPB16AttrQuery,
     config: dict[str, Any],
@@ -342,6 +488,8 @@ def _train_one_epoch(
         "total_loss": 0.0,
         "global_loss": 0.0,
         "local_loss": 0.0,
+        "feature_consistency_loss": 0.0,
+        "attention_consistency_loss": 0.0,
         "global_backbone_gradient": 0.0,
         "local_backbone_gradient": 0.0,
         "global_text_gradient": 0.0,
@@ -397,6 +545,37 @@ def _train_one_epoch(
                 global_loss = global_features.new_zeros(())
                 total = local_output.loss
 
+            feature_consistency = local_features.new_zeros(())
+            attention_consistency = local_features.new_zeros(())
+            if config.get("consistency_variant", "B0") in {"B1", "B2"}:
+                # Disable decoder dropout for both paired views so the penalty
+                # measures image-style sensitivity rather than dropout noise.
+                model.eval()
+                try:
+                    with autocast(device, bool(config["amp"])):
+                        if config.get("consistency_variant") == "B2":
+                            _, original_queries, _, original_attention = model.joint_features_with_tokens(images)
+                            _, styled_queries, _, styled_attention = model.joint_features_with_tokens(
+                                _style_view(images),
+                            )
+                        else:
+                            _, original_queries = model.joint_features(images)
+                            _, styled_queries = model.joint_features(_style_view(images))
+                        feature_consistency = 1.0 - F.cosine_similarity(
+                            original_queries.float(), styled_queries.float(), dim=-1,
+                        ).mean()
+                        if config.get("consistency_variant") == "B2":
+                            attention_consistency = 1.0 - F.cosine_similarity(
+                                original_attention.float(), styled_attention.float(), dim=-1,
+                            ).mean()
+                finally:
+                    model.train()
+                total = (
+                    total
+                    + float(config["feature_consistency_weight"]) * feature_consistency
+                    + float(config["attention_consistency_weight"]) * attention_consistency
+                )
+
         if batch_index == 1 and trains_encoders:
             if not visual_parameters:
                 raise RuntimeError("Joint E1 training has no trainable shared visual parameters")
@@ -441,6 +620,8 @@ def _train_one_epoch(
         totals["total_loss"] += float(total.detach()) * count
         totals["global_loss"] += float(global_loss.detach()) * count
         totals["local_loss"] += float(local_output.loss.detach()) * count
+        totals["feature_consistency_loss"] += float(feature_consistency.detach()) * count
+        totals["attention_consistency_loss"] += float(attention_consistency.detach()) * count
         totals["samples"] += count
         totals["batches"] += 1.0
 
@@ -530,11 +711,28 @@ def train_shared(
     config: dict[str, Any],
     resume: str | None = None,
 ) -> Path:
+    consistency_variant = str(config.get("consistency_variant", "B0"))
+    if consistency_variant not in {"B0", "B1", "B2"}:
+        raise ValueError("consistency_variant must be B0, B1, or B2")
+    feature_weight = float(config.get("feature_consistency_weight", 0.0))
+    attention_weight = float(config.get("attention_consistency_weight", 0.0))
+    if feature_weight < 0.0 or attention_weight < 0.0:
+        raise ValueError("Consistency loss weights must be non-negative")
+    if consistency_variant == "B0" and (feature_weight != 0.0 or attention_weight != 0.0):
+        raise ValueError("B0 is the FCE-only baseline and requires zero consistency weights")
+    if consistency_variant == "B1" and (feature_weight <= 0.0 or attention_weight != 0.0):
+        raise ValueError("B1 requires a positive feature weight and zero attention weight")
+    if consistency_variant == "B2" and (feature_weight <= 0.0 or attention_weight <= 0.0):
+        raise ValueError("B2 requires positive feature and attention consistency weights")
     if stage == "joint":
+        if consistency_variant != "B0":
+            raise ValueError("Consistency variants are only supported for frozen local-query training")
         experiment = "E1-C"
         if init_source != "shared":
             raise ValueError("E1-C requires --init-source shared and an E1-B checkpoint")
     elif stage == "full":
+        if consistency_variant != "B0":
+            raise ValueError("Consistency variants are only supported for frozen local-query training")
         if init_source == "shared":
             experiment = "E1-D"
         elif init_source == "pretrained":
@@ -542,13 +740,17 @@ def train_shared(
         else:
             raise ValueError("Full joint training requires shared E1-B or pretrained CLIP initialization")
     elif init_source == "pretrained":
+        if consistency_variant != "B0":
+            raise ValueError("Consistency variants require initialization from the E1-A checkpoint")
         experiment = "E1-0"
         if stage != "local":
             raise ValueError("E1-0 uses the frozen local-decoder stage")
     elif init_source == "a7":
-        experiment = "E1-B"
+        experiment = {"B0": "E1-B", "B1": "E1-B1", "B2": "E1-B2"}[
+            consistency_variant
+        ]
         if stage != "local":
-            raise ValueError("E1-B uses the frozen local-decoder stage")
+            raise ValueError("E1-B consistency experiments use the frozen local-decoder stage")
     else:
         raise ValueError(f"Unsupported E1 stage/init-source pair: {stage}/{init_source}")
 
@@ -556,6 +758,25 @@ def train_shared(
     data_root = Path(config["data_root"]).resolve()
     train_annotation = find_annotation_file(data_root, "train")
     train_table = read_gt_csv(train_annotation)
+    holdout_domain = config.get("holdout_domain") if init_source == "a7" else None
+    if holdout_domain:
+        keep = np.asarray(
+            [_image_domain(path) != str(holdout_domain) for path in train_table.image_paths],
+            dtype=bool,
+        )
+        removed = int((~keep).sum())
+        if removed == 0:
+            available = sorted({_image_domain(path) for path in train_table.image_paths})
+            raise ValueError(
+                f"holdout-domain={holdout_domain!r} was not found in training annotations; "
+                f"available domains: {available}"
+            )
+        train_table = type(train_table)(
+            [path for path, selected in zip(train_table.image_paths, keep) if selected],
+            train_table.labels[keep], train_table.attribute_names,
+        )
+        if not train_table.image_paths:
+            raise ValueError("Holdout domain filtering left no training images")
     mapper = CategoryPromptMapper(train_table.attribute_names)
     if len(mapper.keys) != 52 or len(mapper.category_indices()) != 12:
         raise RuntimeError("Training annotations do not match the established 52-state ontology")
@@ -578,6 +799,12 @@ def train_shared(
         "text_sampling": "single",
         "contrastive_target": "multi_positive",
         "category_temperature": float(config["category_temperature"]),
+        "consistency_variant": consistency_variant,
+        "feature_consistency_weight": feature_weight,
+        "attention_consistency_weight": attention_weight,
+        "holdout_domain": holdout_domain,
+        "training_domains": sorted({_image_domain(path) for path in train_table.image_paths}),
+        "training_images_after_holdout": len(train_table.image_paths),
     }
     output_dir = Path(config["output_dir"]).resolve()
     config["output_dir"] = str(output_dir)
@@ -598,12 +825,21 @@ def train_shared(
 
     resume_payload = _load_payload(resume) if resume else None
     if resume_payload is not None:
+        saved_config = resume_payload.get("training_config", {})
         if resume_payload.get("experiment") != experiment:
             raise ValueError("Resume checkpoint experiment differs from the requested E1 stage")
-        if resume_payload.get("training_config", {}).get("init_source") != init_source:
+        if saved_config.get("init_source") != init_source:
             raise ValueError("Resume checkpoint initialization source differs from the requested run")
-        if resume_payload.get("training_config", {}).get("init_checkpoint") != config["init_checkpoint"]:
+        if saved_config.get("init_checkpoint") != config["init_checkpoint"]:
             raise ValueError("Resume checkpoint initialization path differs from the requested run")
+        for key, default in (
+            ("consistency_variant", "B0"),
+            ("feature_consistency_weight", 0.0),
+            ("attention_consistency_weight", 0.0),
+            ("holdout_domain", None),
+        ):
+            if saved_config.get(key, default) != config.get(key, default):
+                raise ValueError(f"Resume checkpoint {key} differs from the requested run")
 
     model = _new_model(
         stage=stage,
@@ -821,7 +1057,7 @@ def evaluate_checkpoint(
             raise ValueError(
                 f"Requested {experiment}, checkpoint contains {payload.get('experiment')!r}"
             )
-        rows, _details = evaluate_model(
+        rows, details = evaluate_model(
             model,
             payload["attribute_names"],
             Path(data_root).resolve(),
@@ -846,6 +1082,31 @@ def evaluate_checkpoint(
             "model_stage": payload["model_stage"],
             "vision_encoder_instances": 1,
         }
+        if experiment in {"E1-B", "E1-B1", "E1-B2"}:
+            holdout_domain = payload.get("training_config", {}).get("holdout_domain")
+            fused = next(
+                row for row in rows
+                if row.get("score_type") == "fusion"
+                and abs(float(row.get("alpha", -1.0)) - 0.5) < 1e-9
+            )
+            result["official_validation"] = {
+                "mADM": float(fused["mADM"]),
+                "Rank-1": float(fused["rank1"]),
+                "mAP": float(fused["mAP"]),
+                "fusion_alpha": 0.5,
+            }
+            result["domain_retrieval"] = _domain_retrieval_report(
+                details, str(holdout_domain) if holdout_domain else None,
+            )
+            result["attribute_query_stability"] = _attribute_query_stability(
+                model,
+                Path(data_root).resolve(),
+                device,
+                batch_size,
+                num_workers,
+                amp,
+                max_val_samples,
+            )
     if output_path:
         atomic_json(Path(output_path), result)
     return result
