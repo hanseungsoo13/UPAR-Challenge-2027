@@ -70,13 +70,12 @@ def _configure_training(args: argparse.Namespace, condition: str) -> None:
     args.paper_faithful = False
     args.distill_weight = 0.0
     args.rsc_drop_ratio = 0.0
-    args.swad_start_epoch = 3
     args.unseen_domain = None
 
-    if condition == "domain_swad":
+    if condition == "domain_balance":
         args.domain_sampling = "sqrt"
-        args.dg_method = "swad"
-        args.output_dir = str(Path(args.output_root) / "E1A_DomainBalanced_SWAD")
+        args.dg_method = "none"
+        args.output_dir = str(Path(args.output_root) / "E1A_DomainBalanced")
     elif condition == "wise_source":
         # WiSE-FT needs a plain fine-tuned endpoint and its matching pretrained
         # initialization. The interpolation itself is produced after this run.
@@ -148,12 +147,12 @@ def _wise_checkpoint(
     _atomic_torch_save(payload, output_path)
 
 
-def run_domain_swad(args: argparse.Namespace) -> None:
-    _configure_training(args, "domain_swad")
+def run_domain_balance(args: argparse.Namespace) -> None:
+    _configure_training(args, "domain_balance")
     output_dir = Path(args.output_dir)
     _atomic_json(output_dir / "config.json", vars(args))
     checkpoint = train(args)
-    metrics = _evaluate_checkpoint(args, checkpoint, "E1A_DomainBalanced_SWAD")
+    metrics = _evaluate_checkpoint(args, checkpoint, "E1A_DomainBalanced")
     print(json.dumps(metrics, indent=2, ensure_ascii=False))
 
 
@@ -212,10 +211,10 @@ def run_wise_ft(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = build_parser()
-    parser.description = "E1-A CLIP preservation: domain-balanced + SWAD and WiSE-FT"
+    parser.description = "E1-A CLIP preservation: domain-balanced sampling and WiSE-FT"
     parser.set_defaults(epochs=30)
     parser.add_argument(
-        "--experiment", choices=("domain_swad", "wise_ft"), required=True,
+        "--experiment", choices=("domain_balance", "wise_ft"), required=True,
     )
     parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT))
     parser.add_argument(
@@ -227,8 +226,8 @@ def main() -> None:
         help="fine-tuned weight in alpha*finetuned + (1-alpha)*pretrained",
     )
     args = parser.parse_args()
-    if args.experiment == "domain_swad":
-        run_domain_swad(args)
+    if args.experiment == "domain_balance":
+        run_domain_balance(args)
     else:
         run_wise_ft(args)
 

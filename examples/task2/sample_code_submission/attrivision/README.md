@@ -135,16 +135,17 @@ CUDA_VISIBLE_DEVICES=6 python examples/task2/sample_code_submission/attrivision/
   --output-dir outputs/attrivision_task2_hybrid
 ```
 
-### E1-A: Domain-balanced + SWAD 및 WiSE-FT
+### E1-A: Domain-balanced Sampling 및 WiSE-FT
 
 두 조건은 같은 pretrained OpenAI CLIP ViT-B/32와 E1-A의 FCE 학습·평가 레시피를
-사용한다. `domain_swad`는 각 데이터셋의 image-path prefix를 domain으로 보고
-`P(d) ∝ N_d^0.5`로 샘플링하며, epoch 3 이후 모델 가중치를 SWAD 방식으로 평균한다.
-검증 checkpoint 선택은 전체 validation mADM이고, domain별 mADM도 함께 저장한다.
+사용한다. `domain_balance`는 image-path prefix로 구분한 각 domain을
+`P(d) ∝ N_d^0.5`로 샘플링하고 SWAD는 적용하지 않는다. 자연 분포 기준점은
+`wise_ft` 실행의 E1A source checkpoint이며, 두 조건 모두 전체 validation mADM으로
+checkpoint를 선택하고 domain별 mADM을 기록한다.
 
 ```bash
 python examples/task2/sample_code_submission/attrivision/run_e1a_clip_preservation.py \
-  --experiment domain_swad \
+  --experiment domain_balance \
   --device cuda:0 \
   --output-root outputs/E1A_CLIP_Preservation
 ```
