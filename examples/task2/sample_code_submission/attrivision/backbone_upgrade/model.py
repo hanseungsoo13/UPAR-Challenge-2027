@@ -251,6 +251,7 @@ class BackboneUpgradeModel(nn.Module):
         model_id: str,
         attribute_names: Sequence[str],
         a7_checkpoint: str | None,
+        trainable_vision_encoder: bool = False,
         trainable_vision_last_blocks: int = 0,
         num_heads: int = 8,
         dropout: float = 0.1,
@@ -314,7 +315,12 @@ class BackboneUpgradeModel(nn.Module):
         self.num_heads = int(num_heads)
         self.dropout_rate = float(dropout)
         self.use_ffn = bool(use_ffn)
+        self.trainable_vision_encoder = bool(trainable_vision_encoder)
         self.trainable_vision_last_blocks = int(trainable_vision_last_blocks)
+        if self.trainable_vision_encoder and self.trainable_vision_last_blocks > 0:
+            raise ValueError(
+                "Choose full vision-encoder fine-tuning or last-block fine-tuning, not both"
+            )
         self._freeze_and_select_parameters()
 
     def _freeze_and_select_parameters(self) -> None:
@@ -324,7 +330,10 @@ class BackboneUpgradeModel(nn.Module):
             for parameter in self.global_a7.parameters():
                 parameter.requires_grad_(False)
 
-        if self.backbone_name == "siglip2_b16" and self.trainable_vision_last_blocks > 0:
+        if self.backbone_name == "siglip2_b16" and self.trainable_vision_encoder:
+            for parameter in self.local_backbone.vision.vision_model.parameters():
+                parameter.requires_grad_(True)
+        elif self.backbone_name == "siglip2_b16" and self.trainable_vision_last_blocks > 0:
             layers = self.local_backbone.vision.vision_model.encoder.layers
             count = self.trainable_vision_last_blocks
             if count > len(layers):
@@ -344,7 +353,10 @@ class BackboneUpgradeModel(nn.Module):
             self.global_a7.eval()
         if self.backbone_name == "siglip2_b16":
             self.local_backbone.vision.text_model.eval()
-            if self.trainable_vision_last_blocks == 0:
+            vision_is_trainable = (
+                self.trainable_vision_encoder or self.trainable_vision_last_blocks > 0
+            )
+            if not vision_is_trainable:
                 self.local_backbone.vision.eval()
             else:
                 for layer in self.local_backbone.vision.vision_model.encoder.layers:
@@ -355,7 +367,9 @@ class BackboneUpgradeModel(nn.Module):
         return self
 
     def forward(self, raw_images: torch.Tensor) -> dict[str, torch.Tensor]:
-        vision_grad = self.backbone_name == "siglip2_b16" and self.trainable_vision_last_blocks > 0
+        vision_grad = self.backbone_name == "siglip2_b16" and (
+            self.trainable_vision_encoder or self.trainable_vision_last_blocks > 0
+        )
         local_tokens, siglip_global = self.local_backbone(raw_images, vision_grad=vision_grad)
         local_tokens = self.local_projector(local_tokens.float())
         local_features = self.local_decoder(local_tokens, self.category_text_prototypes)

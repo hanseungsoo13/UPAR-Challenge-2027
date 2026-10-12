@@ -46,7 +46,10 @@ DEFAULT_CONFIGS = {
     "E2_DINOv3_B16": CONFIG_DIR / "e2_dinov3_b16.json",
     "E3A_SigLIP2_Frozen": CONFIG_DIR / "e3a_siglip2_frozen.json",
     "E3B_SigLIP2_Finetune": CONFIG_DIR / "e3b_siglip2_finetune.json",
+    "D1_SigLIP2_Fused": CONFIG_DIR / "d1_siglip2_fused.json",
+    "D2_SigLIP2_FullFT": CONFIG_DIR / "d2_siglip2_full_finetune.json",
 }
+SIGLIP2_GLOBAL_SCORING_MODES = {"sigmoid_normalize", "logit_softmax"}
 
 
 def _atomic_json(path: Path, value: Any) -> None:
@@ -148,10 +151,26 @@ def _load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> d
     )
     if not config.get("output_dir"):
         raise ValueError("Every experiment must have an isolated output_dir")
+    config.setdefault("selection_metric", "fused.mADM")
+    if config["selection_metric"] != "fused.mADM":
+        raise ValueError("BackboneUpgrade checkpoint selection must use fused.mADM")
+    config.setdefault("siglip2_global_scoring", "sigmoid_normalize")
+    if config["siglip2_global_scoring"] not in SIGLIP2_GLOBAL_SCORING_MODES:
+        raise ValueError(
+            "siglip2_global_scoring must be one of "
+            f"{sorted(SIGLIP2_GLOBAL_SCORING_MODES)}"
+        )
     if int(config.get("image_size", 224)) != 224:
         raise ValueError("The shared comparison protocol requires 224x224 input")
     if config.get("backbone") not in {"clip_b16", "dinov3_b16", "siglip2_b16"}:
         raise ValueError(f"Invalid backbone name: {config.get('backbone')}")
+    if config.get("trainable_vision_encoder") and config["backbone"] != "siglip2_b16":
+        raise ValueError("Full vision-encoder fine-tuning is currently supported for SigLIP2 only")
+    if expected == "D2_SigLIP2_FullFT":
+        if not config.get("trainable_vision_encoder"):
+            raise ValueError("D2 requires full SigLIP2 vision-encoder fine-tuning")
+        if float(config.get("global_loss_weight", 0.0)) <= 0.0:
+            raise ValueError("D2 requires a non-zero Global Attribute loss weight")
     if int(config.get("epochs", 0)) <= 0 or int(config.get("batch_size", 0)) <= 0:
         raise ValueError("epochs and batch_size must be positive")
     if int(config.get("eval_batch_size", 0)) <= 0:
@@ -180,6 +199,7 @@ def _build_model(
         model_id=config["model_id"],
         attribute_names=attribute_names,
         a7_checkpoint=config.get("a7_checkpoint"),
+        trainable_vision_encoder=bool(config.get("trainable_vision_encoder", False)),
         trainable_vision_last_blocks=int(config.get("trainable_vision_last_blocks", 0)),
         num_heads=int(config.get("num_heads", 8)),
         dropout=float(config.get("dropout", 0.1)),
@@ -365,10 +385,14 @@ def _score_views(
     groups = _category_groups(mapper)
     target_queries = mapper.encode(torch.from_numpy(queries).float()).numpy()
     target_labels = mapper.encode(torch.from_numpy(labels).float()).numpy()
+    global_scoring = config.get("siglip2_global_scoring", "sigmoid_normalize")
     global_log = _category_log_probs(
         global_scores, groups,
         float(config.get("siglip2_global_temperature", config["category_temperature"])),
-        sigmoid_alignment=config.get("backbone") == "siglip2_b16",
+        sigmoid_alignment=(
+            config.get("backbone") == "siglip2_b16"
+            and global_scoring == "sigmoid_normalize"
+        ),
     )
     local_by_category = _local_category_log_probs(
         local_scores, groups, float(config["category_temperature"]),
@@ -406,20 +430,31 @@ def _score_views(
             )
         results["views"][view]["category_accuracy"] = accuracy
 
-    # Each category's retrieval view ranks using only that category's NLL.
+    # Each category's retrieval view uses category NLL and category-only exact
+    # relevance. Full-attribute relevance here would make this field misleading.
     fused_prob = probabilities["fused"]
-    for index, (name, group) in enumerate(zip(category_labels, groups)):
+    attribute_index = {name: index for index, name in enumerate(mapper.attribute_names)}
+    category_columns = [
+        [attribute_index[column] for column in columns]
+        for _, columns, _, _ in mapper._MULTI_GROUPS
+    ]
+    category_columns.extend([
+        [attribute_index[column]] for column, _, _ in mapper._BINARY_GROUPS
+    ])
+    for name, group, columns in zip(category_labels, groups, category_columns):
         query_targets = target_queries[:, group]
         counts = query_targets.sum(axis=1, keepdims=True).clip(min=1.0)
         gallery_log = np.log(np.clip(fused_prob[:, group], 1e-12, 1.0))
         distances = -(query_targets / counts) @ gallery_log.T
-        results["category_retrieval"][name] = _metric_row(distances, queries, labels, ids)
+        results["category_retrieval"][name] = _metric_row(
+            distances, queries[:, columns], labels[:, columns], ids,
+        )
     results["images"] = int(len(labels))
     results["queries"] = int(len(queries))
     results["fusion_space"] = "category log-probabilities"
+    results["category_retrieval_relevance"] = "exact match on that category's UPAR attributes"
     results["siglip2_global_calibration"] = (
-        "pretrained sigmoid alignment, then within-category normalization"
-        if config.get("backbone") == "siglip2_b16" else None
+        global_scoring if config.get("backbone") == "siglip2_b16" else None
     )
     return results
 
@@ -514,7 +549,7 @@ def evaluate_model(
         "experiment": config["experiment"],
         "split": split,
         "epoch": int(config.get("evaluated_epoch", 0)),
-        "selection_metric": "fused.mADM",
+        "selection_metric": config.get("selection_metric", "fused.mADM"),
         "best_checkpoint": config.get("evaluated_checkpoint"),
         "pretrained_model": model.model_id,
         "global_backbone": "A7" if model.global_mode == "a7" else "SigLIP2 ViT-B/16",
@@ -581,15 +616,17 @@ def _train_one_epoch(
             )
             loss = local.loss
             global_loss = output["global_scores"].new_zeros(())
-            if config["experiment"] == "E3B_SigLIP2_Finetune":
+            global_loss_weight = float(config.get("global_loss_weight", 0.0))
+            local_loss_weight = float(config.get("local_loss_weight", 1.0))
+            if global_loss_weight > 0.0:
                 global_loss = _sigmoid_focal_binary_loss(
                     output["global_scores"], semantic_targets,
                     float(config.get("sigmoid_focal_alpha", 0.25)),
                     float(config.get("sigmoid_focal_gamma", 2.0)),
                 )
                 loss = (
-                    float(config.get("global_loss_weight", 1.0)) * global_loss
-                    + float(config.get("local_loss_weight", 0.25)) * local.loss
+                    global_loss_weight * global_loss
+                    + local_loss_weight * local.loss
                 )
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -616,7 +653,7 @@ def _build_optimizer(
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
-        is_backbone = name.startswith("local_backbone.vision.vision_model.encoder.layers.")
+        is_backbone = name.startswith("local_backbone.vision.vision_model.")
         lr = backbone_lr if is_backbone else head_lr
         wd = decay if parameter.ndim >= 2 else 0.0
         grouped.setdefault(("backbone" if is_backbone else "head", wd), []).append(parameter)
@@ -694,6 +731,8 @@ def train_main(argv: Sequence[str] | None = None) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     _atomic_json(output_dir / "config.json", config)
     if device.type == "cuda":
+        # Initialize the CUDA caching allocator before querying peak stats.
+        torch.empty(1, device=device)
         torch.cuda.reset_peak_memory_stats(device)
 
     model = _build_model(config, train_table.attribute_names, device)
@@ -721,13 +760,21 @@ def train_main(argv: Sequence[str] | None = None) -> None:
         "patch_tokens_at_224": (224 // 16) ** 2,
         "num_categories": model.num_categories,
         "num_states": model.num_states,
+        "trainable_vision_encoder": model.trainable_vision_encoder,
         "trainable_vision_last_blocks": model.trainable_vision_last_blocks,
         "parameter_counts": counts,
         "a7_checkpoint": config.get("a7_checkpoint"),
         "pretrained_model": config["model_id"],
     })
+    vision_finetune = (
+        "full" if model.trainable_vision_encoder else
+        f"last_{model.trainable_vision_last_blocks}_blocks"
+        if model.trainable_vision_last_blocks else "frozen"
+    )
     print(
         f"{config['experiment']} backbone={model.model_id}; device={device}; "
+        f"vision_finetune={vision_finetune}; "
+        f"global_loss_weight={float(config.get('global_loss_weight', 0.0)):.2f}; "
         f"parameters total={counts['total']:,}, frozen={counts['frozen']:,}, "
         f"trainable={counts['trainable']:,}", flush=True,
     )
@@ -840,6 +887,8 @@ def train_main(argv: Sequence[str] | None = None) -> None:
         )
         print(
             f"epoch={epoch:03d}/{config['epochs']} loss={train_metrics['loss']:.5f} "
+            f"localFCE={train_metrics['local_fce_loss']:.5f} "
+            f"globalFocal={train_metrics['global_sigmoid_focal_loss']:.5f} "
             f"R1={100*fused_metrics['rank1']:.2f}% mAP={100*fused_metrics['mAP']:.2f}% "
             f"mADM={100*score:.2f}% (best epoch {best_epoch})", flush=True,
         )
