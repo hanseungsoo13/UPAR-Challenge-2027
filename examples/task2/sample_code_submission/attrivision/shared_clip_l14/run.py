@@ -125,8 +125,8 @@ def _run_train(argv: list[str], *, e1_d: bool = False) -> None:
         parser.add_argument("--stage", choices=("control", "local", "joint", "full"), required=True)
     _add_training_overrides(parser)
     args = parser.parse_args(argv)
-    if e1_d and not args.init_checkpoint:
-        parser.error("e1-d requires --init-checkpoint pointing to the E1-B best checkpoint")
+    if args.stage == "full" and args.init_checkpoint:
+        parser.error("E1-D starts from OpenAI pretrained CLIP; omit --init-checkpoint and use --resume only to continue E1-D")
     if args.stage == "control":
         if args.consistency_variant != "B0" or args.holdout_domain:
             parser.error("Consistency variants and holdout-domain apply only to --stage local")
@@ -144,14 +144,10 @@ def _run_train(argv: list[str], *, e1_d: bool = False) -> None:
         if not args.init_checkpoint:
             parser.error("--stage joint requires --init-checkpoint with the E1-B best checkpoint")
         stage, init_source, experiment = "joint", "shared", "E1-C"
-    elif args.init_checkpoint:
-        if args.consistency_variant != "B0" or args.holdout_domain:
-            parser.error("Consistency variants and holdout-domain apply only to --stage local")
-        stage, init_source, experiment = "full", "shared", "E1-D"
     else:
         if args.consistency_variant != "B0" or args.holdout_domain:
             parser.error("Consistency variants and holdout-domain apply only to --stage local")
-        stage, init_source, experiment = "full", "pretrained", "E1-E"
+        stage, init_source, experiment = "full", "pretrained", "E1-D"
     if args.resume and args.stage == "joint" and args.init_checkpoint is None:
         parser.error("--resume for E1-C requires the same --init-checkpoint as the original run")
     args.experiment_name = experiment

@@ -208,18 +208,18 @@ def _new_model(
         _load_a7_base(base, init_checkpoint, attributes)
     elif init_source == "shared":
         if not init_checkpoint:
-            raise ValueError("E1-C/E1-D requires --init-checkpoint pointing to E1-B best")
+            raise ValueError("Shared initialization requires --init-checkpoint pointing to E1-B best")
         prior_payload = _load_payload(init_checkpoint, map_location="cpu")
         if prior_payload.get("architecture") != ARCHITECTURE or prior_payload.get("model_name") != MODEL_NAME:
-            raise ValueError("E1-C/E1-D initialization is not a shared CLIP ViT-L/14 checkpoint")
+            raise ValueError("Shared initialization is not a shared CLIP ViT-L/14 checkpoint")
         if prior_payload.get("model_stage") != "local" or prior_payload.get("experiment") != "E1-B":
-            raise ValueError("E1-C/E1-D must initialize from an E1-B local-decoder checkpoint")
+            raise ValueError("Shared initialization must use an E1-B local-decoder checkpoint")
         if list(prior_payload.get("attribute_names", [])) != list(attributes):
             raise ValueError("E1-B checkpoint attribute order differs from the dataset")
         model.load_state_dict(prior_payload["model_state_dict"], strict=True)
     elif init_source == "pretrained":
         # The CLIP towers were loaded above; the local decoder keeps its fresh
-        # random initialization for E1-0 and direct full-joint E1-E.
+        # random initialization for E1-0 and direct full-joint E1-D.
         pass
     else:
         raise ValueError(f"Unsupported initialization source: {init_source!r}")
@@ -769,12 +769,9 @@ def train_shared(
     elif stage == "full":
         if consistency_variant != "B0":
             raise ValueError("Consistency variants are only supported for frozen local-query training")
-        if init_source == "shared":
-            experiment = "E1-D"
-        elif init_source == "pretrained":
-            experiment = "E1-E"
-        else:
-            raise ValueError("Full joint training requires shared E1-B or pretrained CLIP initialization")
+        if init_source != "pretrained" or init_checkpoint is not None:
+            raise ValueError("E1-D requires direct OpenAI pretrained CLIP initialization with a fresh AttriQuery decoder")
+        experiment = "E1-D"
     elif init_source == "pretrained":
         if consistency_variant != "B0":
             raise ValueError("Consistency variants require initialization from the E1-A checkpoint")

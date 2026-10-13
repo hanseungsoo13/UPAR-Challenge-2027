@@ -1,6 +1,6 @@
 # Shared CLIP ViT-L/14 E1
 
-OpenAI CLIP Large로 E1-A → E1-B → E1-C/E1-D를 새로 학습하는 별도 실행 경로다.
+OpenAI CLIP Large로 E1-A → E1-B → E1-C와 독립적인 E1-D를 새로 학습하는 별도 실행 경로다.
 현재 B/16 실험의 A7 FCE, category-complete 52-state prompts, 12-category
 local FCE, Global/Local fusion(alpha=0.5), validation mADM 선택을 재사용한다.
 설정은 `attrivision/configs/e1_shared_clip_l14.json`에 있다.
@@ -84,7 +84,8 @@ local-only, alpha=0.5 fusion을 모두 평가하고 fused mADM으로 최적 모�
 
 ## E1-D — CLIP과 cross-attention AttriQuery 전체 joint 학습
 
-E1-B/B0 최적 체크포인트에서 시작한다. E1-C는 거치지 않아도 된다.
+E1-A처럼 OpenAI pretrained CLIP L/14에서 바로 시작한다. AttriQuery local
+head는 새로 무작위 초기화하며 E1-A/B/C 결과 없이 독립적으로 학습할 수 있다.
 CLIP visual tower, text tower, global temperature와 전체 local head
 (category queries, cross-attention, FFN, LayerNorm, output projection)를 모두
 갱신한다. 52-state text embedding도 각 배치에서 gradient를 유지한 채 다시
@@ -101,7 +102,6 @@ projection의 학습 파라미터 수를 기록한다.
 
 ```bash
 conda activate rws-upar-challenge && CUDA_VISIBLE_DEVICES=0 python examples/task2/sample_code_submission/attrivision/shared_clip_l14/run.py e1-d \
-  --init-checkpoint outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-B/checkpoint_best.pth \
   --config examples/task2/sample_code_submission/attrivision/configs/e1_shared_clip_l14.json \
   --data-root data \
   --device cuda:0 \
@@ -115,12 +115,14 @@ conda activate rws-upar-challenge && CUDA_VISIBLE_DEVICES=0 python examples/task
   --output-dir outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-D
 ```
 
-`e1-d`는 E1-B 초기화 체크포인트를 필수로 받는다. 기존
-`train --stage full --init-checkpoint ...`도 같은 E1-D 학습을 실행한다.
+`e1-d`와 `train --stage full`은 모두 pretrained CLIP에서 E1-D를 시작한다.
+`--init-checkpoint`는 허용하지 않는다. 첫 실행 시 OpenAI 사전학습 가중치를
+다운로드하며 저장 설정과 체크포인트에 `init_source=pretrained`를 기록한다.
 Global-only, local-only, fusion(alpha=0.5)을 평가하고 fused validation mADM으로
 `checkpoint_best.pth`를 선택한다. 검증 결과는 `evaluation_val.json`에 저장한다.
 
-E1-D 재개 시에는 위 명령에 다음 인자를 추가한다.
+E1-D 재개 시에는 위 명령에 다음 인자를 추가한다. 이전 E1-B 초기화 방식으로
+학습한 폴더가 있다면 새 출력 폴더에서 pretrained E1-D를 시작해야 한다.
 
 ```bash
 --resume outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-D/checkpoint_last.pth
