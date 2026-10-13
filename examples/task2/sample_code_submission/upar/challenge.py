@@ -41,7 +41,10 @@ def load_model() -> None:
         attrivision_challenge.load_model()
         _ATTRIVISION = True
         return
-    if preview.get("architecture") == "attrivision_jointfce_submission_vit_b_32":
+    if preview.get("architecture") in {
+        "attrivision_jointfce_submission_vit_b_16",
+        "attrivision_jointfce_submission_vit_b_32",
+    }:
         from . import attrquery_challenge
         attrquery_challenge.load_model()
         _ATTRQUERY_JOINTFCE = True

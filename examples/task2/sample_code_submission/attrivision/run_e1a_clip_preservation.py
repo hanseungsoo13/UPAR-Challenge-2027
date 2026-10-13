@@ -180,7 +180,8 @@ def run_wise_ft(args: argparse.Namespace) -> None:
     source_config = source_payload.get("training_config", {})
     if source_config.get("dg_method", "none") != "none":
         raise ValueError("WiSE-FT source must be a plain E1A fine-tuning checkpoint")
-    if source_config.get("domain_sampling", "natural") != "natural":
+    # A missing/None setting is the trainer's default natural sampling mode.
+    if source_config.get("domain_sampling") not in (None, "natural"):
         raise ValueError("WiSE-FT source must use natural domain sampling")
     _evaluate_checkpoint(args, source_checkpoint, "E1A_WiSEFT_Source")
 

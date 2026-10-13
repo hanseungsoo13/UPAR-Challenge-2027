@@ -35,6 +35,11 @@ def load_checkpoint_metadata(source: Path | BinaryIO) -> dict[str, Any]:
     architecture = checkpoint.get("architecture")
     if architecture == "attrivision_openclip_vit_b_32":
         required = {"model_state_dict", "attribute_names", "model_name", "prompt_mode"}
+    elif architecture == "attrivision_attrquery_shared_openclip_vit_b_16":
+        required = {
+            "model_state_dict", "attribute_names", "model_name", "model_stage",
+            "experiment", "state_prompt_texts", "state_keys", "category_groups",
+        }
     elif architecture == "attrquery_fromscratch_jointfce":
         required = {
             "model_state_dict", "attribute_names", "base_model_name",
@@ -48,6 +53,12 @@ def load_checkpoint_metadata(source: Path | BinaryIO) -> dict[str, Any]:
         required = {
             "visual_state_dict", "local_head_state_dict", "text_features",
             "semantic_keys", "attribute_names", "category_groups",
+        }
+    elif architecture == "attrivision_jointfce_submission_vit_b_16":
+        required = {
+            "visual_state_dict", "local_head_state_dict", "text_features",
+            "semantic_keys", "attribute_names", "category_groups",
+            "patch_size", "fusion_alpha",
         }
     else:
         required = CONVNEXT_CHECKPOINT_KEYS
@@ -159,6 +170,106 @@ def _jointfce_submission_checkpoint(
     return stream.getvalue(), metadata
 
 
+def _shared_e1_b_submission_checkpoint(checkpoint: Path) -> tuple[bytes, dict[str, Any]]:
+    """Convert the frozen-encoder E1-B checkpoint to the portable B/16 adapter payload."""
+    from attrivision.datasets.attribute_prompts import CategoryPromptMapper
+    from attrivision.models.attrivision import AttriVision
+
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    if payload.get("architecture") != "attrivision_attrquery_shared_openclip_vit_b_16":
+        raise ValueError("E1-B packaging requires a shared CLIP ViT-B/16 checkpoint")
+    if payload.get("experiment") != "E1-B" or payload.get("model_stage") != "local":
+        raise ValueError("E1-B submission packaging requires the E1-B local-stage checkpoint")
+    if payload.get("model_name") != "ViT-B-16-quickgelu":
+        raise ValueError("E1-B submission packaging requires OpenAI CLIP ViT-B/16")
+    if int(payload.get("epoch", 0)) < 1:
+        raise ValueError("E1-B submission packaging rejects an untrained checkpoint")
+
+    attributes = list(payload["attribute_names"])
+    mapper = CategoryPromptMapper(attributes)
+    if list(payload.get("state_keys", [])) != list(mapper.keys):
+        raise ValueError("E1-B checkpoint semantic state order differs from the submission mapper")
+    if list(payload.get("state_prompt_texts", [])) != list(mapper.prompts):
+        raise ValueError("E1-B checkpoint prompt order differs from the submission mapper")
+    expected_groups = [list(group) for group in mapper.category_indices()]
+    if payload.get("category_groups") != expected_groups:
+        raise ValueError("E1-B checkpoint category partition differs from the Native52 mapper")
+
+    state = payload.get("model_state_dict")
+    if not isinstance(state, dict):
+        raise ValueError("E1-B checkpoint has no model_state_dict")
+    base_state = {
+        key.removeprefix("base."): value.detach().cpu()
+        for key, value in state.items()
+        if key.startswith("base.")
+    }
+    visual_state = {
+        key.removeprefix("base.clip.visual."): value.detach().cpu()
+        for key, value in state.items()
+        if key.startswith("base.clip.visual.")
+    }
+    local_state = {
+        key.removeprefix("local_head."): value.detach().cpu()
+        for key, value in state.items()
+        if key.startswith("local_head.")
+    }
+    if not visual_state or not local_state:
+        raise ValueError("E1-B checkpoint lacks visual or local-head weights")
+
+    base = AttriVision(pretrained=None, model_name=payload["model_name"])
+    missing, unexpected = base.load_state_dict(base_state, strict=True)
+    if missing or unexpected:
+        raise ValueError(
+            f"E1-B CLIP B/16 checkpoint mismatch: missing={missing}, unexpected={unexpected}"
+        )
+    base.eval()
+    with torch.inference_mode():
+        text_features = base.encode_text(base.tokenize(mapper.prompts)).float().cpu()
+
+    training_config = payload.get("training_config", {})
+    category_temperature = float(training_config.get("category_temperature", 0.01))
+    fusion_alpha = float(training_config.get("selection_alpha", 0.5))
+    if category_temperature <= 0 or abs(fusion_alpha - 0.5) > 1e-9:
+        raise ValueError("E1-B submission requires category temperature > 0 and fusion alpha 0.5")
+    converted = {
+        "format_version": 1,
+        "architecture": "attrivision_jointfce_submission_vit_b_16",
+        "patch_size": 16,
+        "quick_gelu": True,
+        "visual_state_dict": visual_state,
+        "local_head_state_dict": local_state,
+        "text_features": text_features,
+        "semantic_keys": list(mapper.keys),
+        "attribute_names": attributes,
+        "category_groups": expected_groups,
+        "visual_dim": int(payload.get("visual_hidden_dim", 768)),
+        "text_dim": int(payload.get("joint_embedding_dim", 512)),
+        "num_categories": len(expected_groups),
+        "num_states": len(mapper.keys),
+        "num_heads": int(training_config.get("num_heads", 8)),
+        "dropout": float(training_config.get("dropout", 0.1)),
+        "use_ffn": bool(training_config.get("use_ffn", True)),
+        "retrieval_scoring": "native52_joint_fusion",
+        "fusion_alpha": fusion_alpha,
+        "category_temperature": category_temperature,
+        "augmentation": "resize_pad_crop",
+        "epoch": payload.get("epoch"),
+        "metrics": payload.get("metrics", {}),
+        "source_architecture": payload.get("architecture"),
+        "source_experiment": payload.get("experiment"),
+    }
+    stream = BytesIO()
+    torch.save(converted, stream)
+    metadata = {
+        "epoch": payload.get("epoch"),
+        "model_kind": "attrivision_e1_b_shared_clip_b16",
+        "metrics": payload.get("metrics", {}),
+        "architecture": payload.get("architecture"),
+        "packaged_architecture": converted["architecture"],
+    }
+    return stream.getvalue(), metadata
+
+
 def submission_checkpoint(
     checkpoint: Path,
     retrieval_scoring: str = "cosine_set",
@@ -170,6 +281,12 @@ def submission_checkpoint(
     """Convert research AttriVision weights to a dependency-free inference payload."""
     metadata = load_checkpoint_metadata(checkpoint)
     architecture = metadata["architecture"]
+    if model == "attrivision_e1_b" or architecture == "attrivision_attrquery_shared_openclip_vit_b_16":
+        if model not in {"auto", "attrivision_e1_b"}:
+            raise ValueError("The selected model preset does not accept an E1-B checkpoint")
+        if architecture != "attrivision_attrquery_shared_openclip_vit_b_16":
+            raise ValueError("--model attrivision_e1_b requires an E1-B shared CLIP B/16 checkpoint")
+        return _shared_e1_b_submission_checkpoint(checkpoint)
     if model == "attrquery_jointfce" or architecture == "attrquery_fromscratch_jointfce":
         if model not in {"auto", "attrquery_jointfce"}:
             raise ValueError("The selected model preset does not accept a JointFCE checkpoint")
@@ -383,7 +500,7 @@ def main() -> None:
         help="output zip path (default: submissions/upar_task2_YYYYMMDD_HHMMSS.zip)",
     )
     parser.add_argument(
-        "--model", choices=("auto", "convnext", "attrivision_a7", "attrquery_jointfce"), default="auto",
+        "--model", choices=("auto", "convnext", "attrivision_a7", "attrivision_e1_b", "attrquery_jointfce"), default="auto",
         help="submission preset; auto preserves the checkpoint's architecture",
     )
     parser.add_argument(

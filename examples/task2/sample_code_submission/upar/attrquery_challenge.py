@@ -113,9 +113,10 @@ class JointFCEModel(nn.Module):
         num_heads: int,
         dropout: float,
         use_ffn: bool,
+        patch_size: int = 32,
     ) -> None:
         super().__init__()
-        self.visual = CLIPVisionTransformer(quick_gelu)
+        self.visual = CLIPVisionTransformer(quick_gelu, patch_size=patch_size)
         self.visual.load_state_dict(visual_state, strict=True)
         self.local_head = CategoryCrossAttention(
             num_categories, visual_dim, text_dim, num_heads, dropout, use_ffn,
@@ -206,15 +207,23 @@ def load_model() -> None:
         payload = torch.load(path, map_location="cpu", weights_only=False)
     except TypeError:
         payload = torch.load(path, map_location="cpu")
-    if payload.get("architecture") != "attrivision_jointfce_submission_vit_b_32":
+    architecture = payload.get("architecture")
+    architecture_patch_sizes = {
+        "attrivision_jointfce_submission_vit_b_16": 16,
+        "attrivision_jointfce_submission_vit_b_32": 32,
+    }
+    if architecture not in architecture_patch_sizes:
         raise ValueError("Invalid packaged JointFCE checkpoint")
+    patch_size = int(payload.get("patch_size", architecture_patch_sizes[architecture]))
+    if patch_size != architecture_patch_sizes[architecture]:
+        raise ValueError("Packaged JointFCE architecture and patch size do not match")
     visual_state = payload["visual_state_dict"]
     local_state = payload["local_head_state_dict"]
     model = JointFCEModel(
         bool(payload.get("quick_gelu", False)), visual_state, local_state,
         int(payload["visual_dim"]), int(payload["text_dim"]),
         int(payload["num_categories"]), int(payload["num_heads"]),
-        float(payload["dropout"]), bool(payload["use_ffn"]),
+        float(payload["dropout"]), bool(payload["use_ffn"]), patch_size,
     )
     _MODEL, _DEVICE = model.to(device).eval(), device
     _TEXT_FEATURES = F.normalize(payload["text_features"].float(), dim=-1).to(device)

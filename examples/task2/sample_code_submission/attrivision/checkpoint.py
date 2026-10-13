@@ -13,6 +13,13 @@ import torch.nn as nn
 from .models.attrivision import AttriVision
 
 
+def _architecture_name(model_name: str) -> str:
+    normalized = model_name.lower().replace("-", "_")
+    if normalized.endswith("_quickgelu"):
+        normalized = normalized[:-len("_quickgelu")]
+    return f"attrivision_openclip_{normalized}"
+
+
 def _cpu_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
     return {key: value.detach().cpu() for key, value in model.state_dict().items()}
 
@@ -29,7 +36,7 @@ def model_payload(model: AttriVision, attribute_names: Sequence[str], epoch: int
                   training_config: dict[str, Any] | None = None) -> dict[str, Any]:
     payload = {
         "format_version": 3,
-        "architecture": "attrivision_openclip_vit_b_32",
+        "architecture": _architecture_name(model.model_name),
         "model_name": model.model_name,
         "model_state_dict": _cpu_state_dict(model),
         "attribute_names": list(attribute_names),
@@ -92,7 +99,22 @@ def _load(path: str | Path, map_location: str | torch.device = "cpu") -> dict[st
         payload = torch.load(path, map_location=map_location)
     required = {"architecture", "model_name", "model_state_dict", "attribute_names"}
     missing = required - payload.keys()
-    if missing or payload["architecture"] != "attrivision_openclip_vit_b_32":
+    expected_architecture = (
+        _architecture_name(payload["model_name"])
+        if "model_name" in payload else None
+    )
+    stored_architecture = payload.get("architecture")
+    # Older B/16 runs used a hard-coded B/32 architecture label even though
+    # their model_name and tensor shapes were B/16. Keep those checkpoints
+    # loadable; load_model() still validates every tensor against the selected
+    # model before inference.
+    legacy_b32_label_for_b16 = (
+        stored_architecture == "attrivision_openclip_vit_b_32"
+        and expected_architecture == "attrivision_openclip_vit_b_16"
+    )
+    if missing or (
+        stored_architecture != expected_architecture and not legacy_b32_label_for_b16
+    ):
         raise ValueError(f"Invalid AttriVision checkpoint; missing={sorted(missing)}")
     return payload
 
