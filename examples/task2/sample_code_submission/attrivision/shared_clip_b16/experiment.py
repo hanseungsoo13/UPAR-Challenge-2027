@@ -466,6 +466,7 @@ def _gradient_norm(loss: torch.Tensor, parameters: Sequence[nn.Parameter]) -> fl
 
 def _train_one_epoch(
     model: SharedCLIPB16AttrQuery,
+    anchor_model: SharedCLIPB16AttrQuery | None,
     loader: DataLoader,
     mapper: CategoryPromptMapper,
     state_tokens: torch.Tensor,
@@ -488,10 +489,12 @@ def _train_one_epoch(
         "total_loss": 0.0,
         "global_loss": 0.0,
         "local_loss": 0.0,
+        "clip_feature_anchor_loss": 0.0,
         "feature_consistency_loss": 0.0,
         "attention_consistency_loss": 0.0,
         "global_backbone_gradient": 0.0,
         "local_backbone_gradient": 0.0,
+        "clip_feature_anchor_backbone_gradient": 0.0,
         "global_text_gradient": 0.0,
         "local_text_gradient": 0.0,
         "samples": 0.0,
@@ -510,6 +513,14 @@ def _train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
         with autocast(device, bool(config["amp"])):
             global_features, local_features = model.joint_features(images)
+            clip_feature_anchor_loss = global_features.new_zeros(())
+            if anchor_model is not None:
+                with torch.no_grad():
+                    anchor_features = anchor_model.base.encode_image(images).float()
+                anchor_similarity = F.cosine_similarity(
+                    global_features.float(), anchor_features, dim=-1,
+                )
+                clip_feature_anchor_loss = (1.0 - anchor_similarity).mean()
             local_state_features = (
                 model.encode_text(state_tokens).float() if is_full else state_features
             )
@@ -540,6 +551,8 @@ def _train_one_epoch(
                 total = (
                     float(config["global_loss_weight"]) * global_loss
                     + float(config["local_loss_weight"]) * local_output.loss
+                    + float(config.get("clip_feature_anchor_weight", 0.0))
+                    * clip_feature_anchor_loss
                 )
             else:
                 global_loss = global_features.new_zeros(())
@@ -587,6 +600,10 @@ def _train_one_epoch(
                 raise RuntimeError("Local loss does not reach the shared CLIP vision encoder")
             totals["global_backbone_gradient"] += global_gradient_norm
             totals["local_backbone_gradient"] += local_gradient_norm
+            if anchor_model is not None:
+                totals["clip_feature_anchor_backbone_gradient"] += _gradient_norm(
+                    clip_feature_anchor_loss, visual_parameters,
+                )
             if is_full:
                 text_projection = getattr(model.base.clip, "text_projection", None)
                 if not isinstance(text_projection, nn.Parameter):
@@ -620,6 +637,7 @@ def _train_one_epoch(
         totals["total_loss"] += float(total.detach()) * count
         totals["global_loss"] += float(global_loss.detach()) * count
         totals["local_loss"] += float(local_output.loss.detach()) * count
+        totals["clip_feature_anchor_loss"] += float(clip_feature_anchor_loss.detach()) * count
         totals["feature_consistency_loss"] += float(feature_consistency.detach()) * count
         totals["attention_consistency_loss"] += float(attention_consistency.detach()) * count
         totals["samples"] += count
@@ -629,12 +647,14 @@ def _train_one_epoch(
     batches = max(totals.pop("batches"), 1.0)
     global_gradient = totals["global_backbone_gradient"]
     local_gradient = totals["local_backbone_gradient"]
+    anchor_gradient = totals["clip_feature_anchor_backbone_gradient"]
     global_text_gradient = totals["global_text_gradient"]
     local_text_gradient = totals["local_text_gradient"]
     result = {key: value / samples for key, value in totals.items()}
     # These two independent gradient norms are measured on the first batch.
     result["global_backbone_gradient"] = global_gradient
     result["local_backbone_gradient"] = local_gradient
+    result["clip_feature_anchor_backbone_gradient"] = anchor_gradient
     result["global_text_gradient"] = global_text_gradient
     result["local_text_gradient"] = local_text_gradient
     result["train_batches"] = batches
@@ -720,8 +740,13 @@ def train_shared(
         raise ValueError("consistency_variant must be B0, B1, or B2")
     feature_weight = float(config.get("feature_consistency_weight", 0.0))
     attention_weight = float(config.get("attention_consistency_weight", 0.0))
+    clip_feature_anchor_weight = float(config.get("clip_feature_anchor_weight", 0.0))
     if feature_weight < 0.0 or attention_weight < 0.0:
         raise ValueError("Consistency loss weights must be non-negative")
+    if not math.isfinite(clip_feature_anchor_weight) or clip_feature_anchor_weight < 0.0:
+        raise ValueError("clip_feature_anchor_weight must be finite and non-negative")
+    if clip_feature_anchor_weight > 0.0 and stage != "joint":
+        raise ValueError("CLIP feature anchoring is only supported for E1-C joint training")
     if consistency_variant == "B0" and (feature_weight != 0.0 or attention_weight != 0.0):
         raise ValueError("B0 is the FCE-only baseline and requires zero consistency weights")
     if consistency_variant == "B1" and (feature_weight <= 0.0 or attention_weight != 0.0):
@@ -806,6 +831,7 @@ def train_shared(
         "consistency_variant": consistency_variant,
         "feature_consistency_weight": feature_weight,
         "attention_consistency_weight": attention_weight,
+        "clip_feature_anchor_weight": clip_feature_anchor_weight,
         "holdout_domain": holdout_domain,
         "training_domains": sorted({_image_domain(path) for path in train_table.image_paths}),
         "training_images_after_holdout": len(train_table.image_paths),
@@ -840,6 +866,7 @@ def train_shared(
             ("consistency_variant", "B0"),
             ("feature_consistency_weight", 0.0),
             ("attention_consistency_weight", 0.0),
+            ("clip_feature_anchor_weight", 0.0),
             ("holdout_domain", None),
         ):
             if saved_config.get(key, default) != config.get(key, default):
@@ -854,6 +881,16 @@ def train_shared(
         device=device,
         resume_payload=resume_payload,
     )
+    anchor_model: SharedCLIPB16AttrQuery | None = None
+    if clip_feature_anchor_weight > 0.0:
+        if not init_checkpoint or init_source != "shared":
+            raise ValueError("E1-C feature anchoring requires the E1-B --init-checkpoint")
+        anchor_model, anchor_payload = _load_shared_model(init_checkpoint, device)
+        if anchor_payload.get("experiment") != "E1-B" or anchor_payload.get("model_stage") != "local":
+            raise ValueError("The feature-anchor teacher must be the E1-B frozen-encoder checkpoint")
+        anchor_model.eval()
+        for parameter in anchor_model.parameters():
+            parameter.requires_grad_(False)
     atomic_json(output_dir / "parameter_counts.json", model.parameter_counts())
     loader = _build_loader(config, train_table, model, data_root, device)
     state_tokens = model.base.tokenize(mapper.prompts).to(device)
@@ -916,7 +953,7 @@ def train_shared(
     for epoch in range(start_epoch, int(config["epochs"]) + 1):
         started = time.perf_counter()
         train_metrics = _train_one_epoch(
-            model, loader, mapper, state_tokens, state_features,
+            model, anchor_model, loader, mapper, state_tokens, state_features,
             global_criterion, local_criterion, optimizer, scheduler, scaler,
             config, device, epoch,
         )
@@ -994,10 +1031,15 @@ def train_shared(
             if current_unseen_score is not None else None,
             "best_unseen_epoch": best_unseen_epoch,
         })
+        anchor_summary = (
+            f"anchor={train_metrics['clip_feature_anchor_loss']:.5f} "
+            if clip_feature_anchor_weight > 0.0 else ""
+        )
         print(
             f"{experiment} epoch={epoch:03d}/{int(config['epochs'])}: "
             f"global={train_metrics['global_loss']:.5f} "
             f"local={train_metrics['local_loss']:.5f} "
+            f"{anchor_summary}"
             f"val(global/local/fused mADM)="
             f"{row['val_global_mADM']:.5f}/{row['val_local_mADM']:.5f}/{current_score:.5f}"
             + (f", holdout({holdout_domain}) mADM={current_unseen_score:.5f}"

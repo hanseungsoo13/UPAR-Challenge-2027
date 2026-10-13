@@ -1,4 +1,4 @@
-"""Vanilla CLIP ViT-B/32 image/text encoder used by AttriVision."""
+"""Vanilla OpenCLIP image/text encoder used by AttriVision."""
 from __future__ import annotations
 
 from typing import Any
@@ -20,7 +20,7 @@ def _import_open_clip() -> Any:
 
 
 class AttriVision(nn.Module):
-    """Thin, fully fine-tunable wrapper around OpenCLIP's vanilla ViT-B/32."""
+    """Fully fine-tunable OpenCLIP wrapper with a dimension-aware binary head."""
 
     def __init__(self, pretrained: str | None = "openai",
                  model_name: str = "ViT-B-32-quickgelu") -> None:
@@ -28,12 +28,16 @@ class AttriVision(nn.Module):
         open_clip = _import_open_clip()
         self.model_name = model_name
         self.pretrained = pretrained
-        self.clip = open_clip.create_model(model_name, pretrained=pretrained)
+        # OpenAI L/14 uses QuickGELU even when reconstructing a trained
+        # checkpoint with pretrained=None. Keep that activation on reload.
+        model_kwargs = {"force_quick_gelu": True} if model_name == "ViT-L-14" else {}
+        self.clip = open_clip.create_model(model_name, pretrained=pretrained, **model_kwargs)
         self.tokenizer = open_clip.get_tokenizer(model_name, context_length=77)
 
         output_dim = int(getattr(self.clip.visual, "output_dim", 0))
-        if output_dim != 512:
-            raise ValueError(f"{model_name} must produce 512-D image features, got {output_dim}")
+        if output_dim <= 0:
+            raise ValueError(f"{model_name} has an invalid image feature dimension: {output_dim}")
+        self.feature_dim = output_dim
         # Task-2 supervised head.  Keeping it on the wrapper makes the
         # retrieval path use exactly the same image representation as training.
         self.binary_head = nn.Linear(output_dim, 40)

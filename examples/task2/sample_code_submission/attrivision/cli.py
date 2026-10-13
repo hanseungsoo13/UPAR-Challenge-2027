@@ -280,7 +280,7 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.trainable_vision_blocks < 0:
         raise ValueError("trainable-vision-blocks cannot be negative")
     if args.image_size != 224:
-        raise ValueError("Vanilla CLIP ViT-B/32 requires --image-size 224")
+        raise ValueError("These CLIP training recipes require --image-size 224")
     if args.focal_alpha < 0 or args.focal_gamma < 0:
         raise ValueError("focal alpha and gamma cannot be negative")
     if args.prototype_loss_weight < 0 or args.set_loss_weight < 0:
@@ -371,9 +371,9 @@ def run_smoke(args: argparse.Namespace) -> None:
         )
         total = fce_output.loss + args.mixed_aux_prototype_weight * prototype_output.prototype
         total.backward()
-        assert image_features.shape == (batch_size, 512)
-        assert text_features.shape == (batch_size, 512)
-        assert prototype_features.shape == (semantic_count, 512)
+        assert image_features.shape == (batch_size, model.feature_dim)
+        assert text_features.shape == (batch_size, model.feature_dim)
+        assert prototype_features.shape == (semantic_count, model.feature_dim)
         assert logits.shape == (batch_size, batch_size)
         assert torch.isfinite(total)
         assert torch.isfinite(prototype_output.prototype)
@@ -417,8 +417,8 @@ def run_smoke(args: argparse.Namespace) -> None:
             binary_smoke_labels,
         )
         output.loss.backward()
-        assert image_features.shape == (batch_size, 512)
-        assert text_features.shape == (semantic_count, 512)
+        assert image_features.shape == (batch_size, model.feature_dim)
+        assert text_features.shape == (semantic_count, model.feature_dim)
         assert torch.isfinite(output.loss)
         assert any(parameter.grad is not None for parameter in model.parameters())
         print(
@@ -444,8 +444,8 @@ def run_smoke(args: argparse.Namespace) -> None:
         text_features = model.encode_text(tokens)
         output = criterion(image_features, text_features, labels, model.logit_scale)
         output.loss.backward()
-        assert image_features.shape == (batch_size, 512)
-        assert text_features.shape == (semantic_count, 512)
+        assert image_features.shape == (batch_size, model.feature_dim)
+        assert text_features.shape == (semantic_count, model.feature_dim)
         assert torch.isfinite(output.loss)
         assert any(parameter.grad is not None for parameter in model.parameters())
         print(
@@ -502,8 +502,8 @@ def run_smoke(args: argparse.Namespace) -> None:
     output = criterion(logits, labels, selected, text_owners)
     positive_mask = criterion.positive_mask(logits, labels, selected, text_owners)
     output.loss.backward()
-    assert image_features.shape == (batch_size, 512)
-    assert text_features.shape == (len(texts), 512)
+    assert image_features.shape == (batch_size, model.feature_dim)
+    assert text_features.shape == (len(texts), model.feature_dim)
     assert logits.shape == (batch_size, len(texts))
     assert torch.isfinite(output.loss)
     assert any(parameter.grad is not None for parameter in model.parameters())

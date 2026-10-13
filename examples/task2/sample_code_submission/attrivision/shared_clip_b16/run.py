@@ -62,6 +62,10 @@ def _add_training_overrides(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--text-learning-rate", type=float)
     parser.add_argument("--global-loss-weight", type=float)
     parser.add_argument("--local-loss-weight", type=float)
+    parser.add_argument(
+        "--clip-feature-anchor-weight", type=float,
+        help="cosine anchor strength to frozen E1-B CLIP image embeddings (E1-C only)",
+    )
     parser.add_argument("--consistency-variant", choices=("B0", "B1", "B2"), default="B0")
     parser.add_argument("--holdout-domain")
     parser.add_argument("--feature-consistency-weight", type=float)
@@ -77,6 +81,7 @@ def _training_config(args: argparse.Namespace) -> dict[str, Any]:
         "output_root", "data_root", "device", "epochs", "batch_size",
         "eval_batch_size", "num_workers", "decoder_learning_rate",
         "vision_learning_rate", "text_learning_rate", "global_loss_weight", "local_loss_weight",
+        "clip_feature_anchor_weight",
         "max_train_samples", "max_val_samples", "amp",
     ):
         value = getattr(args, key, None)

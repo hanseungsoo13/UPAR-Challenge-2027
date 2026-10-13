@@ -178,6 +178,27 @@ training batch to confirm that they reach the same trainable B/16 visual
 parameters. To resume, retain the original E1-B initialization path and use
 `--resume .../E1-C/checkpoint_last.pth`.
 
+To preserve the E1-B global image representation during joint fine-tuning, add
+`--clip-feature-anchor-weight`. The E1-B checkpoint is loaded as a frozen
+teacher and its normalized image embedding is cosine-anchored to the current
+student embedding for each augmented training batch. The teacher adds one
+no-gradient CLIP image forward per batch. Start with a small weight such as
+`0.1`; the raw anchor loss and its backbone gradient norm are recorded in
+`metrics.csv`.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python examples/task2/sample_code_submission/attrivision/shared_clip_b16/run.py train \
+  --stage joint \
+  --init-checkpoint outputs/BackboneUpgrade/E1_SharedCLIP_B16/E1-B/checkpoint_best.pth \
+  --config examples/task2/sample_code_submission/attrivision/configs/e1_shared_clip_b16.json \
+  --data-root data \
+  --device cuda:0 \
+  --vision-learning-rate 2e-6 \
+  --decoder-learning-rate 1e-4 \
+  --clip-feature-anchor-weight 0.1 \
+  --output-dir outputs/BackboneUpgrade/E1_SharedCLIP_B16/E1-C-LR2e-6-Anchor0.1
+```
+
 ```bash
 CUDA_VISIBLE_DEVICES=0 python examples/task2/sample_code_submission/attrivision/shared_clip_b16/run.py train \
   --stage joint \
