@@ -324,7 +324,7 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.grad_cache_steps > 1 and (
         not args.use_fce or args.training_objective != "paper_fce"
         or args.lambda_attr != 0 or args.category_ce_mode != "off"
-        or args.unique_prompts or args.dg_method != "none" or args.distill_weight != 0
+        or args.unique_prompts or args.dg_method != "none"
     ):
         raise ValueError("Gradient Cache supports plain paper_fce with lambda_attr=0, category CE off, ordinary sampled prompts, and no DG auxiliary loss")
 

@@ -1274,6 +1274,7 @@ def train_a7_l14(args: Any) -> Path:
     args.lambda_attr = 0.0
     args.category_ce_mode = "off"
     args.category_temperature = 0.01
+    args.distill_weight = 0.0
     args.validation_protocol = "native52_category_nll"
     args.selection_metric = "mADM"
     args.retrieval_scoring = "paired_l1"

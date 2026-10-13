@@ -64,6 +64,7 @@ category-complete `paper_fce` 학습으로 이미지·텍스트 tower를 모두 
 conda activate rws-upar-challenge && CUDA_VISIBLE_DEVICES=1 python examples/task2/sample_code_submission/attrivision/shared_clip_l14/run.py a7 \
   --mode train_eval --data-root data --device cuda:0 \
   --batch-size 16 --grad-cache-steps 8 --eval-batch-size 32 \
+  --distill-weight 0 \
   --output-dir outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-A-GC128
 ```
 
