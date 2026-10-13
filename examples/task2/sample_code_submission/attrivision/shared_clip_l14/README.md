@@ -11,9 +11,9 @@ local FCE, Global/Local fusion(alpha=0.5), validation mADM 선택을 재사용�
 - 이미지와 텍스트 embedding: 768. Local head는 1024 → 768로 투영한다.
 - 하나의 visual encoder forward에서 global embedding과 local patch tokens를 얻는다.
 - OpenAI QuickGELU를 사전학습 초기화와 `pretrained=None` 체크포인트 복원에 모두 적용한다.
-- 기본 batch: train 16 / eval 32, AMP 사용. `--batch-size`와
-  `--eval-batch-size`로 조정할 수 있다. 배치 크기는 FCE의 배치 내 대조 대상도
-  바꾸므로 B/16과 비교할 때 실제 사용한 값을 함께 기록한다.
+- 기본 microbatch: train 16 / eval 32, AMP 사용. Gradient Cache는 16개씩
+  8개 microbatch의 전체 손실을 계산해 effective batch 128로 한 번 갱신한다.
+  `--batch-size`와 `--eval-batch-size`로 조정할 수 있다.
 - A는 기존 A7 기본값인 최대 100 epochs, B/C는 설정의 최대 30 epochs다.
   조기 종료가 적용된다. A의 설정은 `experiment_config.json`, B/C의 설정은
   `config.json`으로 각 출력 폴더에 저장된다.
@@ -22,6 +22,29 @@ B/16·B/32 체크포인트는 Large 단계 초기화에 사용할 수 없다. A�
 사전학습 가중치에서 시작하고, B는 A-Large, C는 B-Large 결과를 사용한다.
 출력은 `outputs/BackboneUpgrade/E1_SharedCLIP_L14/`에 저장한다.
 
+## Gradient Cache와 effective batch
+
+E1-A/B/C/D 모두 Gradient Cache를 지원한다. 기본값은 `--batch-size 16
+--grad-cache-steps 8`로 effective batch 128이다. 각 microbatch의 CLIP/AttriQuery
+forward를 차례로 실행해 feature만 보관하고, 128개 전체의 FCE 손실을 한 번 계산한
+뒤 encoder를 다시 실행해 gradient를 전달한다. 따라서 GPU activation 메모리는
+microbatch 16 기준으로 유지하면서 전체 128개가 서로 대조 대상이 된다.
+
+메모리가 더 부족하면 두 값을 함께 바꿔 effective batch 128을 유지한다.
+
+| `--batch-size` | `--grad-cache-steps` | effective batch |
+|---:|---:|---:|
+| 16 | 8 | 128 |
+| 8 | 16 | 128 |
+| 4 | 32 | 128 |
+
+각 묶음마다 optimizer와 scheduler를 한 번 갱신한다. 마지막 묶음은 데이터 수에
+따라 128보다 작을 수 있다. encoder를 다시 계산하므로 학습 시간은 늘고, 전체
+effective batch의 feature와 FCE logits를 담는 메모리는 남는다. 끄려면
+`--grad-cache-steps 1`을 지정한다.
+검증 batch는 별도이므로 검증 중 메모리가 부족하면 `--eval-batch-size 16` 또는
+`8`로 낮춘다.
+
 ## 실행 위치
 
 `environment.yml`이 있는 `UPAR-Challenge-2027` 저장소 루트에서 실행한다.
@@ -29,9 +52,6 @@ B/16·B/32 체크포인트는 Large 단계 초기화에 사용할 수 없다. A�
 
 ```bash
 conda activate rws-upar-challenge
-RUNNER=examples/task2/sample_code_submission/attrivision/shared_clip_l14/run.py
-CONFIG=examples/task2/sample_code_submission/attrivision/configs/e1_shared_clip_l14.json
-OUT=outputs/BackboneUpgrade/E1_SharedCLIP_L14
 ```
 
 ## E1-A — CLIP Large A7 전체 fine-tuning
@@ -41,27 +61,29 @@ category-complete `paper_fce` 학습으로 이미지·텍스트 tower를 모두 
 최적 체크포인트의 global-only 검증 결과를 `evaluation_val.json`에 저장한다.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python "$RUNNER" a7 \
+conda activate rws-upar-challenge && CUDA_VISIBLE_DEVICES=1 python examples/task2/sample_code_submission/attrivision/shared_clip_l14/run.py a7 \
   --mode train_eval --data-root data --device cuda:0 \
-  --batch-size 16 --eval-batch-size 32 \
-  --output-dir "$OUT/E1-A"
+  --batch-size 16 --grad-cache-steps 8 --eval-batch-size 32 \
+  --output-dir outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-A-GC128
 ```
 
 ## E1-B — CLIP 고정, local head 학습
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python "$RUNNER" train \
+conda activate rws-upar-challenge && CUDA_VISIBLE_DEVICES=1 python examples/task2/sample_code_submission/attrivision/shared_clip_l14/run.py train \
   --stage local --consistency-variant B0 \
-  --init-checkpoint "$OUT/E1-A/checkpoint_best.pth" \
-  --config "$CONFIG" --data-root data --device cuda:0 \
-  --output-dir "$OUT/E1-B"
+  --init-checkpoint outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-A-GC128/checkpoint_best.pth \
+  --config examples/task2/sample_code_submission/attrivision/configs/e1_shared_clip_l14.json \
+  --data-root data --device cuda:0 --batch-size 16 --grad-cache-steps 8 --eval-batch-size 32 \
+  --output-dir outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-B-GC128
 ```
 
 기본 명령은 전체 학습 데이터를 사용한다. 기존 B/16에서 holdout 실험을 했다면
 같은 `--holdout-domain Market1501`(또는 `PA100k`, `PETA`)을 추가한다.
 동일한 holdout과 seed로 B1(`--consistency-variant B1`) 또는
 B2(`--consistency-variant B2`)를 실행할 수도 있다. 각 variant는
-`--output-dir "$OUT/E1-B1"` / `"$OUT/E1-B2"`처럼 별도 출력 폴더를 쓴다.
+`outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-B1-GC128` /
+`outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-B2-GC128`처럼 별도 출력 폴더를 쓴다.
 
 ## E1-C — shared vision과 local head 공동 fine-tuning
 
@@ -70,11 +92,12 @@ temperature, local decoder를 갱신한다. 기본 learning rate는 vision 1e-5,
 decoder 1e-4이며 loss는 global FCE + 0.25 × local FCE다.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python "$RUNNER" train \
+conda activate rws-upar-challenge && CUDA_VISIBLE_DEVICES=1 python examples/task2/sample_code_submission/attrivision/shared_clip_l14/run.py train \
   --stage joint \
-  --init-checkpoint "$OUT/E1-B/checkpoint_best.pth" \
-  --config "$CONFIG" --data-root data --device cuda:0 \
-  --output-dir "$OUT/E1-C"
+  --init-checkpoint outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-B-GC128/checkpoint_best.pth \
+  --config examples/task2/sample_code_submission/attrivision/configs/e1_shared_clip_l14.json \
+  --data-root data --device cuda:0 --batch-size 16 --grad-cache-steps 8 --eval-batch-size 32 \
+  --output-dir outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-C-GC128
 ```
 
 선택적으로 `--vision-learning-rate 2e-6 --clip-feature-anchor-weight 0.1`을
@@ -98,21 +121,21 @@ global/local loss의 vision·text gradient 및 모든 local parameter의 gradien
 확인한다. `parameter_counts.json`에는 cross-attention, queries, FFN,
 projection의 학습 파라미터 수를 기록한다.
 
-다음 명령은 위 셸 변수 설정 없이 저장소 루트에서 그대로 실행할 수 있다.
+다음 명령도 저장소 루트에서 그대로 실행한다.
 
 ```bash
-conda activate rws-upar-challenge && CUDA_VISIBLE_DEVICES=0 python examples/task2/sample_code_submission/attrivision/shared_clip_l14/run.py e1-d \
+conda activate rws-upar-challenge && CUDA_VISIBLE_DEVICES=1 python examples/task2/sample_code_submission/attrivision/shared_clip_l14/run.py e1-d \
   --config examples/task2/sample_code_submission/attrivision/configs/e1_shared_clip_l14.json \
   --data-root data \
   --device cuda:0 \
-  --batch-size 16 \
+  --batch-size 16 --grad-cache-steps 8 \
   --eval-batch-size 32 \
   --vision-learning-rate 1e-5 \
   --text-learning-rate 1e-5 \
   --decoder-learning-rate 1e-4 \
   --global-loss-weight 1.0 \
   --local-loss-weight 0.25 \
-  --output-dir outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-D
+  --output-dir outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-D-GC128
 ```
 
 `e1-d`와 `train --stage full`은 모두 pretrained CLIP에서 E1-D를 시작한다.
@@ -125,7 +148,7 @@ E1-D 재개 시에는 위 명령에 다음 인자를 추가한다. 이전 E1-B �
 학습한 폴더가 있다면 새 출력 폴더에서 pretrained E1-D를 시작해야 한다.
 
 ```bash
---resume outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-D/checkpoint_last.pth
+--resume outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-D-GC128/checkpoint_last.pth
 ```
 
 ## 중단된 학습 재개
@@ -133,21 +156,26 @@ E1-D 재개 시에는 위 명령에 다음 인자를 추가한다. 이전 E1-B �
 같은 출력 폴더와 초기화 체크포인트, batch 및 학습 설정을 유지한다.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python "$RUNNER" a7 \
+conda activate rws-upar-challenge && CUDA_VISIBLE_DEVICES=1 python examples/task2/sample_code_submission/attrivision/shared_clip_l14/run.py a7 \
   --mode train_eval --data-root data --device cuda:0 \
-  --batch-size 16 --eval-batch-size 32 \
-  --resume "$OUT/E1-A/checkpoint_last.pth" --output-dir "$OUT/E1-A"
+  --batch-size 16 --grad-cache-steps 8 --eval-batch-size 32 \
+  --resume outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-A-GC128/checkpoint_last.pth \
+  --output-dir outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-A-GC128
 
-CUDA_VISIBLE_DEVICES=0 python "$RUNNER" train \
+CUDA_VISIBLE_DEVICES=1 python examples/task2/sample_code_submission/attrivision/shared_clip_l14/run.py train \
   --stage local --consistency-variant B0 \
-  --init-checkpoint "$OUT/E1-A/checkpoint_best.pth" \
-  --resume "$OUT/E1-B/checkpoint_last.pth" \
-  --config "$CONFIG" --data-root data --device cuda:0 --output-dir "$OUT/E1-B"
+  --init-checkpoint outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-A-GC128/checkpoint_best.pth \
+  --resume outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-B-GC128/checkpoint_last.pth \
+  --config examples/task2/sample_code_submission/attrivision/configs/e1_shared_clip_l14.json \
+  --data-root data --device cuda:0 --batch-size 16 --grad-cache-steps 8 \
+  --output-dir outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-B-GC128
 
-CUDA_VISIBLE_DEVICES=0 python "$RUNNER" train \
-  --stage joint --init-checkpoint "$OUT/E1-B/checkpoint_best.pth" \
-  --resume "$OUT/E1-C/checkpoint_last.pth" \
-  --config "$CONFIG" --data-root data --device cuda:0 --output-dir "$OUT/E1-C"
+CUDA_VISIBLE_DEVICES=1 python examples/task2/sample_code_submission/attrivision/shared_clip_l14/run.py train \
+  --stage joint --init-checkpoint outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-B-GC128/checkpoint_best.pth \
+  --resume outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-C-GC128/checkpoint_last.pth \
+  --config examples/task2/sample_code_submission/attrivision/configs/e1_shared_clip_l14.json \
+  --data-root data --device cuda:0 --batch-size 16 --grad-cache-steps 8 \
+  --output-dir outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-C-GC128
 ```
 
 ## 재평가와 모델 점검
@@ -155,8 +183,8 @@ CUDA_VISIBLE_DEVICES=0 python "$RUNNER" train \
 `--experiment`와 경로를 E1-A/B/C에 맞춰 바꾸면 각 최적 모델을 재평가한다.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python "$RUNNER" eval \
-  --experiment E1-C --checkpoint "$OUT/E1-C/checkpoint_best.pth" \
+conda activate rws-upar-challenge && CUDA_VISIBLE_DEVICES=1 python examples/task2/sample_code_submission/attrivision/shared_clip_l14/run.py eval \
+  --experiment E1-C --checkpoint outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-C-GC128/checkpoint_best.pth \
   --data-root data --device cuda:0 --eval-batch-size 32
 ```
 
@@ -165,7 +193,7 @@ CUDA_VISIBLE_DEVICES=0 python "$RUNNER" eval \
 사전학습 다운로드와 데이터 로딩은 하지 않지만 실제 L/14 크기의 메모리가 필요하다.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python "$RUNNER" smoke --device cuda:0 --batch-size 1
+conda activate rws-upar-challenge && CUDA_VISIBLE_DEVICES=1 python examples/task2/sample_code_submission/attrivision/shared_clip_l14/run.py smoke --device cuda:0 --batch-size 1
 ```
 
 이 경로는 학습과 평가용이다. 기존 제출 packager의 B/16·B/32 전용 visual

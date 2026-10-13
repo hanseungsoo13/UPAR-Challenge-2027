@@ -11,6 +11,7 @@
   "augmentation": "resize_pad_crop",
   "epochs": 30,
   "batch_size": 16,
+  "grad_cache_steps": 8,
   "eval_batch_size": 32,
   "num_workers": 4,
   "decoder_learning_rate": 0.0001,

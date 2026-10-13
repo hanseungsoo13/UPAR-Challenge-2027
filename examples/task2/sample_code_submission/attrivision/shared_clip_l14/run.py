@@ -55,6 +55,10 @@ def _add_training_overrides(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--device")
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--batch-size", type=int)
+    parser.add_argument(
+        "--grad-cache-steps", type=int,
+        help="microbatches per Gradient Cache update; batch-size 16 x 8 keeps effective batch 128",
+    )
     parser.add_argument("--eval-batch-size", type=int)
     parser.add_argument("--num-workers", type=int)
     parser.add_argument("--decoder-learning-rate", type=float)
@@ -79,7 +83,7 @@ def _training_config(args: argparse.Namespace) -> dict[str, Any]:
     config = _read_config(args.config)
     for key in (
         "output_root", "data_root", "device", "epochs", "batch_size",
-        "eval_batch_size", "num_workers", "decoder_learning_rate",
+        "eval_batch_size", "num_workers", "decoder_learning_rate", "grad_cache_steps",
         "vision_learning_rate", "text_learning_rate", "global_loss_weight", "local_loss_weight",
         "clip_feature_anchor_weight",
         "max_train_samples", "max_val_samples", "amp",
@@ -108,6 +112,8 @@ def _training_config(args: argparse.Namespace) -> dict[str, Any]:
         )
     if int(config["image_size"]) != 224:
         raise ValueError("CLIP ViT-L/14 E1 requires 224x224 input")
+    if int(config.get("grad_cache_steps", 1)) < 1:
+        raise ValueError("--grad-cache-steps must be at least 1")
     if float(config["selection_alpha"]) != 0.5:
         raise ValueError("The default E1 evaluation protocol fixes fusion alpha=0.5")
     return config
@@ -207,6 +213,7 @@ def _run_a7(argv: list[str]) -> None:
     parser.description = "Train the E1-A OpenAI CLIP L/14 A7 baseline"
     parser.set_defaults(
         batch_size=16, eval_batch_size=32,
+        grad_cache_steps=8,
         clip_model=MODEL_NAME,
         output_dir="outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-A",
     )

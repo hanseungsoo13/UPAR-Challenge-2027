@@ -49,6 +49,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-pretrained", action="store_true")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument(
+        "--grad-cache-steps", type=int, default=1,
+        help="group this many microbatches for one complete FCE loss and Gradient Cache update; 1 disables caching",
+    )
     parser.add_argument("--eval-batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--image-size", type=int, default=224)
@@ -258,7 +262,7 @@ def validate_args(args: argparse.Namespace) -> None:
     for field in (
         "epochs", "batch_size", "eval_batch_size", "num_workers", "image_size",
         "multi_attributes", "minimum_training_epochs", "early_stopping_patience",
-        "retrieval_interval", "smoke_batch_size",
+        "retrieval_interval", "smoke_batch_size", "grad_cache_steps",
     ):
         if getattr(args, field) < (0 if field == "num_workers" else 1):
             raise ValueError(f"{field} has an invalid value: {getattr(args, field)}")
@@ -317,6 +321,12 @@ def validate_args(args: argparse.Namespace) -> None:
         args.resume = str(Path(args.output_dir) / "checkpoint_last.pth")
     if args.resume and args.mode not in {"train", "train_eval"}:
         raise ValueError("--resume is valid only in train or train_eval mode")
+    if args.grad_cache_steps > 1 and (
+        not args.use_fce or args.training_objective != "paper_fce"
+        or args.lambda_attr != 0 or args.category_ce_mode != "off"
+        or args.unique_prompts or args.dg_method != "none" or args.distill_weight != 0
+    ):
+        raise ValueError("Gradient Cache supports plain paper_fce with lambda_attr=0, category CE off, ordinary sampled prompts, and no DG auxiliary loss")
 
 
 def run_smoke(args: argparse.Namespace) -> None:

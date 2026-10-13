@@ -485,6 +485,31 @@ def _train_one_epoch(
     device: torch.device,
     epoch: int,
 ) -> dict[str, float]:
+    if int(config.get("grad_cache_steps", 1)) > 1:
+        from ..engine.gradient_cache import train_cached_epoch
+
+        result = train_cached_epoch(
+            model, loader, optimizer, scheduler, scaler, device, bool(config["amp"]),
+            float(config["grad_clip"]), int(config["grad_cache_steps"]),
+            int(config["batch_size"]), global_criterion, _optimizer_step,
+            local_criterion=local_criterion, state_tokens=state_tokens,
+            state_features=state_features, anchor_model=anchor_model,
+            global_weight=float(config["global_loss_weight"]),
+            local_weight=float(config["local_loss_weight"]),
+            anchor_weight=float(config.get("clip_feature_anchor_weight", 0.0)),
+            consistency_variant=str(config.get("consistency_variant", "B0")),
+            feature_consistency_weight=float(config.get("feature_consistency_weight", 0.0)),
+            attention_consistency_weight=float(config.get("attention_consistency_weight", 0.0)),
+        )
+        result.update({
+            "global_backbone_gradient": result.get("cache_global_image_gradient", 0.0),
+            "local_backbone_gradient": result.get("cache_local_image_gradient", 0.0),
+            "clip_feature_anchor_backbone_gradient": result.get("cache_anchor_image_gradient", 0.0),
+            "global_text_gradient": result.get("cache_global_text_gradient", 0.0),
+            "local_text_gradient": result.get("cache_local_text_gradient", 0.0),
+        })
+        result["epoch"] = epoch
+        return result
     model.train()
     model.assert_trainability()
     is_joint = model.stage == "joint"
@@ -742,6 +767,9 @@ def train_shared(
     config: dict[str, Any],
     resume: str | None = None,
 ) -> Path:
+    grad_cache_steps = int(config.get("grad_cache_steps", 1))
+    if grad_cache_steps < 1:
+        raise ValueError("grad_cache_steps must be at least 1")
     consistency_variant = str(config.get("consistency_variant", "B0"))
     if consistency_variant not in {"B0", "B1", "B2"}:
         raise ValueError("consistency_variant must be B0, B1, or B2")
@@ -839,6 +867,8 @@ def train_shared(
         "holdout_domain": holdout_domain,
         "training_domains": sorted({_image_domain(path) for path in train_table.image_paths}),
         "training_images_after_holdout": len(train_table.image_paths),
+        "grad_cache_steps": grad_cache_steps,
+        "effective_batch_size": int(config["batch_size"]) * grad_cache_steps,
     }
     output_dir = Path(config["output_dir"]).resolve()
     config["output_dir"] = str(output_dir)
@@ -872,9 +902,12 @@ def train_shared(
             ("attention_consistency_weight", 0.0),
             ("clip_feature_anchor_weight", 0.0),
             ("holdout_domain", None),
+            ("grad_cache_steps", 1),
         ):
             if saved_config.get(key, default) != config.get(key, default):
                 raise ValueError(f"Resume checkpoint {key} differs from the requested run")
+        if grad_cache_steps > 1 and saved_config.get("batch_size") != config["batch_size"]:
+            raise ValueError("Gradient Cache resume must keep the original microbatch size")
 
     model = _new_model(
         stage=stage,
@@ -916,7 +949,7 @@ def train_shared(
     optimizer = torch.optim.AdamW(_optimizer_groups(model, config))
     scheduler = build_scheduler(
         optimizer,
-        len(loader),
+        math.ceil(len(loader) / grad_cache_steps),
         int(config["epochs"]),
         int(config["warmup_epochs"]),
         float(config["decoder_learning_rate"]),

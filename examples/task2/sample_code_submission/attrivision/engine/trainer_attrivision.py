@@ -149,7 +149,23 @@ def train_one_epoch_paper(
     category_mode: str = "off", category_weight: float = 1.0,
     teacher_model: AttriVision | None = None, distill_weight: float = 0.0,
     rsc_drop_ratio: float = 0.0,
+    grad_cache_steps: int = 1, grad_cache_chunk_size: int | None = None,
 ) -> dict[str, float]:
+    if grad_cache_steps > 1:
+        if binary_criterion is not None or category_mode != "off" or teacher_model is not None or rsc_drop_ratio > 0:
+            raise ValueError("Gradient Cache requires the plain A7 FCE objective")
+        from .gradient_cache import train_cached_epoch
+
+        metrics = train_cached_epoch(
+            model, loader, optimizer, scheduler, scaler, device, amp, grad_clip,
+            grad_cache_steps, grad_cache_chunk_size or loader.batch_size,
+            criterion, _optimizer_step,
+        )
+        metrics.update({
+            "loss": metrics["total_loss"], "fce": metrics["global_loss"],
+            "category_ce": 0.0, "bce": 0.0, "distill": 0.0, "rsc_dropped": 0.0,
+        })
+        return metrics
     model.train()
     if category_mode not in {"off", "only", "combined"}:
         raise ValueError(f"Unknown Category CE mode: {category_mode}")
@@ -824,6 +840,13 @@ def train(args: Any) -> Path:
     # sampling changes are recorded and checked as part of resume metadata.
     if domain_sampling != "natural":
         training_config["domain_sampling"] = domain_sampling
+    grad_cache_steps = int(getattr(args, "grad_cache_steps", 1))
+    if grad_cache_steps > 1:
+        training_config.update({
+            "grad_cache_steps": grad_cache_steps,
+            "grad_cache_micro_batch_size": args.batch_size,
+            "effective_batch_size": args.batch_size * grad_cache_steps,
+        })
     optimizer = torch.optim.AdamW(
         _optimizer_groups(
             model, args.weight_decay, args.learning_rate,
@@ -832,7 +855,7 @@ def train(args: Any) -> Path:
         ),
     )
     scheduler = build_scheduler(
-        optimizer, len(loader), args.epochs, args.warmup_epochs,
+        optimizer, math.ceil(len(loader) / grad_cache_steps), args.epochs, args.warmup_epochs,
         args.learning_rate, args.min_learning_rate,
     )
     scaler = _grad_scaler(args.amp and device.type == "cuda")
@@ -921,6 +944,12 @@ def train(args: Any) -> Path:
         f"Training samples={len(dataset)}, attributes={len(table.attribute_names)}, "
         f"unseen_domain={unseen_domain or 'none'}"
     )
+    if grad_cache_steps > 1:
+        logger.log(
+            f"Gradient Cache: micro_batch={args.batch_size}, grouped_batches={grad_cache_steps}, "
+            f"contrastive_batch={args.batch_size * grad_cache_steps}, "
+            f"updates_per_epoch={math.ceil(len(loader) / grad_cache_steps)}"
+        )
     if domain_sampler is not None:
         logger.log(
             "Domain-balanced sampler: target_probabilities="
@@ -1037,6 +1066,8 @@ def train(args: Any) -> Path:
                         getattr(args, "rsc_drop_ratio", 0.0)
                         if getattr(args, "dg_method", "none") == "rsc" else 0.0
                     ),
+                    grad_cache_steps=grad_cache_steps,
+                    grad_cache_chunk_size=args.batch_size,
                 )
             metrics: dict[str, float] = {}
             should_stop = False
