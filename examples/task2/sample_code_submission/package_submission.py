@@ -42,6 +42,8 @@ def load_checkpoint_metadata(source: Path | BinaryIO) -> dict[str, Any]:
         }
     elif architecture == "attrivision_submission_vit_b_32":
         required = {"visual_state_dict", "text_features", "semantic_keys", "attribute_names"}
+    elif architecture == "attrivision_submission_vit_b_16":
+        required = {"visual_state_dict", "text_features", "semantic_keys", "attribute_names"}
     elif architecture == "attrivision_jointfce_submission_vit_b_32":
         required = {
             "visual_state_dict", "local_head_state_dict", "text_features",
@@ -208,6 +210,17 @@ def submission_checkpoint(
     from attrivision.models.attrivision import AttriVision
 
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    if payload["model_name"].startswith("ViT-B-16"):
+        packaged_architecture = "attrivision_submission_vit_b_16"
+        patch_size = 16
+    elif payload["model_name"].startswith("ViT-B-32"):
+        packaged_architecture = "attrivision_submission_vit_b_32"
+        patch_size = 32
+    else:
+        raise ValueError(
+            "AttriVision submission packaging supports CLIP ViT-B/16 and ViT-B/32, "
+            f"got {payload['model_name']!r}"
+        )
     model = AttriVision(pretrained=None, model_name=payload["model_name"])
     model.load_state_dict(payload["model_state_dict"], strict=True)
     model.eval()
@@ -260,7 +273,8 @@ def submission_checkpoint(
     }
     converted = {
         "format_version": 1,
-        "architecture": "attrivision_submission_vit_b_32",
+        "architecture": packaged_architecture,
+        "patch_size": patch_size,
         "quick_gelu": payload["model_name"].endswith("-quickgelu"),
         "visual_state_dict": visual,
         "text_features": text_features,

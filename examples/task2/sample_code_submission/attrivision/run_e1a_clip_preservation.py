@@ -46,7 +46,7 @@ def _atomic_torch_save(payload: dict[str, Any], path: Path) -> None:
 def _configure_training(args: argparse.Namespace, condition: str) -> None:
     """Keep the E1-A fine-tuning recipe fixed across the two conditions."""
     args.mode = "train_eval"
-    args.clip_model = "ViT-B-32-quickgelu"
+    args.clip_model = args.clip_model or "ViT-B-32-quickgelu"
     args.pretrained_tag = args.pretrained_tag or "openai"
     args.no_pretrained = False
     args.init_checkpoint = None
@@ -64,13 +64,13 @@ def _configure_training(args: argparse.Namespace, condition: str) -> None:
     args.category_ce_mode = "off"
     args.validation_protocol = "native52_category_nll"
     args.retrieval_scoring = "paired_l1"
-    args.selection_metric = "mADM"
+    args.selection_metric = args.selection_metric or "mADM"
     args.domain_wise_validation = True
     args.training_log_filename = "training_log.csv"
     args.paper_faithful = False
     args.distill_weight = 0.0
     args.rsc_drop_ratio = 0.0
-    args.unseen_domain = None
+    args.unseen_domain = args.unseen_domain or None
 
     if condition == "domain_balance":
         args.domain_sampling = "sqrt"
@@ -95,12 +95,13 @@ def _evaluate_checkpoint(args: argparse.Namespace, checkpoint: Path, label: str)
         build_eval_transform(args.image_size, args.augmentation), device,
         args.eval_batch_size, args.num_workers, args.amp, args.max_val_samples,
         args.category_temperature,
+        unseen_domain=args.unseen_domain,
     )
     metrics.update({
         "experiment": label,
         "checkpoint": str(checkpoint.resolve()),
         "checkpoint_epoch": payload.get("epoch"),
-        "selection_metric": "mADM",
+        "selection_metric": args.selection_metric,
         "domain_sampling": payload.get("training_config", {}).get("domain_sampling", "natural"),
         "dg_method": payload.get("training_config", {}).get("dg_method", "none"),
     })

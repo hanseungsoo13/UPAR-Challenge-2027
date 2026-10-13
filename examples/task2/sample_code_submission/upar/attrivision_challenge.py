@@ -59,12 +59,16 @@ class Transformer(nn.Module):
 
 
 class CLIPVisionTransformer(nn.Module):
-    def __init__(self, quick_gelu: bool = False) -> None:
+    def __init__(self, quick_gelu: bool = False, patch_size: int = 32) -> None:
         super().__init__()
+        if patch_size not in {16, 32}:
+            raise ValueError(f"Unsupported CLIP ViT patch size: {patch_size}")
+        self.patch_size = patch_size
         self.class_embedding = nn.Parameter(torch.empty(768))
-        self.positional_embedding = nn.Parameter(torch.empty(50, 768))
+        grid_size = 224 // patch_size
+        self.positional_embedding = nn.Parameter(torch.empty(1 + grid_size * grid_size, 768))
         self.proj = nn.Parameter(torch.empty(768, 512))
-        self.conv1 = nn.Conv2d(3, 768, 32, 32, bias=False)
+        self.conv1 = nn.Conv2d(3, 768, patch_size, patch_size, bias=False)
         self.ln_pre = nn.LayerNorm(768)
         self.transformer = Transformer(quick_gelu)
         self.ln_post = nn.LayerNorm(768)
@@ -225,9 +229,19 @@ def load_model() -> None:
     path = Path(os.environ.get("UPAR_CHECKPOINT", str(DEFAULT_CHECKPOINT)))
     device = choose_device(os.environ.get("UPAR_DEVICE", "auto"))
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    if checkpoint.get("architecture") != "attrivision_submission_vit_b_32":
+    architecture = checkpoint.get("architecture")
+    patch_sizes = {
+        "attrivision_submission_vit_b_16": 16,
+        "attrivision_submission_vit_b_32": 32,
+    }
+    if architecture not in patch_sizes:
         raise ValueError("Invalid packaged AttriVision checkpoint")
-    model = CLIPVisionTransformer(bool(checkpoint.get("quick_gelu", False)))
+    patch_size = int(checkpoint.get("patch_size", patch_sizes[architecture]))
+    if patch_size != patch_sizes[architecture]:
+        raise ValueError("Packaged AttriVision architecture and patch size do not match")
+    model = CLIPVisionTransformer(
+        bool(checkpoint.get("quick_gelu", False)), patch_size=patch_size,
+    )
     model.load_state_dict(checkpoint["visual_state_dict"], strict=True)
     _MODEL, _DEVICE = model.to(device).eval(), device
     _TEXT_FEATURES = F.normalize(checkpoint["text_features"].float(), dim=-1)

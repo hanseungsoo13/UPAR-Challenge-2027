@@ -591,6 +591,8 @@ def train(args: Any) -> Path:
     table = read_gt_csv(train_gt)
     unseen_domain = getattr(args, "unseen_domain", None)
     if unseen_domain:
+        args.domain_wise_validation = True
+    if unseen_domain:
         keep = np.asarray(
             [str(path).split("/", 1)[0] != unseen_domain for path in table.image_paths],
             dtype=bool,
@@ -836,6 +838,7 @@ def train(args: Any) -> Path:
     scaler = _grad_scaler(args.amp and device.type == "cuda")
     output_dir = Path(args.output_dir)
     best_path = output_dir / "checkpoint_best.pth"
+    best_unseen_path = output_dir / "checkpoint_best_unseen_domain.pth"
     last_path = output_dir / "checkpoint_last.pth"
     logger = RunLogger(
         output_dir, resume=bool(args.resume),
@@ -843,6 +846,8 @@ def train(args: Any) -> Path:
     )
     best_map = -math.inf
     best_epoch = 0
+    best_unseen_score = -math.inf
+    best_unseen_epoch = 0
     stale = 0
     selection_key = getattr(args, "selection_metric", "mADM")
     start_epoch = 1
@@ -872,6 +877,8 @@ def train(args: Any) -> Path:
             )
         best_map = float(state.get("best_score", state["best_map"]))
         best_epoch = int(state["best_epoch"])
+        best_unseen_score = float(state.get("best_unseen_score", -math.inf))
+        best_unseen_epoch = int(state.get("best_unseen_epoch", 0))
         stale = int(state["stale_evaluations"])
         start_epoch = int(payload["epoch"]) + 1
         if sampler is not None:
@@ -1095,6 +1102,20 @@ def train(args: Any) -> Path:
                         f"did not produce the requested selection metric {selection_key!r}. "
                         f"Available metrics: {sorted(metrics)}"
                     )
+                if unseen_domain and "unseen_mADM" in metrics:
+                    current_unseen_score = float(metrics["unseen_mADM"])
+                    if current_unseen_score > best_unseen_score:
+                        best_unseen_score = current_unseen_score
+                        best_unseen_epoch = epoch
+                        save_best(
+                            best_unseen_path, evaluation_model, table.attribute_names, epoch,
+                            {**losses, **metrics}, args.prompt_mode, training_config,
+                        )
+                        logger.log(
+                            f"Saved new unseen-domain best checkpoint: {best_unseen_path} "
+                            f"(unseen_mADM={current_unseen_score:.6f}, "
+                            f"domain={metrics.get('unseen_domain', unseen_domain)})"
+                        )
                 current_score = float(metrics[selection_key])
                 if current_score > best_map:
                     best_map = current_score
@@ -1185,6 +1206,10 @@ def train(args: Any) -> Path:
                 "consistency_loss": losses.get("consistency", ""),
                 "best_map": best_map, "best_epoch": best_epoch,
                 "best_score": best_map, "selection_metric": selection_key,
+                "best_unseen_mADM": (
+                    best_unseen_score if best_unseen_epoch else ""
+                ),
+                "best_unseen_epoch": best_unseen_epoch or "",
                 "stale_evaluations": stale, "elapsed_seconds": elapsed,
                 "train_batches": losses["train_batches"],
                 "average_batch_size": losses["average_batch_size"],
@@ -1196,7 +1221,7 @@ def train(args: Any) -> Path:
             save_last(
                 last_path, model, table.attribute_names, epoch, {**losses, **metrics},
                 optimizer, scheduler, scaler, best_map, best_epoch, stale,
-                args.prompt_mode, training_config,
+                args.prompt_mode, training_config, best_unseen_score, best_unseen_epoch,
             )
             if should_stop:
                 logger.log(

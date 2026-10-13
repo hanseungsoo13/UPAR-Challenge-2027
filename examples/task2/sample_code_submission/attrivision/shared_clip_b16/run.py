@@ -128,8 +128,8 @@ def _run_train(argv: list[str]) -> None:
             args.consistency_variant
         ]
     elif args.stage == "joint":
-        if args.consistency_variant != "B0" or args.holdout_domain:
-            parser.error("Consistency variants and holdout-domain apply only to --stage local")
+        if args.consistency_variant != "B0":
+            parser.error("Consistency variants apply only to --stage local")
         if not args.init_checkpoint:
             parser.error("--stage joint requires --init-checkpoint with the E1-B best checkpoint")
         stage, init_source, experiment = "joint", "shared", "E1-C"
@@ -169,7 +169,6 @@ def _run_train(argv: list[str]) -> None:
     if experiment in {"E1-B", "E1-B1", "E1-B2"}:
         validation = result["official_validation"]
         stability = result["attribute_query_stability"]
-        domain_result = result["domain_retrieval"]
         print(
             f"Official val: mADM={validation['mADM']:.6f} "
             f"Rank-1={validation['Rank-1']:.6f} mAP={validation['mAP']:.6f}; "
@@ -177,6 +176,8 @@ def _run_train(argv: list[str]) -> None:
             f"attention stability={stability['attention_cosine_mean']:.6f}",
             flush=True,
         )
+    if experiment in {"E1-B", "E1-B1", "E1-B2", "E1-C"}:
+        domain_result = result["domain_retrieval"]
         if domain_result.get("holdout"):
             holdout = domain_result["holdout"]
             print(

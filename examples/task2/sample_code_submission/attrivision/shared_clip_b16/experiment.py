@@ -650,6 +650,8 @@ def _training_state(
     best_score: float,
     best_epoch: int,
     stale_evaluations: int,
+    best_unseen_score: float = -math.inf,
+    best_unseen_epoch: int = 0,
 ) -> dict[str, Any]:
     return {
         "optimizer": optimizer.state_dict(),
@@ -658,6 +660,8 @@ def _training_state(
         "best_score": float(best_score),
         "best_epoch": int(best_epoch),
         "stale_evaluations": int(stale_evaluations),
+        "best_unseen_score": float(best_unseen_score),
+        "best_unseen_epoch": int(best_unseen_epoch),
         "rng": rng_state(),
     }
 
@@ -758,7 +762,7 @@ def train_shared(
     data_root = Path(config["data_root"]).resolve()
     train_annotation = find_annotation_file(data_root, "train")
     train_table = read_gt_csv(train_annotation)
-    holdout_domain = config.get("holdout_domain") if init_source == "a7" else None
+    holdout_domain = config.get("holdout_domain") if init_source in {"a7", "shared"} else None
     if holdout_domain:
         keep = np.asarray(
             [_image_domain(path) != str(holdout_domain) for path in train_table.image_paths],
@@ -879,9 +883,12 @@ def train_shared(
     )
     scaler = _grad_scaler(bool(config["amp"]) and device.type == "cuda")
     best_path = output_dir / "checkpoint_best.pth"
+    best_unseen_path = output_dir / "checkpoint_best_unseen_domain.pth"
     last_path = output_dir / "checkpoint_last.pth"
     best_score = -math.inf
     best_epoch = 0
+    best_unseen_score = -math.inf
+    best_unseen_epoch = 0
     stale = 0
     start_epoch = 1
     if resume_payload is not None:
@@ -895,6 +902,8 @@ def train_shared(
             restore_rng(training_state["rng"])
         best_score = float(training_state["best_score"])
         best_epoch = int(training_state["best_epoch"])
+        best_unseen_score = float(training_state.get("best_unseen_score", -math.inf))
+        best_unseen_epoch = int(training_state.get("best_unseen_epoch", 0))
         stale = int(training_state["stale_evaluations"])
         start_epoch = int(resume_payload["epoch"]) + 1
 
@@ -911,7 +920,7 @@ def train_shared(
             global_criterion, local_criterion, optimizer, scheduler, scaler,
             config, device, epoch,
         )
-        validation_rows, _details = evaluate_model(
+        validation_rows, details = evaluate_model(
             model,
             train_table.attribute_names,
             data_root,
@@ -930,6 +939,21 @@ def train_shared(
             and abs(float(row.get("alpha", -1.0)) - float(config["selection_alpha"])) < 1e-9
         )
         current_score = float(fused["mADM"])
+        domain_report = (
+            _domain_retrieval_report(details, str(holdout_domain))
+            if holdout_domain else None
+        )
+        current_unseen_score = (
+            float(domain_report["holdout"]["mADM"])
+            if domain_report and domain_report.get("holdout") else None
+        )
+        new_unseen_best = (
+            current_unseen_score is not None
+            and current_unseen_score > best_unseen_score
+        )
+        if new_unseen_best:
+            best_unseen_score = float(current_unseen_score)
+            best_unseen_epoch = epoch
         elapsed = time.perf_counter() - started
         row = {
             "experiment": experiment,
@@ -942,6 +966,18 @@ def train_shared(
             "val_fused_mINP": fused.get("mINP"),
             "selection_alpha": float(config["selection_alpha"]),
             "selection_metric": "mADM",
+            "unseen_mADM": current_unseen_score,
+            "unseen_rank1": (
+                float(domain_report["holdout"]["rank1"])
+                if domain_report and domain_report.get("holdout") else None
+            ),
+            "unseen_mAP": (
+                float(domain_report["holdout"]["mAP"])
+                if domain_report and domain_report.get("holdout") else None
+            ),
+            "best_unseen_mADM": max(best_unseen_score, current_unseen_score)
+            if current_unseen_score is not None else None,
+            "best_unseen_epoch": best_unseen_epoch,
             "epoch_seconds": elapsed,
         }
         rows.append(row)
@@ -953,13 +989,19 @@ def train_shared(
             "validation": validation_rows,
             "selection_metric": "mADM",
             "best_mADM": max(best_score, current_score),
+            "domain_retrieval": domain_report,
+            "best_unseen_mADM": max(best_unseen_score, current_unseen_score)
+            if current_unseen_score is not None else None,
+            "best_unseen_epoch": best_unseen_epoch,
         })
         print(
             f"{experiment} epoch={epoch:03d}/{int(config['epochs'])}: "
             f"global={train_metrics['global_loss']:.5f} "
             f"local={train_metrics['local_loss']:.5f} "
             f"val(global/local/fused mADM)="
-            f"{row['val_global_mADM']:.5f}/{row['val_local_mADM']:.5f}/{current_score:.5f}",
+            f"{row['val_global_mADM']:.5f}/{row['val_local_mADM']:.5f}/{current_score:.5f}"
+            + (f", holdout({holdout_domain}) mADM={current_unseen_score:.5f}"
+               if current_unseen_score is not None else ""),
             flush=True,
         )
 
@@ -970,17 +1012,31 @@ def train_shared(
             atomic_torch_save(
                 _checkpoint_payload(
                     model, train_table.attribute_names, experiment, epoch,
-                    {"scores": validation_rows, "selected": fused}, config,
+                    {"scores": validation_rows, "selected": fused,
+                     "domain_retrieval": domain_report}, config,
                 ),
                 best_path,
             )
         else:
             stale += 1
+        if new_unseen_best:
+            atomic_torch_save(
+                _checkpoint_payload(
+                    model, train_table.attribute_names, experiment, epoch,
+                    {"scores": validation_rows, "selected": fused,
+                     "domain_retrieval": domain_report,
+                     "checkpoint_selection": "holdout_domain_mADM"}, config,
+                ),
+                best_unseen_path,
+            )
         atomic_torch_save(
             _checkpoint_payload(
                 model, train_table.attribute_names, experiment, epoch,
                 {"scores": validation_rows, "selected": fused}, config,
-                _training_state(optimizer, scheduler, scaler, best_score, best_epoch, stale),
+                _training_state(
+                    optimizer, scheduler, scaler, best_score, best_epoch, stale,
+                    best_unseen_score, best_unseen_epoch,
+                ),
             ),
             last_path,
         )
@@ -996,6 +1052,9 @@ def train_shared(
         "last_checkpoint": str(last_path),
         "best_epoch": best_epoch,
         "best_mADM": best_score,
+        "best_unseen_checkpoint": str(best_unseen_path) if best_unseen_path.is_file() else None,
+        "best_unseen_epoch": best_unseen_epoch if best_unseen_epoch else None,
+        "best_unseen_mADM": best_unseen_score if best_unseen_epoch else None,
         "selection_metric": "mADM",
         "selection_alpha": float(config["selection_alpha"]),
     })
@@ -1082,6 +1141,11 @@ def evaluate_checkpoint(
             "model_stage": payload["model_stage"],
             "vision_encoder_instances": 1,
         }
+        if experiment in {"E1-B", "E1-B1", "E1-B2", "E1-C"}:
+            holdout_domain = payload.get("training_config", {}).get("holdout_domain")
+            result["domain_retrieval"] = _domain_retrieval_report(
+                details, str(holdout_domain) if holdout_domain else None,
+            )
         if experiment in {"E1-B", "E1-B1", "E1-B2"}:
             holdout_domain = payload.get("training_config", {}).get("holdout_domain")
             fused = next(
@@ -1095,9 +1159,6 @@ def evaluate_checkpoint(
                 "mAP": float(fused["mAP"]),
                 "fusion_alpha": 0.5,
             }
-            result["domain_retrieval"] = _domain_retrieval_report(
-                details, str(holdout_domain) if holdout_domain else None,
-            )
             result["attribute_query_stability"] = _attribute_query_stability(
                 model,
                 Path(data_root).resolve(),

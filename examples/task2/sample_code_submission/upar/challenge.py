@@ -33,7 +33,10 @@ def load_model() -> None:
     device = choose_device(requested_device)
     checkpoint_path = os.environ.get("UPAR_CHECKPOINT", str(DEFAULT_CHECKPOINT))
     preview = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    if preview.get("architecture") == "attrivision_submission_vit_b_32":
+    if preview.get("architecture") in {
+        "attrivision_submission_vit_b_16",
+        "attrivision_submission_vit_b_32",
+    }:
         from . import attrivision_challenge
         attrivision_challenge.load_model()
         _ATTRIVISION = True

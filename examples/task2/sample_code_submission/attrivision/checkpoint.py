@@ -57,7 +57,9 @@ def save_last(path: Path, model: AttriVision, attribute_names: Sequence[str], ep
               metrics: dict[str, float], optimizer: torch.optim.Optimizer,
               scheduler: Any, scaler: Any, best_map: float, best_epoch: int,
               stale_evaluations: int, prompt_mode: str,
-              training_config: dict[str, Any]) -> None:
+              training_config: dict[str, Any],
+              best_unseen_score: float = float("-inf"),
+              best_unseen_epoch: int = 0) -> None:
     payload = model_payload(
         model, attribute_names, epoch, metrics, prompt_mode, training_config,
     )
@@ -72,6 +74,8 @@ def save_last(path: Path, model: AttriVision, attribute_names: Sequence[str], ep
         "best_score": float(best_map),
         "selection_metric": training_config.get("selection_metric", "mADM"),
         "best_epoch": int(best_epoch),
+        "best_unseen_score": float(best_unseen_score),
+        "best_unseen_epoch": int(best_unseen_epoch),
         "stale_evaluations": int(stale_evaluations),
         "python_rng": random.getstate(),
         "numpy_rng": np.random.get_state(),
