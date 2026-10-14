@@ -140,6 +140,11 @@ CUDA_VISIBLE_DEVICES=1 python examples/task2/sample_code_submission/attrivision/
 SWAD 활성화 시 `checkpoint_best.pth`는 평균 가중치에서 선택·저장되고,
 `checkpoint_last.pth`는 optimizer와 평균 누적 상태를 포함해 이어서 학습할 수 있다.
 
+E1-D에서 특정 domain을 학습에서 제외해 unseen 평가를 하려면
+`--holdout-domain Market1501`을 추가한다. `--unseen-domain`도 같은 옵션의 별칭이며,
+학습이 끝나면 `checkpoint_best_unseen_domain.pth`도 저장된다. E1-D는 A7 runner가
+아니므로 `--mode`와 `--distill-weight` 옵션은 사용하지 않는다.
+
 ### 평가
 
 ```bash

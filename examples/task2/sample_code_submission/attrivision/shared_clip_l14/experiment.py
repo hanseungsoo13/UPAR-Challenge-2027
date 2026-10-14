@@ -830,7 +830,10 @@ def train_shared(
     data_root = Path(config["data_root"]).resolve()
     train_annotation = find_annotation_file(data_root, "train")
     train_table = read_gt_csv(train_annotation)
-    holdout_domain = config.get("holdout_domain") if init_source in {"a7", "shared"} else None
+    holdout_domain = (
+        config.get("holdout_domain")
+        if init_source in {"a7", "shared"} or stage == "full" else None
+    )
     if holdout_domain:
         keep = np.asarray(
             [_image_domain(path) != str(holdout_domain) for path in train_table.image_paths],
@@ -1254,7 +1257,7 @@ def evaluate_checkpoint(
             "model_stage": payload["model_stage"],
             "vision_encoder_instances": 1,
         }
-        if experiment in {"E1-B", "E1-B1", "E1-B2", "E1-C"}:
+        if experiment in {"E1-B", "E1-B1", "E1-B2", "E1-C", "E1-D"}:
             holdout_domain = payload.get("training_config", {}).get("holdout_domain")
             result["domain_retrieval"] = _domain_retrieval_report(
                 details, str(holdout_domain) if holdout_domain else None,
