@@ -48,6 +48,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pretrained-tag", default="openai")
     parser.add_argument("--no-pretrained", action="store_true")
     parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument(
+        "--stop-after-epoch", type=int,
+        help="stop after this epoch while keeping the learning-rate schedule based on --epochs; save that epoch as checkpoint_epoch_NNN.pth",
+    )
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument(
         "--grad-cache-steps", type=int, default=1,
@@ -281,6 +285,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("min-learning-rate cannot exceed learning-rate")
     if args.warmup_epochs >= args.epochs and not args.debug:
         raise ValueError("warmup-epochs must be smaller than epochs")
+    if args.stop_after_epoch is not None and not 1 <= args.stop_after_epoch <= args.epochs:
+        raise ValueError("stop-after-epoch must be between 1 and epochs")
     if args.trainable_vision_blocks < 0:
         raise ValueError("trainable-vision-blocks cannot be negative")
     if args.image_size != 224:
@@ -324,7 +330,7 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.grad_cache_steps > 1 and (
         not args.use_fce or args.training_objective != "paper_fce"
         or args.lambda_attr != 0 or args.category_ce_mode != "off"
-        or args.unique_prompts or args.dg_method != "none"
+        or args.unique_prompts or args.dg_method not in {"none", "swad"}
     ):
         raise ValueError("Gradient Cache supports plain paper_fce with lambda_attr=0, category CE off, ordinary sampled prompts, and no DG auxiliary loss")
 

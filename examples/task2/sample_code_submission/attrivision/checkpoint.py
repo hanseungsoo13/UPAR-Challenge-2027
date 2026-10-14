@@ -66,7 +66,8 @@ def save_last(path: Path, model: AttriVision, attribute_names: Sequence[str], ep
               stale_evaluations: int, prompt_mode: str,
               training_config: dict[str, Any],
               best_unseen_score: float = float("-inf"),
-              best_unseen_epoch: int = 0) -> None:
+              best_unseen_epoch: int = 0,
+              extra_training_state: dict[str, Any] | None = None) -> None:
     payload = model_payload(
         model, attribute_names, epoch, metrics, prompt_mode, training_config,
     )
@@ -89,6 +90,8 @@ def save_last(path: Path, model: AttriVision, attribute_names: Sequence[str], ep
         "torch_rng": torch.get_rng_state(),
         "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
     }
+    if extra_training_state:
+        payload["training_state"].update(extra_training_state)
     _atomic_save(payload, path)
 
 

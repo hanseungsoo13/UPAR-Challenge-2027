@@ -114,9 +114,18 @@ class JointFCEModel(nn.Module):
         dropout: float,
         use_ffn: bool,
         patch_size: int = 32,
+        visual_layers: int = 12,
+        visual_heads: int = 12,
     ) -> None:
         super().__init__()
-        self.visual = CLIPVisionTransformer(quick_gelu, patch_size=patch_size)
+        self.visual = CLIPVisionTransformer(
+            quick_gelu,
+            patch_size=patch_size,
+            visual_dim=visual_dim,
+            output_dim=text_dim,
+            layers=visual_layers,
+            heads=visual_heads,
+        )
         self.visual.load_state_dict(visual_state, strict=True)
         self.local_head = CategoryCrossAttention(
             num_categories, visual_dim, text_dim, num_heads, dropout, use_ffn,
@@ -125,7 +134,7 @@ class JointFCEModel(nn.Module):
 
     def forward_features(self, images: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         x = self.visual.conv1(images)
-        x = x.reshape(images.shape[0], 768, -1).permute(0, 2, 1)
+        x = x.reshape(images.shape[0], self.visual.visual_dim, -1).permute(0, 2, 1)
         cls = self.visual.class_embedding.to(x.dtype).expand(images.shape[0], 1, -1)
         x = torch.cat((cls, x), dim=1) + self.visual.positional_embedding.to(x.dtype)
         x = self.visual.ln_pre(x).permute(1, 0, 2)
@@ -211,6 +220,7 @@ def load_model() -> None:
     architecture_patch_sizes = {
         "attrivision_jointfce_submission_vit_b_16": 16,
         "attrivision_jointfce_submission_vit_b_32": 32,
+        "attrivision_jointfce_submission_vit_l_14": 14,
     }
     if architecture not in architecture_patch_sizes:
         raise ValueError("Invalid packaged JointFCE checkpoint")
@@ -224,6 +234,8 @@ def load_model() -> None:
         int(payload["visual_dim"]), int(payload["text_dim"]),
         int(payload["num_categories"]), int(payload["num_heads"]),
         float(payload["dropout"]), bool(payload["use_ffn"]), patch_size,
+        int(payload.get("visual_layers", 12)),
+        int(payload.get("visual_heads", 12)),
     )
     _MODEL, _DEVICE = model.to(device).eval(), device
     _TEXT_FEATURES = F.normalize(payload["text_features"].float(), dim=-1).to(device)
@@ -231,8 +243,12 @@ def load_model() -> None:
     _SEMANTIC_KEYS = list(payload["semantic_keys"])
     _GROUPS = _category_groups(_SEMANTIC_KEYS)
     _CONFIG = {
-        "batch_size": int(os.environ.get("UPAR_BATCH_SIZE", "128")),
-        "num_workers": int(os.environ.get("UPAR_NUM_WORKERS", "0")),
+        "batch_size": int(os.environ.get(
+            "UPAR_BATCH_SIZE", payload.get("default_batch_size", 128),
+        )),
+        "num_workers": int(os.environ.get(
+            "UPAR_NUM_WORKERS", payload.get("default_num_workers", 0),
+        )),
         "amp": os.environ.get("UPAR_AMP", "1").lower() not in {"0", "false", "no"},
         "progress_every": max(1, int(os.environ.get("UPAR_PROGRESS_EVERY", "5"))),
         "augmentation": os.environ.get("UPAR_AUGMENTATION", payload.get("augmentation", "resize_pad_crop")),

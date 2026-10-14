@@ -1,7 +1,6 @@
 """Fine-tuning loop for the AttriVision CLIP baseline."""
 from __future__ import annotations
 
-import copy
 import json
 import math
 import time
@@ -598,6 +597,24 @@ class _UniformWeightAverage:
             raise RuntimeError("SWAD average is not initialized")
         return self._state
 
+    def checkpoint_state(self) -> dict[str, Any]:
+        return {
+            "start_epoch": self.start_epoch,
+            "count": self.count,
+            "state": None if self._state is None else {
+                key: value.clone() for key, value in self._state.items()
+            },
+        }
+
+    def load_checkpoint_state(self, state: dict[str, Any]) -> None:
+        if int(state.get("start_epoch", self.start_epoch)) != self.start_epoch:
+            raise ValueError("SWAD resume start epoch differs from the checkpoint")
+        self.count = int(state.get("count", 0))
+        weights = state.get("state")
+        self._state = None if weights is None else {
+            key: value.detach().cpu().clone() for key, value in weights.items()
+        }
+
 
 def train(args: Any) -> Path:
     set_seed(args.seed, args.deterministic)
@@ -827,6 +844,7 @@ def train(args: Any) -> Path:
         "freeze_binary_head": getattr(args, "freeze_binary_head", False),
         "augmentation": getattr(args, "augmentation", "current"),
         "selection_metric": getattr(args, "selection_metric", "map"),
+        "stop_after_epoch": getattr(args, "stop_after_epoch", None),
         "paper_faithful": bool(getattr(args, "paper_faithful", False)),
         "dg_method": getattr(args, "dg_method", "none"),
         "distill_weight": getattr(args, "distill_weight", 0.0),
@@ -873,6 +891,8 @@ def train(args: Any) -> Path:
     best_unseen_epoch = 0
     stale = 0
     selection_key = getattr(args, "selection_metric", "mADM")
+    stop_after_epoch = getattr(args, "stop_after_epoch", None)
+    final_epoch = min(args.epochs, stop_after_epoch or args.epochs)
     start_epoch = 1
 
     if args.resume:
@@ -915,11 +935,10 @@ def train(args: Any) -> Path:
         _UniformWeightAverage(getattr(args, "swad_start_epoch", 3))
         if getattr(args, "dg_method", "none") == "swad" else None
     )
-    swad_eval_model = copy.deepcopy(model).to(device) if swad_average is not None else None
-    if swad_eval_model is not None:
-        for parameter in swad_eval_model.parameters():
-            parameter.requires_grad_(False)
-
+    if swad_average is not None and args.resume:
+        swad_state = payload["training_state"].get("swad_average")
+        if swad_state is not None:
+            swad_average.load_checkpoint_state(swad_state)
     logger.log(json.dumps({**vars(args), "resolved_device": str(device)}, indent=2, default=str))
     logger.log(
         f"Initialization checkpoint: {args.init_checkpoint if args.init_checkpoint else 'pretrained/default'}; "
@@ -1011,7 +1030,7 @@ def train(args: Any) -> Path:
             f"consistency_weight={getattr(args, 'mixed_consistency_weight', 0.1):g}"
         )
     try:
-        for epoch in range(start_epoch, args.epochs + 1):
+        for epoch in range(start_epoch, final_epoch + 1):
             if domain_sampler is not None:
                 domain_sampler.epoch = epoch - 1
             started = time.time()
@@ -1071,12 +1090,19 @@ def train(args: Any) -> Path:
                 )
             metrics: dict[str, float] = {}
             should_stop = False
-            if epoch % args.retrieval_interval == 0 or epoch == args.epochs:
-                evaluation_model = model
+            evaluation_model = model
+            swad_raw_state: dict[str, torch.Tensor] | None = None
+            if (
+                epoch % args.retrieval_interval == 0
+                or epoch == args.epochs
+                or epoch == final_epoch
+            ):
                 if swad_average is not None and swad_average.update(model, epoch):
-                    assert swad_eval_model is not None
-                    swad_eval_model.load_state_dict(swad_average.state_dict())
-                    evaluation_model = swad_eval_model
+                    swad_raw_state = {
+                        key: value.detach().cpu().clone()
+                        for key, value in model.state_dict().items()
+                    }
+                    model.load_state_dict(swad_average.state_dict())
                 if getattr(args, "validation_protocol", "binary_head") == "native52_category_nll":
                     if getattr(args, "domain_wise_validation", False):
                         metrics = evaluate_native52_category_nll_domainwise(
@@ -1166,6 +1192,8 @@ def train(args: Any) -> Path:
                         epoch >= args.minimum_training_epochs
                         and stale >= args.early_stopping_patience
                     )
+            if swad_raw_state is not None:
+                model.load_state_dict(swad_raw_state)
 
             elapsed = time.time() - started
             lr = float(optimizer.param_groups[0]["lr"])
@@ -1253,7 +1281,32 @@ def train(args: Any) -> Path:
                 last_path, model, table.attribute_names, epoch, {**losses, **metrics},
                 optimizer, scheduler, scaler, best_map, best_epoch, stale,
                 args.prompt_mode, training_config, best_unseen_score, best_unseen_epoch,
+                extra_training_state=(
+                    {"swad_average": swad_average.checkpoint_state()}
+                    if swad_average is not None else None
+                ),
             )
+            if stop_after_epoch is not None and epoch == stop_after_epoch:
+                fixed_epoch_path = output_dir / f"checkpoint_epoch_{epoch:03d}.pth"
+                fixed_raw_state = None
+                if swad_average is not None and swad_average.count:
+                    fixed_raw_state = {
+                        key: value.detach().cpu().clone()
+                        for key, value in model.state_dict().items()
+                    }
+                    model.load_state_dict(swad_average.state_dict())
+                save_best(
+                    fixed_epoch_path, model, table.attribute_names, epoch,
+                    {**losses, **metrics}, args.prompt_mode, training_config,
+                )
+                if fixed_raw_state is not None:
+                    model.load_state_dict(fixed_raw_state)
+                logger.log(f"Saved requested fixed-epoch checkpoint: {fixed_epoch_path}")
+                logger.log(
+                    f"Stopping at epoch {epoch}; learning-rate schedule was planned for "
+                    f"{args.epochs} epochs."
+                )
+                break
             if should_stop:
                 logger.log(
                     f"Early stopping at epoch {epoch}; best "

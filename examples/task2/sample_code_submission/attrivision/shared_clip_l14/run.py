@@ -59,6 +59,14 @@ def _add_training_overrides(parser: argparse.ArgumentParser) -> None:
         "--grad-cache-steps", type=int,
         help="microbatches per Gradient Cache update; batch-size 16 x 8 keeps effective batch 128",
     )
+    parser.add_argument(
+        "--swad", action=argparse.BooleanOptionalAction, default=None,
+        help="select E1-D checkpoints using post-burn-in uniform weight averaging",
+    )
+    parser.add_argument(
+        "--swad-start-epoch", type=int,
+        help="first epoch included in the SWAD-style uniform average",
+    )
     parser.add_argument("--eval-batch-size", type=int)
     parser.add_argument("--num-workers", type=int)
     parser.add_argument("--decoder-learning-rate", type=float)
@@ -84,6 +92,7 @@ def _training_config(args: argparse.Namespace) -> dict[str, Any]:
     for key in (
         "output_root", "data_root", "device", "epochs", "batch_size",
         "eval_batch_size", "num_workers", "decoder_learning_rate", "grad_cache_steps",
+        "swad", "swad_start_epoch",
         "vision_learning_rate", "text_learning_rate", "global_loss_weight", "local_loss_weight",
         "clip_feature_anchor_weight",
         "max_train_samples", "max_val_samples", "amp",
@@ -131,6 +140,8 @@ def _run_train(argv: list[str], *, e1_d: bool = False) -> None:
         parser.add_argument("--stage", choices=("control", "local", "joint", "full"), required=True)
     _add_training_overrides(parser)
     args = parser.parse_args(argv)
+    if args.swad and not e1_d:
+        parser.error("--swad is currently supported for E1-D only; E1-A uses --dg-method swad")
     if args.stage == "full" and args.init_checkpoint:
         parser.error("E1-D starts from OpenAI pretrained CLIP; omit --init-checkpoint and use --resume only to continue E1-D")
     if args.stage == "control":

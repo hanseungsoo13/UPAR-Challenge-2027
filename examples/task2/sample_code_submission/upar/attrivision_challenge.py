@@ -28,15 +28,18 @@ class QuickGELU(nn.Module):
 
 
 class ResidualAttentionBlock(nn.Module):
-    def __init__(self, quick_gelu: bool = False) -> None:
+    def __init__(
+        self, quick_gelu: bool = False, width: int = 768, heads: int = 12,
+    ) -> None:
         super().__init__()
-        self.ln_1 = nn.LayerNorm(768)
-        self.attn = nn.MultiheadAttention(768, 12)
-        self.ln_2 = nn.LayerNorm(768)
+        self.ln_1 = nn.LayerNorm(width)
+        self.attn = nn.MultiheadAttention(width, heads)
+        self.ln_2 = nn.LayerNorm(width)
+        hidden_width = 4 * width
         self.mlp = nn.Sequential(OrderedDict([
-            ("c_fc", nn.Linear(768, 3072)),
+            ("c_fc", nn.Linear(width, hidden_width)),
             ("gelu", QuickGELU() if quick_gelu else nn.GELU()),
-            ("c_proj", nn.Linear(3072, 768)),
+            ("c_proj", nn.Linear(hidden_width, width)),
         ]))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -46,10 +49,13 @@ class ResidualAttentionBlock(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, quick_gelu: bool = False) -> None:
+    def __init__(
+        self, quick_gelu: bool = False, width: int = 768,
+        layers: int = 12, heads: int = 12,
+    ) -> None:
         super().__init__()
         self.resblocks = nn.ModuleList([
-            ResidualAttentionBlock(quick_gelu) for _ in range(12)
+            ResidualAttentionBlock(quick_gelu, width, heads) for _ in range(layers)
         ])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -59,22 +65,36 @@ class Transformer(nn.Module):
 
 
 class CLIPVisionTransformer(nn.Module):
-    def __init__(self, quick_gelu: bool = False, patch_size: int = 32) -> None:
+    def __init__(
+        self,
+        quick_gelu: bool = False,
+        patch_size: int = 32,
+        visual_dim: int = 768,
+        output_dim: int = 512,
+        layers: int = 12,
+        heads: int = 12,
+    ) -> None:
         super().__init__()
-        if patch_size not in {16, 32}:
+        if patch_size not in {14, 16, 32}:
             raise ValueError(f"Unsupported CLIP ViT patch size: {patch_size}")
         self.patch_size = patch_size
-        self.class_embedding = nn.Parameter(torch.empty(768))
+        self.visual_dim = visual_dim
+        self.output_dim = output_dim
+        self.class_embedding = nn.Parameter(torch.empty(visual_dim))
         grid_size = 224 // patch_size
-        self.positional_embedding = nn.Parameter(torch.empty(1 + grid_size * grid_size, 768))
-        self.proj = nn.Parameter(torch.empty(768, 512))
-        self.conv1 = nn.Conv2d(3, 768, patch_size, patch_size, bias=False)
-        self.ln_pre = nn.LayerNorm(768)
-        self.transformer = Transformer(quick_gelu)
-        self.ln_post = nn.LayerNorm(768)
+        self.positional_embedding = nn.Parameter(
+            torch.empty(1 + grid_size * grid_size, visual_dim),
+        )
+        self.proj = nn.Parameter(torch.empty(visual_dim, output_dim))
+        self.conv1 = nn.Conv2d(3, visual_dim, patch_size, patch_size, bias=False)
+        self.ln_pre = nn.LayerNorm(visual_dim)
+        self.transformer = Transformer(quick_gelu, visual_dim, layers, heads)
+        self.ln_post = nn.LayerNorm(visual_dim)
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
-        x = self.conv1(images).reshape(images.shape[0], 768, -1).permute(0, 2, 1)
+        x = self.conv1(images).reshape(
+            images.shape[0], self.visual_dim, -1,
+        ).permute(0, 2, 1)
         cls = self.class_embedding.to(x.dtype).expand(images.shape[0], 1, -1)
         x = torch.cat((cls, x), dim=1) + self.positional_embedding.to(x.dtype)
         x = self.ln_pre(x).permute(1, 0, 2)

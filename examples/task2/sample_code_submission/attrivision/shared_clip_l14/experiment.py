@@ -21,6 +21,7 @@ from ..datasets.attribute_prompts import CategoryPromptMapper
 from ..datasets.upar_abpr import AttriVisionDataset, PromptBatch, PromptCollator
 from ..engine.evaluator_abpr import evaluate_native52_category_nll
 from ..engine.trainer_attrivision import (
+    _UniformWeightAverage,
     _grad_scaler,
     _optimizer_step,
     build_scheduler,
@@ -704,8 +705,9 @@ def _training_state(
     stale_evaluations: int,
     best_unseen_score: float = -math.inf,
     best_unseen_epoch: int = 0,
+    swad_average: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    state = {
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "scaler": scaler.state_dict(),
@@ -716,6 +718,9 @@ def _training_state(
         "best_unseen_epoch": int(best_unseen_epoch),
         "rng": rng_state(),
     }
+    if swad_average is not None:
+        state["swad_average"] = swad_average
+    return state
 
 
 def _checkpoint_payload(
@@ -770,6 +775,10 @@ def train_shared(
     grad_cache_steps = int(config.get("grad_cache_steps", 1))
     if grad_cache_steps < 1:
         raise ValueError("grad_cache_steps must be at least 1")
+    swad_enabled = bool(config.get("swad", False))
+    swad_start_epoch = int(config.get("swad_start_epoch", 3))
+    if swad_start_epoch < 1:
+        raise ValueError("swad_start_epoch must be positive")
     consistency_variant = str(config.get("consistency_variant", "B0"))
     if consistency_variant not in {"B0", "B1", "B2"}:
         raise ValueError("consistency_variant must be B0, B1, or B2")
@@ -814,6 +823,8 @@ def train_shared(
             raise ValueError("E1-B consistency experiments use the frozen local-decoder stage")
     else:
         raise ValueError(f"Unsupported E1 stage/init-source pair: {stage}/{init_source}")
+    if swad_enabled and experiment != "E1-D":
+        raise ValueError("SWAD-style averaging is currently supported for E1-D only")
 
     device = choose_device(config["device"])
     data_root = Path(config["data_root"]).resolve()
@@ -869,6 +880,9 @@ def train_shared(
         "training_images_after_holdout": len(train_table.image_paths),
         "grad_cache_steps": grad_cache_steps,
         "effective_batch_size": int(config["batch_size"]) * grad_cache_steps,
+        "swad": swad_enabled,
+        "swad_start_epoch": swad_start_epoch,
+        "weight_averaging": "uniform_post_burn_in" if swad_enabled else "none",
     }
     output_dir = Path(config["output_dir"]).resolve()
     config["output_dir"] = str(output_dir)
@@ -903,6 +917,8 @@ def train_shared(
             ("clip_feature_anchor_weight", 0.0),
             ("holdout_domain", None),
             ("grad_cache_steps", 1),
+            ("swad", False),
+            ("swad_start_epoch", 3),
         ):
             if saved_config.get(key, default) != config.get(key, default):
                 raise ValueError(f"Resume checkpoint {key} differs from the requested run")
@@ -965,6 +981,9 @@ def train_shared(
     best_unseen_epoch = 0
     stale = 0
     start_epoch = 1
+    swad_average = (
+        _UniformWeightAverage(swad_start_epoch) if swad_enabled else None
+    )
     if resume_payload is not None:
         training_state = resume_payload.get("training_state")
         if not isinstance(training_state, dict):
@@ -980,6 +999,11 @@ def train_shared(
         best_unseen_epoch = int(training_state.get("best_unseen_epoch", 0))
         stale = int(training_state["stale_evaluations"])
         start_epoch = int(resume_payload["epoch"]) + 1
+        if swad_average is not None:
+            swad_state = training_state.get("swad_average")
+            if not isinstance(swad_state, dict):
+                raise ValueError("SWAD resume checkpoint has no running average state")
+            swad_average.load_checkpoint_state(swad_state)
 
     history_path = output_dir / "metrics.csv"
     rows: list[dict[str, Any]] = []
@@ -994,6 +1018,13 @@ def train_shared(
             global_criterion, local_criterion, optimizer, scheduler, scaler,
             config, device, epoch,
         )
+        swad_raw_state: dict[str, torch.Tensor] | None = None
+        if swad_average is not None and swad_average.update(model, epoch):
+            swad_raw_state = {
+                key: value.detach().cpu().clone()
+                for key, value in model.state_dict().items()
+            }
+            model.load_state_dict(swad_average.state_dict())
         validation_rows, details = evaluate_model(
             model,
             train_table.attribute_names,
@@ -1108,6 +1139,8 @@ def train_shared(
                 ),
                 best_unseen_path,
             )
+        if swad_raw_state is not None:
+            model.load_state_dict(swad_raw_state)
         atomic_torch_save(
             _checkpoint_payload(
                 model, train_table.attribute_names, experiment, epoch,
@@ -1115,6 +1148,7 @@ def train_shared(
                 _training_state(
                     optimizer, scheduler, scaler, best_score, best_epoch, stale,
                     best_unseen_score, best_unseen_epoch,
+                    swad_average.checkpoint_state() if swad_average is not None else None,
                 ),
             ),
             last_path,

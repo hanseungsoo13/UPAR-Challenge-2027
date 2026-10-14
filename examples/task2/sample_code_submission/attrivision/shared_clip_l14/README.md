@@ -197,5 +197,11 @@ conda activate rws-upar-challenge && CUDA_VISIBLE_DEVICES=1 python examples/task
 conda activate rws-upar-challenge && CUDA_VISIBLE_DEVICES=1 python examples/task2/sample_code_submission/attrivision/shared_clip_l14/run.py smoke --device cuda:0 --batch-size 1
 ```
 
-이 경로는 학습과 평가용이다. 기존 제출 packager의 B/16·B/32 전용 visual
-runtime에는 L/14 지원을 별도로 추가해야 한다.
+E1-D 최적 체크포인트는 다음 명령으로 제출용 ViT-L/14 ZIP으로 변환한다.
+
+```bash
+conda activate rws-upar-challenge && python examples/task2/sample_code_submission/package_submission.py \
+  --checkpoint outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-D/checkpoint_best.pth \
+  --model attrivision_e1_d \
+  --output submissions/attrivision_e1_d_shared_clip_l14.zip
+```

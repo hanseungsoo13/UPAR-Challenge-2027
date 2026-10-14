@@ -96,6 +96,50 @@ CUDA_VISIBLE_DEVICES=6 python examples/task2/sample_code_submission/attrivision/
 첫 실행에서는 OpenAI CLIP pretrained weight를 다운로드하므로 인터넷 연결이
 필요하다. 이후에는 로컬 cache를 사용한다.
 
+### CLIP Large E1-A / E1-D + SWAD-style weight averaging
+
+E1-A와 E1-D는 epoch 3 이후의 모델 가중치를 균등 평균해 validation mADM으로
+checkpoint를 선택할 수 있다. 이는 post-burn-in uniform averaging 방식의
+SWAD-style 설정이다. Gradient Cache의 `batch-size 16 × grad-cache-steps 8`은
+effective contrastive batch size 128을 유지한다.
+
+E1-A는 기존 A7 runner에 `--dg-method swad`를 지정한다.
+
+```bash
+conda activate rws-upar-challenge
+CUDA_VISIBLE_DEVICES=1 python examples/task2/sample_code_submission/attrivision/shared_clip_l14/run.py a7 \
+  --mode train_eval \
+  --data-root data \
+  --device cuda:0 \
+  --batch-size 16 \
+  --grad-cache-steps 8 \
+  --eval-batch-size 32 \
+  --dg-method swad \
+  --swad-start-epoch 3 \
+  --distill-weight 0 \
+  --output-dir outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-A-GC128-SWAD
+```
+
+E1-D는 OpenAI pretrained CLIP ViT-L/14에서 바로 시작하며, AttriQuery cross-attention과
+CLIP vision/text tower를 함께 학습한다.
+
+```bash
+conda activate rws-upar-challenge
+CUDA_VISIBLE_DEVICES=1 python examples/task2/sample_code_submission/attrivision/shared_clip_l14/run.py e1-d \
+  --config examples/task2/sample_code_submission/attrivision/configs/e1_shared_clip_l14.json \
+  --data-root data \
+  --device cuda:0 \
+  --batch-size 16 \
+  --grad-cache-steps 8 \
+  --eval-batch-size 32 \
+  --swad \
+  --swad-start-epoch 3 \
+  --output-dir outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-D-GC128-SWAD
+```
+
+SWAD 활성화 시 `checkpoint_best.pth`는 평균 가중치에서 선택·저장되고,
+`checkpoint_last.pth`는 optimizer와 평균 누적 상태를 포함해 이어서 학습할 수 있다.
+
 ### 평가
 
 ```bash

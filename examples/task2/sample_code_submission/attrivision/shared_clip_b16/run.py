@@ -54,6 +54,10 @@ def _add_training_overrides(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--data-root")
     parser.add_argument("--device")
     parser.add_argument("--epochs", type=int)
+    parser.add_argument(
+        "--stop-after-epoch", type=int,
+        help="stop after this epoch while keeping the learning-rate schedule based on --epochs; save that epoch as checkpoint_epoch_NNN.pth",
+    )
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--eval-batch-size", type=int)
     parser.add_argument("--num-workers", type=int)
@@ -78,7 +82,7 @@ def _add_training_overrides(parser: argparse.ArgumentParser) -> None:
 def _training_config(args: argparse.Namespace) -> dict[str, Any]:
     config = _read_config(args.config)
     for key in (
-        "output_root", "data_root", "device", "epochs", "batch_size",
+        "output_root", "data_root", "device", "epochs", "stop_after_epoch", "batch_size",
         "eval_batch_size", "num_workers", "decoder_learning_rate",
         "vision_learning_rate", "text_learning_rate", "global_loss_weight", "local_loss_weight",
         "clip_feature_anchor_weight",
@@ -88,6 +92,8 @@ def _training_config(args: argparse.Namespace) -> dict[str, Any]:
         if value is not None:
             config[key] = value
     config["consistency_variant"] = args.consistency_variant
+    if args.stop_after_epoch is not None and not 1 <= args.stop_after_epoch <= int(config["epochs"]):
+        raise ValueError("stop-after-epoch must be between 1 and epochs")
     config["feature_consistency_weight"] = (
         args.feature_consistency_weight
         if args.feature_consistency_weight is not None

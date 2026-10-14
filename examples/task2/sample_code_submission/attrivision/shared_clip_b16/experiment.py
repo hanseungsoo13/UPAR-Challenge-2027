@@ -735,6 +735,11 @@ def train_shared(
     config: dict[str, Any],
     resume: str | None = None,
 ) -> Path:
+    stop_after_epoch = config.get("stop_after_epoch")
+    if stop_after_epoch is not None:
+        stop_after_epoch = int(stop_after_epoch)
+        if not 1 <= stop_after_epoch <= int(config["epochs"]):
+            raise ValueError("stop_after_epoch must be between 1 and epochs")
     consistency_variant = str(config.get("consistency_variant", "B0"))
     if consistency_variant not in {"B0", "B1", "B2"}:
         raise ValueError("consistency_variant must be B0, B1, or B2")
@@ -950,7 +955,8 @@ def train_shared(
         with history_path.open(encoding="utf-8", newline="") as handle:
             rows.extend(dict(row) for row in csv.DictReader(handle))
 
-    for epoch in range(start_epoch, int(config["epochs"]) + 1):
+    final_epoch = min(int(config["epochs"]), stop_after_epoch or int(config["epochs"]))
+    for epoch in range(start_epoch, final_epoch + 1):
         started = time.perf_counter()
         train_metrics = _train_one_epoch(
             model, anchor_model, loader, mapper, state_tokens, state_features,
@@ -1082,6 +1088,23 @@ def train_shared(
             ),
             last_path,
         )
+        if stop_after_epoch is not None and epoch == stop_after_epoch:
+            fixed_epoch_path = output_dir / f"checkpoint_epoch_{epoch:03d}.pth"
+            atomic_torch_save(
+                _checkpoint_payload(
+                    model, train_table.attribute_names, experiment, epoch,
+                    {"scores": validation_rows, "selected": fused,
+                     "checkpoint_selection": "fixed_epoch"}, config,
+                ),
+                fixed_epoch_path,
+            )
+            print(f"Saved requested fixed-epoch checkpoint: {fixed_epoch_path}", flush=True)
+            print(
+                f"Stopping at epoch {epoch}; learning-rate schedule was planned for "
+                f"{int(config['epochs'])} epochs.",
+                flush=True,
+            )
+            break
         if stale >= int(config["early_stopping_patience"]):
             print(f"Early stopping at epoch {epoch}; best mADM={best_score:.6f} at {best_epoch}", flush=True)
             break
@@ -1092,6 +1115,11 @@ def train_shared(
         "experiment": experiment,
         "best_checkpoint": str(best_path),
         "last_checkpoint": str(last_path),
+        "fixed_epoch_checkpoint": (
+            str(output_dir / f"checkpoint_epoch_{stop_after_epoch:03d}.pth")
+            if stop_after_epoch is not None else None
+        ),
+        "stopped_after_epoch": stop_after_epoch,
         "best_epoch": best_epoch,
         "best_mADM": best_score,
         "best_unseen_checkpoint": str(best_unseen_path) if best_unseen_path.is_file() else None,
