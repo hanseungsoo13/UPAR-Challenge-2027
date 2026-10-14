@@ -243,24 +243,44 @@ def _build_eval_transform() -> transforms.Compose:
     ])
 
 
-def load_model() -> None:
+def load_model(checkpoint: dict[str, Any] | None = None) -> None:
     global _MODEL, _DEVICE, _TEXT_FEATURES, _PAIRED_TEXT_FEATURES
     global _INVERSE_TEMPERATURE, _ATTRIBUTE_NAMES, _SEMANTIC_KEYS, _CONFIG
     path = Path(os.environ.get("UPAR_CHECKPOINT", str(DEFAULT_CHECKPOINT)))
     device = choose_device(os.environ.get("UPAR_DEVICE", "auto"))
-    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    if checkpoint is None:
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     architecture = checkpoint.get("architecture")
-    patch_sizes = {
-        "attrivision_submission_vit_b_16": 16,
-        "attrivision_submission_vit_b_32": 32,
+    architecture_configs = {
+        "attrivision_submission_vit_b_16": {
+            "patch_size": 16, "visual_dim": 768, "output_dim": 512,
+            "layers": 12, "heads": 12,
+        },
+        "attrivision_submission_vit_b_32": {
+            "patch_size": 32, "visual_dim": 768, "output_dim": 512,
+            "layers": 12, "heads": 12,
+        },
+        "attrivision_submission_vit_l_14": {
+            "patch_size": 14, "visual_dim": 1024, "output_dim": 768,
+            "layers": 24, "heads": 16,
+        },
     }
-    if architecture not in patch_sizes:
+    if architecture not in architecture_configs:
         raise ValueError("Invalid packaged AttriVision checkpoint")
-    patch_size = int(checkpoint.get("patch_size", patch_sizes[architecture]))
-    if patch_size != patch_sizes[architecture]:
+    model_config = architecture_configs[architecture]
+    patch_size = int(checkpoint.get("patch_size", model_config["patch_size"]))
+    if patch_size != model_config["patch_size"]:
         raise ValueError("Packaged AttriVision architecture and patch size do not match")
+    for field in ("visual_dim", "output_dim"):
+        if int(checkpoint.get(field, model_config[field])) != model_config[field]:
+            raise ValueError(f"Packaged AttriVision {field} does not match its architecture")
     model = CLIPVisionTransformer(
-        bool(checkpoint.get("quick_gelu", False)), patch_size=patch_size,
+        bool(checkpoint.get("quick_gelu", False)),
+        patch_size=patch_size,
+        visual_dim=model_config["visual_dim"],
+        output_dim=model_config["output_dim"],
+        layers=model_config["layers"],
+        heads=model_config["heads"],
     )
     model.load_state_dict(checkpoint["visual_state_dict"], strict=True)
     _MODEL, _DEVICE = model.to(device).eval(), device
@@ -273,8 +293,12 @@ def load_model() -> None:
     _ATTRIBUTE_NAMES = list(checkpoint["attribute_names"])
     _SEMANTIC_KEYS = list(checkpoint["semantic_keys"])
     _CONFIG = {
-        "batch_size": int(os.environ.get("UPAR_BATCH_SIZE", "128")),
-        "num_workers": int(os.environ.get("UPAR_NUM_WORKERS", "0")),
+        "batch_size": int(os.environ.get(
+            "UPAR_BATCH_SIZE", str(checkpoint.get("default_batch_size", 128))
+        )),
+        "num_workers": int(os.environ.get(
+            "UPAR_NUM_WORKERS", str(checkpoint.get("default_num_workers", 0))
+        )),
         "amp": os.environ.get("UPAR_AMP", "1").lower() not in {"0", "false", "no"},
         "progress_every": max(1, int(os.environ.get("UPAR_PROGRESS_EVERY", "5"))),
         "retrieval_scoring": os.environ.get(

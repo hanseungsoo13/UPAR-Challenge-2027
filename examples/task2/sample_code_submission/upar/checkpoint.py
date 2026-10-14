@@ -145,9 +145,14 @@ def _load_payload(path: str | Path) -> dict[str, Any]:
         return torch.load(path, map_location="cpu")
 
 
-def load_checkpoint(path: str | Path, device: torch.device) -> tuple[UPARModel, dict[str, Any]]:
+def load_checkpoint(
+    path: str | Path,
+    device: torch.device,
+    checkpoint: dict[str, Any] | None = None,
+) -> tuple[UPARModel, dict[str, Any]]:
     path = Path(path)
-    checkpoint = _load_payload(path)
+    if checkpoint is None:
+        checkpoint = _load_payload(path)
     required = {"model_state_dict", "attribute_names", "preprocessing", "positive_ratios"}
     missing = required - set(checkpoint)
     if missing:

@@ -1192,6 +1192,11 @@ def train(args: Any) -> Path:
                         epoch >= args.minimum_training_epochs
                         and stale >= args.early_stopping_patience
                     )
+            epoch_checkpoint_path = output_dir / f"checkpoint_epoch_{epoch:03d}.pth"
+            save_best(
+                epoch_checkpoint_path, evaluation_model, table.attribute_names, epoch,
+                {**losses, **metrics}, args.prompt_mode, training_config,
+            )
             if swad_raw_state is not None:
                 model.load_state_dict(swad_raw_state)
 
@@ -1287,21 +1292,7 @@ def train(args: Any) -> Path:
                 ),
             )
             if stop_after_epoch is not None and epoch == stop_after_epoch:
-                fixed_epoch_path = output_dir / f"checkpoint_epoch_{epoch:03d}.pth"
-                fixed_raw_state = None
-                if swad_average is not None and swad_average.count:
-                    fixed_raw_state = {
-                        key: value.detach().cpu().clone()
-                        for key, value in model.state_dict().items()
-                    }
-                    model.load_state_dict(swad_average.state_dict())
-                save_best(
-                    fixed_epoch_path, model, table.attribute_names, epoch,
-                    {**losses, **metrics}, args.prompt_mode, training_config,
-                )
-                if fixed_raw_state is not None:
-                    model.load_state_dict(fixed_raw_state)
-                logger.log(f"Saved requested fixed-epoch checkpoint: {fixed_epoch_path}")
+                logger.log(f"Saved requested fixed-epoch checkpoint: {epoch_checkpoint_path}")
                 logger.log(
                     f"Stopping at epoch {epoch}; learning-rate schedule was planned for "
                     f"{args.epochs} epochs."

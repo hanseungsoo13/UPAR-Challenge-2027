@@ -1142,6 +1142,15 @@ def train_shared(
                 ),
                 best_unseen_path,
             )
+        epoch_checkpoint_path = output_dir / f"checkpoint_epoch_{epoch:03d}.pth"
+        atomic_torch_save(
+            _checkpoint_payload(
+                model, train_table.attribute_names, experiment, epoch,
+                {"scores": validation_rows, "selected": fused,
+                 "domain_retrieval": domain_report}, config,
+            ),
+            epoch_checkpoint_path,
+        )
         if swad_raw_state is not None:
             model.load_state_dict(swad_raw_state)
         atomic_torch_save(
@@ -1171,6 +1180,7 @@ def train_shared(
         "best_unseen_checkpoint": str(best_unseen_path) if best_unseen_path.is_file() else None,
         "best_unseen_epoch": best_unseen_epoch if best_unseen_epoch else None,
         "best_unseen_mADM": best_unseen_score if best_unseen_epoch else None,
+        "epoch_checkpoint_pattern": str(output_dir / "checkpoint_epoch_{epoch:03d}.pth"),
         "selection_metric": "mADM",
         "selection_alpha": float(config["selection_alpha"]),
     })

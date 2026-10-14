@@ -35,6 +35,8 @@ def load_checkpoint_metadata(source: Path | BinaryIO) -> dict[str, Any]:
     architecture = checkpoint.get("architecture")
     if architecture == "attrivision_openclip_vit_b_32":
         required = {"model_state_dict", "attribute_names", "model_name", "prompt_mode"}
+    elif architecture == "attrivision_openclip_vit_l_14":
+        required = {"model_state_dict", "attribute_names", "model_name", "prompt_mode"}
     elif architecture == "attrivision_attrquery_shared_openclip_vit_b_16":
         required = {
             "model_state_dict", "attribute_names", "model_name", "model_stage",
@@ -54,6 +56,11 @@ def load_checkpoint_metadata(source: Path | BinaryIO) -> dict[str, Any]:
         required = {"visual_state_dict", "text_features", "semantic_keys", "attribute_names"}
     elif architecture == "attrivision_submission_vit_b_16":
         required = {"visual_state_dict", "text_features", "semantic_keys", "attribute_names"}
+    elif architecture == "attrivision_submission_vit_l_14":
+        required = {
+            "visual_state_dict", "text_features", "semantic_keys", "attribute_names",
+            "patch_size", "visual_dim", "output_dim", "visual_layers", "visual_heads",
+        }
     elif architecture == "attrivision_jointfce_submission_vit_b_32":
         required = {
             "visual_state_dict", "local_head_state_dict", "text_features",
@@ -276,6 +283,8 @@ def _shared_e1_submission_checkpoint(
         "fusion_alpha": fusion_alpha,
         "category_temperature": category_temperature,
         "augmentation": "resize_pad_crop",
+        "default_batch_size": 128,
+        "default_num_workers": 0,
         "epoch": payload.get("epoch"),
         "metrics": payload.get("metrics", {}),
         "source_architecture": payload.get("architecture"),
@@ -286,6 +295,87 @@ def _shared_e1_submission_checkpoint(
     metadata = {
         "epoch": payload.get("epoch"),
         "model_kind": f"attrivision_{experiment.lower().replace('-', '_')}_shared_clip_b16",
+        "metrics": payload.get("metrics", {}),
+        "architecture": payload.get("architecture"),
+        "packaged_architecture": converted["architecture"],
+    }
+    return stream.getvalue(), metadata
+
+
+def _attrivision_a7_l14_submission_checkpoint(
+    checkpoint: Path,
+) -> tuple[bytes, dict[str, Any]]:
+    """Convert an AttriVision A7 CLIP L/14 checkpoint to an inference payload."""
+    from attrivision.datasets.attribute_prompts import CategoryPromptMapper
+    from attrivision.models.attrivision import AttriVision
+
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    if payload.get("architecture") != "attrivision_openclip_vit_l_14":
+        raise ValueError("E1-A L/14 packaging requires an AttriVision ViT-L/14 checkpoint")
+    if payload.get("model_name") != "ViT-L-14":
+        raise ValueError("E1-A L/14 packaging requires OpenAI CLIP ViT-L/14")
+    if payload.get("prompt_mode") != "category_complete":
+        raise ValueError("E1-A L/14 packaging requires category_complete prompts")
+    if int(payload.get("epoch", 0)) < 1:
+        raise ValueError("E1-A L/14 packaging rejects an untrained checkpoint")
+
+    attributes = list(payload["attribute_names"])
+    mapper = CategoryPromptMapper(attributes)
+    model = AttriVision(pretrained=None, model_name=payload["model_name"])
+    missing, unexpected = model.load_state_dict(payload["model_state_dict"], strict=True)
+    if missing or unexpected:
+        raise ValueError(
+            f"E1-A CLIP L/14 checkpoint mismatch: missing={missing}, unexpected={unexpected}"
+        )
+    model.eval()
+    with torch.inference_mode():
+        text_features = model.encode_text(model.tokenize(mapper.prompts)).float().cpu()
+    if tuple(text_features.shape) != (52, 768):
+        raise ValueError(
+            f"E1-A L/14 text features must have shape (52, 768), got {tuple(text_features.shape)}"
+        )
+
+    visual = {
+        key.removeprefix("clip.visual."): value.detach().cpu()
+        for key, value in payload["model_state_dict"].items()
+        if key.startswith("clip.visual.")
+    }
+    if not visual:
+        raise ValueError("E1-A L/14 checkpoint has no CLIP visual weights")
+    training_config = payload.get("training_config", {})
+    category_temperature = float(training_config.get("category_temperature", 0.01))
+    if category_temperature <= 0:
+        raise ValueError("E1-A L/14 category temperature must be positive")
+
+    converted = {
+        "format_version": 1,
+        "architecture": "attrivision_submission_vit_l_14",
+        "patch_size": 14,
+        "quick_gelu": True,
+        "visual_dim": 1024,
+        "output_dim": 768,
+        "visual_layers": 24,
+        "visual_heads": 16,
+        "visual_state_dict": visual,
+        "text_features": text_features,
+        "semantic_keys": list(mapper.keys),
+        "attribute_names": attributes,
+        "retrieval_scoring": "native52_category_nll",
+        "category_temperature": category_temperature,
+        "augmentation": "resize_pad_crop",
+        "default_batch_size": int(training_config.get("eval_batch_size", 32)),
+        # Codabench containers often have a small /dev/shm; load images inline.
+        "default_num_workers": 0,
+        "epoch": payload.get("epoch"),
+        "metrics": payload.get("metrics", {}),
+        "source_architecture": payload.get("architecture"),
+        "source_experiment": "E1-A",
+    }
+    stream = BytesIO()
+    torch.save(converted, stream)
+    metadata = {
+        "epoch": payload.get("epoch"),
+        "model_kind": "attrivision_e1_a_shared_clip_l14",
         "metrics": payload.get("metrics", {}),
         "architecture": payload.get("architecture"),
         "packaged_architecture": converted["architecture"],
@@ -381,7 +471,8 @@ def _shared_e1_l14_submission_checkpoint(
         "category_temperature": category_temperature,
         "augmentation": "resize_pad_crop",
         "default_batch_size": int(training_config.get("eval_batch_size", 32)),
-        "default_num_workers": int(training_config.get("num_workers", 0)),
+        # Training worker counts are unsafe in the submission container's /dev/shm.
+        "default_num_workers": 0,
         "epoch": payload.get("epoch"),
         "metrics": payload.get("metrics", {}),
         "source_architecture": payload.get("architecture"),
@@ -410,6 +501,12 @@ def submission_checkpoint(
     """Convert research AttriVision weights to a dependency-free inference payload."""
     metadata = load_checkpoint_metadata(checkpoint)
     architecture = metadata["architecture"]
+    if model == "attrivision_e1_a_l14" or architecture == "attrivision_openclip_vit_l_14":
+        if model not in {"auto", "attrivision_e1_a_l14"}:
+            raise ValueError("The selected model preset does not accept an AttriVision A7 L/14 checkpoint")
+        if architecture != "attrivision_openclip_vit_l_14":
+            raise ValueError("The E1-A L/14 preset requires an AttriVision ViT-L/14 checkpoint")
+        return _attrivision_a7_l14_submission_checkpoint(checkpoint)
     if model == "attrivision_e1_d" or architecture == "attrivision_attrquery_shared_openclip_vit_l_14":
         if model not in {"auto", "attrivision_e1_d"}:
             raise ValueError("The selected model preset does not accept a shared CLIP L/14 E1-D checkpoint")
@@ -641,7 +738,7 @@ def main() -> None:
         help="output zip path (default: submissions/upar_task2_YYYYMMDD_HHMMSS.zip)",
     )
     parser.add_argument(
-        "--model", choices=("auto", "convnext", "attrivision_a7", "attrivision_e1_b", "attrivision_e1_b1", "attrivision_e1_b2", "attrivision_e1_c", "attrivision_e1_d", "attrquery_jointfce"), default="auto",
+        "--model", choices=("auto", "convnext", "attrivision_a7", "attrivision_e1_a_l14", "attrivision_e1_b", "attrivision_e1_b1", "attrivision_e1_b2", "attrivision_e1_c", "attrivision_e1_d", "attrquery_jointfce"), default="auto",
         help="submission preset; auto preserves the checkpoint's architecture",
     )
     parser.add_argument(

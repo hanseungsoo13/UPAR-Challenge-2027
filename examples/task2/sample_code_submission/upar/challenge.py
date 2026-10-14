@@ -36,9 +36,10 @@ def load_model() -> None:
     if preview.get("architecture") in {
         "attrivision_submission_vit_b_16",
         "attrivision_submission_vit_b_32",
+        "attrivision_submission_vit_l_14",
     }:
         from . import attrivision_challenge
-        attrivision_challenge.load_model()
+        attrivision_challenge.load_model(checkpoint=preview)
         _ATTRIVISION = True
         return
     if preview.get("architecture") in {
@@ -47,7 +48,9 @@ def load_model() -> None:
         "attrivision_jointfce_submission_vit_l_14",
     }:
         from . import attrquery_challenge
-        attrquery_challenge.load_model()
+        # Reuse this payload for model construction; loading the large
+        # checkpoint again in the adapter wastes startup time and RAM.
+        attrquery_challenge.load_model(payload=preview)
         _ATTRQUERY_JOINTFCE = True
         return
     print(
@@ -59,7 +62,7 @@ def load_model() -> None:
     if device.type == "cuda":
         print(f"[submission] CUDA device: {torch.cuda.get_device_name(device)}", flush=True)
     print(f"[submission] checkpoint: {checkpoint_path}", flush=True)
-    model, checkpoint = load_checkpoint(checkpoint_path, device)
+    model, checkpoint = load_checkpoint(checkpoint_path, device, checkpoint=preview)
     preprocessing = PreprocessingConfig.from_dict(checkpoint["preprocessing"])
     _MODEL = model
     _DEVICE = device

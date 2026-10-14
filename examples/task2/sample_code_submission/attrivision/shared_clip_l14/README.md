@@ -17,6 +17,9 @@ local FCE, Global/Local fusion(alpha=0.5), validation mADM 선택을 재사용�
 - A는 기존 A7 기본값인 최대 100 epochs, B/C는 설정의 최대 30 epochs다.
   조기 종료가 적용된다. A의 설정은 `experiment_config.json`, B/C의 설정은
   `config.json`으로 각 출력 폴더에 저장된다.
+- E1-A/B/C/D는 매 epoch마다 `checkpoint_epoch_001.pth` 형식의 가중치 snapshot을
+  저장한다. `checkpoint_last.pth`는 optimizer 상태를 포함한 resume용이며,
+  `checkpoint_best.pth`는 validation 선택 결과다.
 
 B/16·B/32 체크포인트는 Large 단계 초기화에 사용할 수 없다. A는 OpenAI L/14
 사전학습 가중치에서 시작하고, B는 A-Large, C는 B-Large 결과를 사용한다.
@@ -204,4 +207,13 @@ conda activate rws-upar-challenge && python examples/task2/sample_code_submissio
   --checkpoint outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-D/checkpoint_best.pth \
   --model attrivision_e1_d \
   --output submissions/attrivision_e1_d_shared_clip_l14.zip
+```
+
+E1-A A7 최적 체크포인트도 다음 명령으로 제출용 ViT-L/14 ZIP으로 변환할 수 있다.
+
+```bash
+conda activate rws-upar-challenge && python examples/task2/sample_code_submission/package_submission.py \
+  --checkpoint outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-A-GC128-SWAD/checkpoint_best.pth \
+  --model attrivision_e1_a_l14 \
+  --output submissions/attrivision_e1_a_shared_clip_l14.zip
 ```

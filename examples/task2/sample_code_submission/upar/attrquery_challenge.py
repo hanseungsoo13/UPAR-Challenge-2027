@@ -208,14 +208,16 @@ _GROUPS: list[np.ndarray] = []
 _CONFIG: dict[str, Any] = {}
 
 
-def load_model() -> None:
-    global _MODEL, _DEVICE, _TEXT_FEATURES, _ATTRIBUTE_NAMES, _SEMANTIC_KEYS, _GROUPS, _CONFIG
+def load_model(payload: dict[str, Any] | None = None) -> None:
+    global _MODEL, _DEVICE, _TEXT_FEATURES, _ATTRIBUTE_NAMES, _SEMANTIC_KEYS
+    global _GROUPS, _CONFIG
     path = Path(os.environ.get("UPAR_CHECKPOINT", str(REPOSITORY_ROOT / "assets" / "model_best.pth")))
     device = choose_device(os.environ.get("UPAR_DEVICE", "auto"))
-    try:
-        payload = torch.load(path, map_location="cpu", weights_only=False)
-    except TypeError:
-        payload = torch.load(path, map_location="cpu")
+    if payload is None:
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+        except TypeError:
+            payload = torch.load(path, map_location="cpu")
     architecture = payload.get("architecture")
     architecture_patch_sizes = {
         "attrivision_jointfce_submission_vit_b_16": 16,
@@ -264,13 +266,25 @@ def load_model() -> None:
         raise ValueError("UPAR_JOINT_FUSION_ALPHA must be in [0,1]")
     print(
         f"[submission] JointFCE loaded on {device}; batch_size={_CONFIG['batch_size']}; "
-        f"scoring={_CONFIG['retrieval_scoring']}; alpha={_CONFIG['fusion_alpha']}", flush=True,
+        f"num_workers={_CONFIG['num_workers']}; scoring={_CONFIG['retrieval_scoring']}; "
+        f"alpha={_CONFIG['fusion_alpha']}", flush=True,
     )
 
 
-def _category_nll_distances(
-    queries: np.ndarray,
-    query_names: list[str],
+def _normalized_query_state_weights(query_states: np.ndarray) -> np.ndarray:
+    query_states = np.asarray(query_states, dtype=np.float32)
+    weights = np.zeros_like(query_states)
+    for indices in _GROUPS:
+        targets = query_states[:, indices]
+        counts = targets.sum(axis=1, keepdims=True)
+        if np.any(counts == 0):
+            raise ValueError("Every query category needs an active semantic state")
+        weights[:, indices] = targets / counts / len(_GROUPS)
+    return weights
+
+
+def _category_nll_distances_from_features(
+    query_weights: np.ndarray | torch.Tensor,
     global_gallery: torch.Tensor,
     local_gallery: torch.Tensor,
 ) -> np.ndarray:
@@ -278,7 +292,6 @@ def _category_nll_distances(
     temperature = float(_CONFIG["category_temperature"])
     if temperature <= 0:
         raise ValueError("UPAR_CATEGORY_TEMPERATURE must be positive")
-    query_states = _semantic_queries(queries, query_names, _ATTRIBUTE_NAMES, _SEMANTIC_KEYS)
     global_scores = (global_gallery @ _TEXT_FEATURES.T).float().cpu().numpy()
     local_scores = torch.einsum(
         "gcd,sd->gcs", local_gallery, _TEXT_FEATURES,
@@ -309,17 +322,33 @@ def _category_nll_distances(
     else:
         raise ValueError(f"Unknown JointFCE retrieval scoring: {scoring}")
     log_probabilities = np.log(np.clip(fused, 1e-12, 1.0))
-    distances = np.zeros((len(query_states), len(fused)), dtype=np.float32)
-    for indices in _GROUPS:
-        targets = query_states[:, indices]
-        counts = targets.sum(axis=1, keepdims=True)
-        if np.any(counts == 0):
-            raise ValueError("Every query category needs an active semantic state")
-        distances -= (targets / counts) @ log_probabilities[:, indices].T
-    distances /= len(_GROUPS)
+    device = global_gallery.device
+    if isinstance(query_weights, torch.Tensor):
+        query_weights_tensor = query_weights.to(device=device, dtype=torch.float32)
+    else:
+        query_weights_tensor = torch.as_tensor(
+            query_weights, dtype=torch.float32, device=device,
+        )
+    log_probabilities_tensor = torch.as_tensor(
+        log_probabilities, dtype=torch.float32, device=device,
+    )
+    distances_tensor = -query_weights_tensor @ log_probabilities_tensor.T
+    distances = distances_tensor.float().cpu().numpy()
     if not np.isfinite(distances).all():
         raise RuntimeError("JointFCE Category-NLL distances contain NaN or Inf")
     return distances
+
+
+def _category_nll_distances(
+    queries: np.ndarray,
+    query_names: list[str],
+    global_gallery: torch.Tensor,
+    local_gallery: torch.Tensor,
+) -> np.ndarray:
+    query_states = _semantic_queries(queries, query_names, _ATTRIBUTE_NAMES, _SEMANTIC_KEYS)
+    return _category_nll_distances_from_features(
+        _normalized_query_state_weights(query_states), global_gallery, local_gallery,
+    )
 
 
 @torch.inference_mode()
@@ -338,24 +367,34 @@ def rank_gallery(sample: dict[str, Any]) -> dict[str, np.ndarray]:
         num_workers=_CONFIG["num_workers"],
         pin_memory=_DEVICE.type == "cuda",
     )
-    global_chunks: list[torch.Tensor] = []
-    local_chunks: list[torch.Tensor] = []
+    queries = np.asarray(sample["queries"], dtype=np.float32)
+    query_states = _semantic_queries(
+        queries, list(sample["attribute_names"]), _ATTRIBUTE_NAMES, _SEMANTIC_KEYS,
+    )
+    query_weights = torch.as_tensor(
+        _normalized_query_state_weights(query_states), dtype=torch.float32, device=_DEVICE,
+    )
+    # Keep only the required query-by-gallery result on CPU. Moving all global
+    # and local features to CPU and then back to CUDA created several GB of
+    # avoidable traffic and temporary storage for full-gallery retrieval.
+    distances = np.empty((len(query_states), len(paths)), dtype=np.float32)
+    offset = 0
     started = time.perf_counter()
     for index, images in enumerate(loader, start=1):
         with autocast(_DEVICE, _CONFIG["amp"]):
             global_features, local_features = _MODEL.forward_features(
                 images.to(_DEVICE, non_blocking=True),
             )
-        global_chunks.append(global_features.float().cpu())
-        local_chunks.append(local_features.float().cpu())
+        end = offset + len(images)
+        distances[:, offset:end] = _category_nll_distances_from_features(
+            query_weights, global_features.float(), local_features.float(),
+        )
+        offset = end
+        del global_features, local_features
         if index % _CONFIG["progress_every"] == 0 or index == len(loader):
             print(f"[submission] JointFCE gallery batch {index}/{len(loader)}", flush=True)
-    global_gallery = torch.cat(global_chunks).to(_DEVICE)
-    local_gallery = torch.cat(local_chunks).to(_DEVICE)
-    queries = np.asarray(sample["queries"], dtype=np.float32)
-    distances = _category_nll_distances(
-        queries, list(sample["attribute_names"]), global_gallery, local_gallery,
-    )
+    if offset != len(paths):
+        raise RuntimeError(f"DataLoader returned {offset} images for a gallery of {len(paths)}")
     print(
         f"[submission] JointFCE retrieval complete in {time.perf_counter() - started:.1f}s; "
         f"distances={distances.shape}; alpha={_CONFIG['fusion_alpha']}", flush=True,
