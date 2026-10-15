@@ -61,7 +61,7 @@ def _add_training_overrides(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--swad", action=argparse.BooleanOptionalAction, default=None,
-        help="select E1-D checkpoints using post-burn-in uniform weight averaging",
+        help="select E1-B/E1-D checkpoints using post-burn-in uniform weight averaging",
     )
     parser.add_argument(
         "--swad-start-epoch", type=int,
@@ -143,8 +143,11 @@ def _run_train(argv: list[str], *, e1_d: bool = False) -> None:
         parser.add_argument("--stage", choices=("control", "local", "joint", "full"), required=True)
     _add_training_overrides(parser)
     args = parser.parse_args(argv)
-    if args.swad and not e1_d:
-        parser.error("--swad is currently supported for E1-D only; E1-A uses --dg-method swad")
+    swad_supported = e1_d or (
+        args.stage == "local" and args.consistency_variant == "B0"
+    )
+    if args.swad and not swad_supported:
+        parser.error("--swad is supported for E1-B and E1-D; E1-A uses --dg-method swad")
     if args.stage == "full" and args.init_checkpoint:
         parser.error("E1-D starts from OpenAI pretrained CLIP; omit --init-checkpoint and use --resume only to continue E1-D")
     if args.stage == "control":

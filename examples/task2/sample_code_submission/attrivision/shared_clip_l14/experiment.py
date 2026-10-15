@@ -823,8 +823,8 @@ def train_shared(
             raise ValueError("E1-B consistency experiments use the frozen local-decoder stage")
     else:
         raise ValueError(f"Unsupported E1 stage/init-source pair: {stage}/{init_source}")
-    if swad_enabled and experiment != "E1-D":
-        raise ValueError("SWAD-style averaging is currently supported for E1-D only")
+    if swad_enabled and experiment not in {"E1-B", "E1-D"}:
+        raise ValueError("SWAD-style averaging is currently supported for E1-B and E1-D")
 
     device = choose_device(config["device"])
     data_root = Path(config["data_root"]).resolve()

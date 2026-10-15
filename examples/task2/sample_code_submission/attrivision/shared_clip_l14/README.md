@@ -82,6 +82,24 @@ conda activate rws-upar-challenge && CUDA_VISIBLE_DEVICES=1 python examples/task
   --output-dir outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-B-GC128
 ```
 
+E1-B에 SWAD-style 균등 가중치 평균을 적용하려면 `--swad --swad-start-epoch 3`을
+추가한다. Holdout unseen 평가와 함께 실행하는 예시는 다음과 같다.
+
+```bash
+conda activate rws-upar-challenge && CUDA_VISIBLE_DEVICES=1 python examples/task2/sample_code_submission/attrivision/shared_clip_l14/run.py train \
+  --stage local --consistency-variant B0 \
+  --init-checkpoint outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-A-GC128/checkpoint_best.pth \
+  --config examples/task2/sample_code_submission/attrivision/configs/e1_shared_clip_l14.json \
+  --data-root data --device cuda:0 --batch-size 8 --grad-cache-steps 16 --eval-batch-size 32 \
+  --holdout-domain Market1501 \
+  --swad --swad-start-epoch 3 \
+  --output-dir outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-B-GC128-Unseen-Market1501-SWAD
+```
+
+`checkpoint_best.pth`는 validation 전체 mADM, `checkpoint_best_unseen_domain.pth`는
+holdout mADM 기준으로 고른다. SWAD 누적 상태는 `checkpoint_last.pth`에 저장되어
+resume 시 이어진다.
+
 기본 명령은 전체 학습 데이터를 사용한다. 기존 B/16에서 holdout 실험을 했다면
 같은 `--holdout-domain Market1501`(또는 `PA100k`, `PETA`)을 추가한다.
 동일한 holdout과 seed로 B1(`--consistency-variant B1`) 또는

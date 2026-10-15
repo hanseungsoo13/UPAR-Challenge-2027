@@ -96,12 +96,14 @@ CUDA_VISIBLE_DEVICES=6 python examples/task2/sample_code_submission/attrivision/
 첫 실행에서는 OpenAI CLIP pretrained weight를 다운로드하므로 인터넷 연결이
 필요하다. 이후에는 로컬 cache를 사용한다.
 
-### CLIP Large E1-A / E1-D + SWAD-style weight averaging
+### CLIP Large E1-A / E1-B / E1-D + SWAD-style weight averaging
 
-E1-A와 E1-D는 epoch 3 이후의 모델 가중치를 균등 평균해 validation mADM으로
-checkpoint를 선택할 수 있다. 이는 post-burn-in uniform averaging 방식의
-SWAD-style 설정이다. Gradient Cache의 `batch-size 16 × grad-cache-steps 8`은
-effective contrastive batch size 128을 유지한다.
+E1-A, E1-B, E1-D는 epoch 3 이후의 학습 가중치를 균등 평균해 validation mADM으로
+checkpoint를 선택할 수 있다. E1-B에서는 고정된 CLIP tower가 아니라 학습 중인
+AttriQuery/local head 가중치를 평균한다. 이는 post-burn-in uniform averaging
+방식의 SWAD-style 설정이다. Gradient Cache의 `batch-size 16 × grad-cache-steps 8`은
+effective contrastive batch size 128을 유지한다. E1-B 명령은
+`shared_clip_l14/README.md`의 unseen 예제를 참고한다.
 
 E1-A는 기존 A7 runner에 `--dg-method swad`를 지정한다.
 
