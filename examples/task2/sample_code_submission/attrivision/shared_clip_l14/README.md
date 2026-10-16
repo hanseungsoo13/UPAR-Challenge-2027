@@ -106,6 +106,18 @@ resume 시 이어진다.
 B2(`--consistency-variant B2`)를 실행할 수도 있다. 각 variant는
 `outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-B1-GC128` /
 `outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-B2-GC128`처럼 별도 출력 폴더를 쓴다.
+SWAD-style averaging은 B0/B1/B2의 frozen local-decoder 학습 모두에서 사용할 수 있다.
+예를 들어 B2를 4 epoch 학습하고 첫 epoch부터 평균하려면 다음처럼 실행한다.
+
+```bash
+conda activate rws-upar-challenge && CUDA_VISIBLE_DEVICES=1 python examples/task2/sample_code_submission/attrivision/shared_clip_l14/run.py train \
+  --stage local --consistency-variant B2 \
+  --init-checkpoint outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-A-GC128-SWAD-1/checkpoint_epoch_004.pth \
+  --config examples/task2/sample_code_submission/attrivision/configs/e1_shared_clip_l14.json \
+  --data-root data --device cuda:0 --batch-size 8 --grad-cache-steps 16 --eval-batch-size 32 \
+  --epochs 4 --swad --swad-start-epoch 1 \
+  --output-dir outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-B2-GC128-SWAD-A4epoch
+```
 
 ## E1-C — shared vision과 local head 공동 fine-tuning
 
@@ -126,6 +138,33 @@ conda activate rws-upar-challenge && CUDA_VISIBLE_DEVICES=1 python examples/task
 추가하면 E1-B의 고정 global image feature를 teacher로 사용하는 anchor
 loss가 적용된다. 이 경우 별도 출력 폴더를 지정한다. B/C는 global-only,
 local-only, alpha=0.5 fusion을 모두 평가하고 fused mADM으로 최적 모델을 고른다.
+
+## Pretrained CLIP에서 B2 → joint fine-tuning
+
+E1-A 체크포인트 없이 OpenAI pretrained CLIP에서 frozen local-query B2를 시작할
+수 있다. 이 경로는 `E1-0-B2`로 기록한다. 이어 joint 단계는 그 local checkpoint를
+초기값으로 읽고 vision tower와 decoder를 학습한다. joint 단계의 loss는
+`global FCE + 0.25 × local FCE`이며 B2 consistency loss는 local B2 단계에서만
+사용한다. 따라서 joint 실험명은 `E1-0-B2-C`다.
+
+```bash
+conda activate rws-upar-challenge && CUDA_VISIBLE_DEVICES=1 python examples/task2/sample_code_submission/attrivision/shared_clip_l14/run.py train \
+  --stage control --consistency-variant B2 \
+  --config examples/task2/sample_code_submission/attrivision/configs/e1_shared_clip_l14.json \
+  --data-root data --device cuda:0 --batch-size 8 --grad-cache-steps 16 --eval-batch-size 32 \
+  --output-dir outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-0-B2-GC128
+
+CUDA_VISIBLE_DEVICES=1 python examples/task2/sample_code_submission/attrivision/shared_clip_l14/run.py train \
+  --stage joint --joint-init-experiment E1-0-B2 \
+  --init-checkpoint outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-0-B2-GC128/checkpoint_best.pth \
+  --config examples/task2/sample_code_submission/attrivision/configs/e1_shared_clip_l14.json \
+  --data-root data --device cuda:0 --batch-size 8 --grad-cache-steps 16 --eval-batch-size 32 \
+  --output-dir outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-0-B2-C-GC128
+```
+
+`--consistency-variant B0`과 `--stage control`을 사용하면 pretrained CLIP →
+E1-0 → E1-0-C 순서로 같은 절차를 실행한다. SWAD가 필요하면 첫 단계에만
+`--swad --swad-start-epoch 3`을 추가한다.
 
 ## E1-D — CLIP과 cross-attention AttriQuery 전체 joint 학습
 

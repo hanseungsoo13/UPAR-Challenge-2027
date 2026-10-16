@@ -385,34 +385,39 @@ def _attrivision_a7_l14_submission_checkpoint(
 
 def _shared_e1_l14_submission_checkpoint(
     checkpoint: Path,
+    expected_experiment: str | None = None,
 ) -> tuple[bytes, dict[str, Any]]:
-    """Convert the full-joint CLIP L/14 E1-D checkpoint to a portable payload."""
+    """Convert shared CLIP L/14 E1-B/E1-B2/E1-D checkpoints to a portable payload."""
     from attrivision.datasets.attribute_prompts import CategoryPromptMapper
     from attrivision.models.attrivision import AttriVision
 
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     if payload.get("architecture") != "attrivision_attrquery_shared_openclip_vit_l_14":
-        raise ValueError("E1-D packaging requires a shared CLIP ViT-L/14 checkpoint")
-    if payload.get("experiment") != "E1-D" or payload.get("model_stage") != "full":
-        raise ValueError("L/14 E1-D submission packaging requires the E1-D full-stage checkpoint")
+        raise ValueError("E1-B/E1-D packaging requires a shared CLIP ViT-L/14 checkpoint")
+    experiment = payload.get("experiment")
+    expected_stage = {"E1-B": "local", "E1-B2": "local", "E1-D": "full"}
+    if experiment not in expected_stage or payload.get("model_stage") != expected_stage[experiment]:
+        raise ValueError("L/14 submission packaging supports E1-B/E1-B2 local-stage or E1-D full-stage checkpoints")
+    if expected_experiment is not None and experiment != expected_experiment:
+        raise ValueError(f"Expected {expected_experiment}, found {experiment!r}")
     if payload.get("model_name") != "ViT-L-14":
-        raise ValueError("E1-D submission packaging requires OpenAI CLIP ViT-L/14")
+        raise ValueError("E1-B/E1-D submission packaging requires OpenAI CLIP ViT-L/14")
     if int(payload.get("epoch", 0)) < 1:
-        raise ValueError("E1-D submission packaging rejects an untrained checkpoint")
+        raise ValueError("E1-B/E1-D submission packaging rejects an untrained checkpoint")
 
     attributes = list(payload["attribute_names"])
     mapper = CategoryPromptMapper(attributes)
     if list(payload.get("state_keys", [])) != list(mapper.keys):
-        raise ValueError("L/14 E1-D semantic state order differs from the submission mapper")
+        raise ValueError("L/14 shared E1 semantic state order differs from the submission mapper")
     if list(payload.get("state_prompt_texts", [])) != list(mapper.prompts):
-        raise ValueError("L/14 E1-D prompt order differs from the submission mapper")
+        raise ValueError("L/14 shared E1 prompt order differs from the submission mapper")
     expected_groups = [list(group) for group in mapper.category_indices()]
     if payload.get("category_groups") != expected_groups:
-        raise ValueError("L/14 E1-D category partition differs from the Native52 mapper")
+        raise ValueError("L/14 shared E1 category partition differs from the Native52 mapper")
 
     state = payload.get("model_state_dict")
     if not isinstance(state, dict):
-        raise ValueError("L/14 E1-D checkpoint has no model_state_dict")
+        raise ValueError("L/14 shared E1 checkpoint has no model_state_dict")
     base_state = {
         key.removeprefix("base."): value.detach().cpu()
         for key, value in state.items()
@@ -429,13 +434,13 @@ def _shared_e1_l14_submission_checkpoint(
         if key.startswith("local_head.")
     }
     if not visual_state or not local_state:
-        raise ValueError("L/14 E1-D checkpoint lacks visual or local-head weights")
+        raise ValueError("L/14 shared E1 checkpoint lacks visual or local-head weights")
 
     base = AttriVision(pretrained=None, model_name=payload["model_name"])
     missing, unexpected = base.load_state_dict(base_state, strict=True)
     if missing or unexpected:
         raise ValueError(
-            f"E1-D CLIP L/14 checkpoint mismatch: missing={missing}, unexpected={unexpected}"
+            f"{experiment} CLIP L/14 checkpoint mismatch: missing={missing}, unexpected={unexpected}"
         )
     base.eval()
     with torch.inference_mode():
@@ -445,7 +450,7 @@ def _shared_e1_l14_submission_checkpoint(
     category_temperature = float(training_config.get("category_temperature", 0.01))
     fusion_alpha = float(training_config.get("selection_alpha", 0.5))
     if category_temperature <= 0 or abs(fusion_alpha - 0.5) > 1e-9:
-        raise ValueError("L/14 E1-D submission requires category temperature > 0 and fusion alpha 0.5")
+        raise ValueError("L/14 shared E1 submission requires category temperature > 0 and fusion alpha 0.5")
     converted = {
         "format_version": 1,
         "architecture": "attrivision_jointfce_submission_vit_l_14",
@@ -476,13 +481,13 @@ def _shared_e1_l14_submission_checkpoint(
         "epoch": payload.get("epoch"),
         "metrics": payload.get("metrics", {}),
         "source_architecture": payload.get("architecture"),
-        "source_experiment": "E1-D",
+        "source_experiment": experiment,
     }
     stream = BytesIO()
     torch.save(converted, stream)
     metadata = {
         "epoch": payload.get("epoch"),
-        "model_kind": "attrivision_e1_d_shared_clip_l14",
+        "model_kind": f"attrivision_{experiment.lower().replace('-', '_')}_shared_clip_l14",
         "metrics": payload.get("metrics", {}),
         "architecture": payload.get("architecture"),
         "packaged_architecture": converted["architecture"],
@@ -507,12 +512,17 @@ def submission_checkpoint(
         if architecture != "attrivision_openclip_vit_l_14":
             raise ValueError("The E1-A L/14 preset requires an AttriVision ViT-L/14 checkpoint")
         return _attrivision_a7_l14_submission_checkpoint(checkpoint)
-    if model == "attrivision_e1_d" or architecture == "attrivision_attrquery_shared_openclip_vit_l_14":
-        if model not in {"auto", "attrivision_e1_d"}:
-            raise ValueError("The selected model preset does not accept a shared CLIP L/14 E1-D checkpoint")
+    if model in {"attrivision_e1_b_l14", "attrivision_e1_b2_l14", "attrivision_e1_d"} or architecture == "attrivision_attrquery_shared_openclip_vit_l_14":
+        if model not in {"auto", "attrivision_e1_b_l14", "attrivision_e1_b2_l14", "attrivision_e1_d"}:
+            raise ValueError("The selected model preset does not accept a shared CLIP L/14 E1-B/E1-B2/E1-D checkpoint")
         if architecture != "attrivision_attrquery_shared_openclip_vit_l_14":
-            raise ValueError("The E1-D preset requires a shared CLIP ViT-L/14 checkpoint")
-        return _shared_e1_l14_submission_checkpoint(checkpoint)
+            raise ValueError("The selected E1 L/14 preset requires a shared CLIP ViT-L/14 checkpoint")
+        expected_experiment = {
+            "attrivision_e1_b_l14": "E1-B",
+            "attrivision_e1_b2_l14": "E1-B2",
+            "attrivision_e1_d": "E1-D",
+        }.get(model)
+        return _shared_e1_l14_submission_checkpoint(checkpoint, expected_experiment)
     if model in {"attrivision_e1_b", "attrivision_e1_b1", "attrivision_e1_b2", "attrivision_e1_c"} or architecture == "attrivision_attrquery_shared_openclip_vit_b_16":
         if model not in {"auto", "attrivision_e1_b", "attrivision_e1_b1", "attrivision_e1_b2", "attrivision_e1_c"}:
             raise ValueError("The selected model preset does not accept a shared E1 checkpoint")
@@ -738,7 +748,7 @@ def main() -> None:
         help="output zip path (default: submissions/upar_task2_YYYYMMDD_HHMMSS.zip)",
     )
     parser.add_argument(
-        "--model", choices=("auto", "convnext", "attrivision_a7", "attrivision_e1_a_l14", "attrivision_e1_b", "attrivision_e1_b1", "attrivision_e1_b2", "attrivision_e1_c", "attrivision_e1_d", "attrquery_jointfce"), default="auto",
+        "--model", choices=("auto", "convnext", "attrivision_a7", "attrivision_e1_a_l14", "attrivision_e1_b", "attrivision_e1_b1", "attrivision_e1_b2", "attrivision_e1_c", "attrivision_e1_b_l14", "attrivision_e1_b2_l14", "attrivision_e1_d", "attrquery_jointfce"), default="auto",
         help="submission preset; auto preserves the checkpoint's architecture",
     )
     parser.add_argument(

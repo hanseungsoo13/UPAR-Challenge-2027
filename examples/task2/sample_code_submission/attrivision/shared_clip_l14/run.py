@@ -18,6 +18,11 @@ from attrivision.cli import build_parser as build_a7_parser  # noqa: E402
 from attrivision.datasets.attribute_prompts import ATTRIBUTE_PROMPTS, CategoryPromptMapper  # noqa: E402
 from attrivision.models.attrivision import AttriVision  # noqa: E402
 from attrivision.shared_clip_l14.experiment import (  # noqa: E402
+    A7_LOCAL_EXPERIMENTS,
+    JOINT_EXPERIMENTS,
+    JOINT_EXPERIMENTS_BY_PARENT,
+    LOCAL_EXPERIMENTS,
+    PRETRAINED_LOCAL_EXPERIMENTS,
     _checkpoint_payload,
     atomic_json,
     evaluate_checkpoint,
@@ -61,7 +66,7 @@ def _add_training_overrides(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--swad", action=argparse.BooleanOptionalAction, default=None,
-        help="select E1-B/E1-D checkpoints using post-burn-in uniform weight averaging",
+        help="select local-decoder/E1-D checkpoints using post-burn-in uniform weight averaging",
     )
     parser.add_argument(
         "--swad-start-epoch", type=int,
@@ -76,9 +81,14 @@ def _add_training_overrides(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--local-loss-weight", type=float)
     parser.add_argument(
         "--clip-feature-anchor-weight", type=float,
-        help="cosine anchor strength to frozen E1-B CLIP image embeddings (E1-C only)",
+        help="cosine anchor strength to the selected frozen local checkpoint (joint stage only)",
     )
     parser.add_argument("--consistency-variant", choices=("B0", "B1", "B2"), default="B0")
+    parser.add_argument(
+        "--joint-init-experiment", choices=tuple(JOINT_EXPERIMENTS_BY_PARENT),
+        default="E1-B",
+        help="local checkpoint experiment to continue from with --stage joint",
+    )
     parser.add_argument(
         "--holdout-domain", "--unseen-domain", dest="holdout_domain",
         help="exclude this training domain and report its validation retrieval separately",
@@ -143,40 +153,38 @@ def _run_train(argv: list[str], *, e1_d: bool = False) -> None:
         parser.add_argument("--stage", choices=("control", "local", "joint", "full"), required=True)
     _add_training_overrides(parser)
     args = parser.parse_args(argv)
-    swad_supported = e1_d or (
-        args.stage == "local" and args.consistency_variant == "B0"
-    )
+    swad_supported = e1_d or args.stage in {"control", "local", "full"}
     if args.swad and not swad_supported:
-        parser.error("--swad is supported for E1-B and E1-D; E1-A uses --dg-method swad")
+        parser.error("--swad is supported for frozen local-decoder stages and E1-D; E1-A uses --dg-method swad")
     if args.stage == "full" and args.init_checkpoint:
         parser.error("E1-D starts from OpenAI pretrained CLIP; omit --init-checkpoint and use --resume only to continue E1-D")
     if args.stage == "control":
-        if args.consistency_variant != "B0":
-            parser.error("Consistency variants apply only to --stage local")
         if args.holdout_domain:
             parser.error("--holdout-domain is supported for E1-B, E1-C, and E1-D")
-        stage, init_source, experiment = "local", "pretrained", "E1-0"
+        stage, init_source = "local", "pretrained"
+        experiment = PRETRAINED_LOCAL_EXPERIMENTS[args.consistency_variant]
     elif args.stage == "local":
         if not args.init_checkpoint:
             parser.error("--stage local requires --init-checkpoint with the E1-A best checkpoint")
         stage, init_source = "local", "a7"
-        experiment = {"B0": "E1-B", "B1": "E1-B1", "B2": "E1-B2"}[
-            args.consistency_variant
-        ]
+        experiment = A7_LOCAL_EXPERIMENTS[args.consistency_variant]
     elif args.stage == "joint":
         if args.consistency_variant != "B0":
             parser.error("Consistency variants apply only to --stage local")
         if not args.init_checkpoint:
-            parser.error("--stage joint requires --init-checkpoint with the E1-B best checkpoint")
-        stage, init_source, experiment = "joint", "shared", "E1-C"
+            parser.error("--stage joint requires --init-checkpoint with the selected local-decoder best checkpoint")
+        stage, init_source = "joint", "shared"
+        experiment = JOINT_EXPERIMENTS_BY_PARENT[args.joint_init_experiment]
     else:
         if args.consistency_variant != "B0":
             parser.error("Consistency variants apply only to --stage local")
         stage, init_source, experiment = "full", "pretrained", "E1-D"
     if args.resume and args.stage == "joint" and args.init_checkpoint is None:
-        parser.error("--resume for E1-C requires the same --init-checkpoint as the original run")
+        parser.error("--resume for joint training requires the same --init-checkpoint as the original run")
     args.experiment_name = experiment
     config = _training_config(args)
+    if args.stage == "joint":
+        config["joint_init_experiment"] = args.joint_init_experiment
     best = train_shared(
         stage=stage,
         init_source=init_source,
@@ -198,7 +206,7 @@ def _run_train(argv: list[str], *, e1_d: bool = False) -> None:
     )
     print(f"Best checkpoint: {best}", flush=True)
     print(f"Validation result: {Path(config['output_dir']) / 'evaluation_val.json'}", flush=True)
-    if experiment in {"E1-B", "E1-B1", "E1-B2"}:
+    if experiment in LOCAL_EXPERIMENTS:
         validation = result["official_validation"]
         stability = result["attribute_query_stability"]
         print(
@@ -208,7 +216,7 @@ def _run_train(argv: list[str], *, e1_d: bool = False) -> None:
             f"attention stability={stability['attention_cosine_mean']:.6f}",
             flush=True,
         )
-    if experiment in {"E1-B", "E1-B1", "E1-B2", "E1-C", "E1-D"}:
+    if experiment in LOCAL_EXPERIMENTS | JOINT_EXPERIMENTS | {"E1-D"}:
         domain_result = result["domain_retrieval"]
         if domain_result.get("holdout"):
             holdout = domain_result["holdout"]
@@ -218,8 +226,8 @@ def _run_train(argv: list[str], *, e1_d: bool = False) -> None:
                 f"mAP={holdout['mAP']:.6f}",
                 flush=True,
             )
-    if experiment == "E1-C":
-        print("E1-C evaluation includes global-only, local-only, and alpha=0.5 fusion.", flush=True)
+    if experiment in JOINT_EXPERIMENTS:
+        print(f"{experiment} evaluation includes global-only, local-only, and alpha=0.5 fusion.", flush=True)
     if experiment == "E1-D":
         print("E1-D evaluation includes global-only, local-only, and alpha=0.5 fusion.", flush=True)
     if experiment == "E1-E":
@@ -267,7 +275,11 @@ def _run_eval(argv: list[str]) -> None:
         description="Evaluate an E1 checkpoint on the UPAR validation split",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--experiment", choices=("E1-A", "E1-0", "E1-B", "E1-B1", "E1-B2", "E1-C", "E1-D", "E1-E"), required=True)
+    parser.add_argument(
+        "--experiment",
+        choices=("E1-A", *sorted(LOCAL_EXPERIMENTS), *sorted(JOINT_EXPERIMENTS), "E1-D", "E1-E"),
+        required=True,
+    )
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--data-root", default="data")
     parser.add_argument("--output")

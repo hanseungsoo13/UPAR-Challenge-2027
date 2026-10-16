@@ -44,6 +44,26 @@ from upar.retrieval import autocast, official_retrieval_metrics
 from .model import ARCHITECTURE, MODEL_ID, MODEL_NAME, SharedCLIPL14AttrQuery
 
 
+A7_LOCAL_EXPERIMENTS = {"B0": "E1-B", "B1": "E1-B1", "B2": "E1-B2"}
+PRETRAINED_LOCAL_EXPERIMENTS = {
+    "B0": "E1-0",
+    "B1": "E1-0-B1",
+    "B2": "E1-0-B2",
+}
+LOCAL_EXPERIMENTS = frozenset(
+    {*A7_LOCAL_EXPERIMENTS.values(), *PRETRAINED_LOCAL_EXPERIMENTS.values()}
+)
+JOINT_EXPERIMENTS_BY_PARENT = {
+    "E1-B": "E1-C",
+    "E1-B1": "E1-B1-C",
+    "E1-B2": "E1-B2-C",
+    "E1-0": "E1-0-C",
+    "E1-0-B1": "E1-0-B1-C",
+    "E1-0-B2": "E1-0-B2-C",
+}
+JOINT_EXPERIMENTS = frozenset(JOINT_EXPERIMENTS_BY_PARENT.values())
+
+
 def _json_default(value: Any) -> Any:
     if isinstance(value, np.generic):
         return value.item()
@@ -185,7 +205,7 @@ def _new_model(
         base = AttriVision(pretrained=None, model_name=MODEL_NAME)
     elif init_source == "pretrained":
         if stage not in {"local", "full"}:
-            raise ValueError("Direct pretrained initialization is valid for E1-0/local or full joint training")
+            raise ValueError("Direct pretrained initialization is valid for frozen local or full joint training")
         base = AttriVision(
             pretrained=str(config.get("pretrained_tag", "openai")),
             model_name=MODEL_NAME,
@@ -209,14 +229,19 @@ def _new_model(
         _load_a7_base(base, init_checkpoint, attributes)
     elif init_source == "shared":
         if not init_checkpoint:
-            raise ValueError("Shared initialization requires --init-checkpoint pointing to E1-B best")
+            raise ValueError("Shared initialization requires --init-checkpoint pointing to a local-decoder checkpoint")
         prior_payload = _load_payload(init_checkpoint, map_location="cpu")
         if prior_payload.get("architecture") != ARCHITECTURE or prior_payload.get("model_name") != MODEL_NAME:
             raise ValueError("Shared initialization is not a shared CLIP ViT-L/14 checkpoint")
-        if prior_payload.get("model_stage") != "local" or prior_payload.get("experiment") != "E1-B":
-            raise ValueError("Shared initialization must use an E1-B local-decoder checkpoint")
+        expected_parent = str(config.get("joint_init_experiment", "E1-B"))
+        if (prior_payload.get("model_stage") != "local"
+                or prior_payload.get("experiment") != expected_parent):
+            raise ValueError(
+                "Shared initialization must use the requested local-decoder checkpoint "
+                f"({expected_parent})"
+            )
         if list(prior_payload.get("attribute_names", [])) != list(attributes):
-            raise ValueError("E1-B checkpoint attribute order differs from the dataset")
+            raise ValueError("Local-decoder checkpoint attribute order differs from the dataset")
         model.load_state_dict(prior_payload["model_state_dict"], strict=True)
     elif init_source == "pretrained":
         # The CLIP towers were loaded above; the local decoder keeps its fresh
@@ -790,7 +815,7 @@ def train_shared(
     if not math.isfinite(clip_feature_anchor_weight) or clip_feature_anchor_weight < 0.0:
         raise ValueError("clip_feature_anchor_weight must be finite and non-negative")
     if clip_feature_anchor_weight > 0.0 and stage != "joint":
-        raise ValueError("CLIP feature anchoring is only supported for E1-C joint training")
+        raise ValueError("CLIP feature anchoring is only supported for joint training")
     if consistency_variant == "B0" and (feature_weight != 0.0 or attention_weight != 0.0):
         raise ValueError("B0 is the FCE-only baseline and requires zero consistency weights")
     if consistency_variant == "B1" and (feature_weight <= 0.0 or attention_weight != 0.0):
@@ -800,9 +825,15 @@ def train_shared(
     if stage == "joint":
         if consistency_variant != "B0":
             raise ValueError("Consistency variants are only supported for frozen local-query training")
-        experiment = "E1-C"
+        joint_init_experiment = str(config.get("joint_init_experiment", "E1-B"))
+        try:
+            experiment = JOINT_EXPERIMENTS_BY_PARENT[joint_init_experiment]
+        except KeyError as error:
+            raise ValueError(
+                f"Unsupported local checkpoint for joint fine-tuning: {joint_init_experiment!r}"
+            ) from error
         if init_source != "shared":
-            raise ValueError("E1-C requires --init-source shared and an E1-B checkpoint")
+            raise ValueError("Joint fine-tuning requires --init-source shared and a local checkpoint")
     elif stage == "full":
         if consistency_variant != "B0":
             raise ValueError("Consistency variants are only supported for frozen local-query training")
@@ -810,21 +841,19 @@ def train_shared(
             raise ValueError("E1-D requires direct OpenAI pretrained CLIP initialization with a fresh AttriQuery decoder")
         experiment = "E1-D"
     elif init_source == "pretrained":
-        if consistency_variant != "B0":
-            raise ValueError("Consistency variants require initialization from the E1-A checkpoint")
-        experiment = "E1-0"
+        experiment = PRETRAINED_LOCAL_EXPERIMENTS[consistency_variant]
         if stage != "local":
-            raise ValueError("E1-0 uses the frozen local-decoder stage")
+            raise ValueError("Pretrained-local variants use the frozen local-decoder stage")
     elif init_source == "a7":
-        experiment = {"B0": "E1-B", "B1": "E1-B1", "B2": "E1-B2"}[
-            consistency_variant
-        ]
+        experiment = A7_LOCAL_EXPERIMENTS[consistency_variant]
         if stage != "local":
             raise ValueError("E1-B consistency experiments use the frozen local-decoder stage")
     else:
         raise ValueError(f"Unsupported E1 stage/init-source pair: {stage}/{init_source}")
-    if swad_enabled and experiment not in {"E1-B", "E1-D"}:
-        raise ValueError("SWAD-style averaging is currently supported for E1-B and E1-D")
+    if swad_enabled and experiment not in LOCAL_EXPERIMENTS | {"E1-D"}:
+        raise ValueError(
+            "SWAD-style averaging is supported for frozen local-decoder stages and E1-D"
+        )
 
     device = choose_device(config["device"])
     data_root = Path(config["data_root"]).resolve()
@@ -918,6 +947,7 @@ def train_shared(
             ("feature_consistency_weight", 0.0),
             ("attention_consistency_weight", 0.0),
             ("clip_feature_anchor_weight", 0.0),
+            ("joint_init_experiment", "E1-B"),
             ("holdout_domain", None),
             ("grad_cache_steps", 1),
             ("swad", False),
@@ -940,10 +970,15 @@ def train_shared(
     anchor_model: SharedCLIPL14AttrQuery | None = None
     if clip_feature_anchor_weight > 0.0:
         if not init_checkpoint or init_source != "shared":
-            raise ValueError("E1-C feature anchoring requires the E1-B --init-checkpoint")
+            raise ValueError("Joint feature anchoring requires the local --init-checkpoint")
         anchor_model, anchor_payload = _load_shared_model(init_checkpoint, device)
-        if anchor_payload.get("experiment") != "E1-B" or anchor_payload.get("model_stage") != "local":
-            raise ValueError("The feature-anchor teacher must be the E1-B frozen-encoder checkpoint")
+        expected_parent = str(config.get("joint_init_experiment", "E1-B"))
+        if (anchor_payload.get("experiment") != expected_parent
+                or anchor_payload.get("model_stage") != "local"):
+            raise ValueError(
+                "The feature-anchor teacher must match the selected frozen local checkpoint "
+                f"({expected_parent})"
+            )
         anchor_model.eval()
         for parameter in anchor_model.parameters():
             parameter.requires_grad_(False)
@@ -1267,12 +1302,12 @@ def evaluate_checkpoint(
             "model_stage": payload["model_stage"],
             "vision_encoder_instances": 1,
         }
-        if experiment in {"E1-B", "E1-B1", "E1-B2", "E1-C", "E1-D"}:
+        if experiment in LOCAL_EXPERIMENTS | JOINT_EXPERIMENTS | {"E1-D"}:
             holdout_domain = payload.get("training_config", {}).get("holdout_domain")
             result["domain_retrieval"] = _domain_retrieval_report(
                 details, str(holdout_domain) if holdout_domain else None,
             )
-        if experiment in {"E1-B", "E1-B1", "E1-B2"}:
+        if experiment in LOCAL_EXPERIMENTS:
             holdout_domain = payload.get("training_config", {}).get("holdout_domain")
             fused = next(
                 row for row in rows
