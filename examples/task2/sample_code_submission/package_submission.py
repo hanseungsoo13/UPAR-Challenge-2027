@@ -387,7 +387,7 @@ def _shared_e1_l14_submission_checkpoint(
     checkpoint: Path,
     expected_experiment: str | None = None,
 ) -> tuple[bytes, dict[str, Any]]:
-    """Convert shared CLIP L/14 E1-B/E1-B2/E1-D checkpoints to a portable payload."""
+    """Convert shared CLIP L/14 E1 joint/local checkpoints to a portable payload."""
     from attrivision.datasets.attribute_prompts import CategoryPromptMapper
     from attrivision.models.attrivision import AttriVision
 
@@ -395,9 +395,17 @@ def _shared_e1_l14_submission_checkpoint(
     if payload.get("architecture") != "attrivision_attrquery_shared_openclip_vit_l_14":
         raise ValueError("E1-B/E1-D packaging requires a shared CLIP ViT-L/14 checkpoint")
     experiment = payload.get("experiment")
-    expected_stage = {"E1-B": "local", "E1-B2": "local", "E1-D": "full"}
+    expected_stage = {
+        "E1-B": "local",
+        "E1-B2": "local",
+        "E1-0-C": "joint",
+        "E1-D": "full",
+    }
     if experiment not in expected_stage or payload.get("model_stage") != expected_stage[experiment]:
-        raise ValueError("L/14 submission packaging supports E1-B/E1-B2 local-stage or E1-D full-stage checkpoints")
+        raise ValueError(
+            "L/14 submission packaging supports E1-B/E1-B2 local-stage, "
+            "E1-0-C joint-stage, or E1-D full-stage checkpoints"
+        )
     if expected_experiment is not None and experiment != expected_experiment:
         raise ValueError(f"Expected {expected_experiment}, found {experiment!r}")
     if payload.get("model_name") != "ViT-L-14":

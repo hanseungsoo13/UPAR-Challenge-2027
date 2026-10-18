@@ -98,6 +98,7 @@ def _add_training_overrides(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-train-samples", type=int)
     parser.add_argument("--max-val-samples", type=int)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--hard-augmentation", action="store_true")
 
 
 def _training_config(args: argparse.Namespace) -> dict[str, Any]:
@@ -108,7 +109,7 @@ def _training_config(args: argparse.Namespace) -> dict[str, Any]:
         "swad", "swad_start_epoch",
         "vision_learning_rate", "text_learning_rate", "global_loss_weight", "local_loss_weight",
         "clip_feature_anchor_weight",
-        "max_train_samples", "max_val_samples", "amp",
+        "max_train_samples", "max_val_samples", "amp", "hard_augmentation",
     ):
         value = getattr(args, key, None)
         if value is not None:

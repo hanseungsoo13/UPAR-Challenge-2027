@@ -360,7 +360,8 @@ def _make_loaders(config: dict[str, Any], model: Any, table: Any,
     gt_path = find_annotation_file(data_root, "train")
     dataset = AttriVisionDataset(
         table, [data_root, gt_path.parent, REPOSITORY_ROOT],
-        build_train_transform(config["image_size"], config["rotation"], config["augmentation"]),
+        build_train_transform(config["image_size"], config["rotation"], config["augmentation"],
+                              hard_augmentation=config.get("hard_augmentation", False)),
         config.get("max_train_samples"),
     )
     loader = DataLoader(
@@ -613,6 +614,7 @@ def _base_config(args: argparse.Namespace) -> dict[str, Any]:
         "image_size": 224,
         "rotation": 10.0,
         "augmentation": "resize_pad_crop",
+        "hard_augmentation": args.hard_augmentation,
         "learning_rate": 1.0e-5,
         "calibration_learning_rate": 1.0e-2,
         "weight_decay": 0.01,
@@ -888,6 +890,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-batch-size", type=int, default=128)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--hard-augmentation", action="store_true")
     parser.add_argument("--max-train-samples", type=int)
     parser.add_argument("--max-val-samples", type=int)
     return parser

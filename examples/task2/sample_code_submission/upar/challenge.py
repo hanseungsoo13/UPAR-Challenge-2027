@@ -32,7 +32,17 @@ def load_model() -> None:
     requested_device = os.environ.get("UPAR_DEVICE", "auto")
     device = choose_device(requested_device)
     checkpoint_path = os.environ.get("UPAR_CHECKPOINT", str(DEFAULT_CHECKPOINT))
+    print(
+        f"[submission] load_model entered; requested_device={requested_device}; "
+        f"resolved_device={device}",
+        flush=True,
+    )
+    print("[submission] reading checkpoint payload on CPU", flush=True)
     preview = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    print(
+        f"[submission] checkpoint payload ready; architecture={preview.get('architecture')}",
+        flush=True,
+    )
     if preview.get("architecture") in {
         "attrivision_submission_vit_b_16",
         "attrivision_submission_vit_b_32",

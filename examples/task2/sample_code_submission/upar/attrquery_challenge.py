@@ -211,14 +211,21 @@ _CONFIG: dict[str, Any] = {}
 def load_model(payload: dict[str, Any] | None = None) -> None:
     global _MODEL, _DEVICE, _TEXT_FEATURES, _ATTRIBUTE_NAMES, _SEMANTIC_KEYS
     global _GROUPS, _CONFIG
+    started = time.perf_counter()
+    print("[submission] JointFCE load_model entered", flush=True)
     path = Path(os.environ.get("UPAR_CHECKPOINT", str(REPOSITORY_ROOT / "assets" / "model_best.pth")))
     device = choose_device(os.environ.get("UPAR_DEVICE", "auto"))
     if payload is None:
+        print("[submission] JointFCE reading packaged checkpoint on CPU", flush=True)
         try:
             payload = torch.load(path, map_location="cpu", weights_only=False)
         except TypeError:
             payload = torch.load(path, map_location="cpu")
     architecture = payload.get("architecture")
+    print(
+        f"[submission] JointFCE checkpoint ready; architecture={architecture}; device={device}",
+        flush=True,
+    )
     architecture_patch_sizes = {
         "attrivision_jointfce_submission_vit_b_16": 16,
         "attrivision_jointfce_submission_vit_b_32": 32,
@@ -231,6 +238,7 @@ def load_model(payload: dict[str, Any] | None = None) -> None:
         raise ValueError("Packaged JointFCE architecture and patch size do not match")
     visual_state = payload["visual_state_dict"]
     local_state = payload["local_head_state_dict"]
+    print("[submission] JointFCE building model", flush=True)
     model = JointFCEModel(
         bool(payload.get("quick_gelu", False)), visual_state, local_state,
         int(payload["visual_dim"]), int(payload["text_dim"]),
@@ -239,6 +247,7 @@ def load_model(payload: dict[str, Any] | None = None) -> None:
         int(payload.get("visual_layers", 12)),
         int(payload.get("visual_heads", 12)),
     )
+    print(f"[submission] JointFCE moving model to {device}", flush=True)
     _MODEL, _DEVICE = model.to(device).eval(), device
     _TEXT_FEATURES = F.normalize(payload["text_features"].float(), dim=-1).to(device)
     _ATTRIBUTE_NAMES = list(payload["attribute_names"])
@@ -267,7 +276,8 @@ def load_model(payload: dict[str, Any] | None = None) -> None:
     print(
         f"[submission] JointFCE loaded on {device}; batch_size={_CONFIG['batch_size']}; "
         f"num_workers={_CONFIG['num_workers']}; scoring={_CONFIG['retrieval_scoring']}; "
-        f"alpha={_CONFIG['fusion_alpha']}", flush=True,
+        f"alpha={_CONFIG['fusion_alpha']}; model_init={time.perf_counter() - started:.1f}s",
+        flush=True,
     )
 
 
@@ -353,6 +363,13 @@ def _category_nll_distances(
 
 @torch.inference_mode()
 def rank_gallery(sample: dict[str, Any]) -> dict[str, np.ndarray]:
+    print(
+        f"[submission] JointFCE rank_gallery entered; "
+        f"queries={len(sample.get('queries', []))}; "
+        f"gallery={len(sample.get('gallery', []))}; "
+        f"attributes={len(sample.get('attribute_names', []))}",
+        flush=True,
+    )
     if _MODEL is None:
         load_model()
     assert _MODEL is not None and _DEVICE is not None
@@ -366,6 +383,11 @@ def rank_gallery(sample: dict[str, Any]) -> dict[str, np.ndarray]:
         batch_size=_CONFIG["batch_size"],
         num_workers=_CONFIG["num_workers"],
         pin_memory=_DEVICE.type == "cuda",
+    )
+    print(
+        f"[submission] JointFCE gallery loader ready; batches={len(loader)}; "
+        f"batch_size={_CONFIG['batch_size']}; num_workers={_CONFIG['num_workers']}",
+        flush=True,
     )
     queries = np.asarray(sample["queries"], dtype=np.float32)
     query_states = _semantic_queries(
@@ -391,7 +413,7 @@ def rank_gallery(sample: dict[str, Any]) -> dict[str, np.ndarray]:
         )
         offset = end
         del global_features, local_features
-        if index % _CONFIG["progress_every"] == 0 or index == len(loader):
+        if index == 1 or index % _CONFIG["progress_every"] == 0 or index == len(loader):
             print(f"[submission] JointFCE gallery batch {index}/{len(loader)}", flush=True)
     if offset != len(paths):
         raise RuntimeError(f"DataLoader returned {offset} images for a gallery of {len(paths)}")

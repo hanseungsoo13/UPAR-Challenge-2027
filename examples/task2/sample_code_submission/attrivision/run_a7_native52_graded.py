@@ -490,7 +490,8 @@ def _build_train_loaders(config: dict[str, Any], model: Any, table: Any,
                          train_roots: list[Path]) -> tuple[DataLoader, DataLoader]:
     dataset = AttriVisionDataset(
         table, train_roots,
-        build_train_transform(config["image_size"], config["rotation"], "resize_pad_crop"),
+        build_train_transform(config["image_size"], config["rotation"], "resize_pad_crop",
+                              hard_augmentation=config.get("hard_augmentation", False)),
         config.get("max_train_samples"),
     )
     plain_loader = DataLoader(
@@ -520,7 +521,7 @@ def _resolved_config(args: argparse.Namespace) -> dict[str, Any]:
     for key in (
         "checkpoint", "data_root", "output_root", "device", "epochs", "batch_size",
         "eval_batch_size", "num_workers", "max_train_samples", "max_val_samples",
-        "seed", "experiment", "lambda_graded", "lambda_distill",
+        "seed", "experiment", "lambda_graded", "lambda_distill", "hard_augmentation",
     ):
         value = getattr(args, key, None)
         if value is not None:
@@ -833,6 +834,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-train-samples", type=int)
     parser.add_argument("--max-val-samples", type=int)
     parser.add_argument("--seed", type=int)
+    parser.add_argument("--hard-augmentation", action="store_true")
     parser.add_argument("--lambda-graded", type=float)
     parser.add_argument("--lambda-distill", type=float)
     return parser

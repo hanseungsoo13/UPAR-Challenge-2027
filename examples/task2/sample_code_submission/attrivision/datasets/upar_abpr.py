@@ -31,7 +31,7 @@ class AttriVisionDataset(Dataset):
     def __len__(self) -> int:
         return len(self.image_paths)
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, index: int) -> tuple[Any, torch.Tensor]:
         path = resolve_image_path(self.image_paths[index], self.roots)
         with Image.open(path) as image:
             tensor = self.transform(image.convert("RGB"))
@@ -46,6 +46,7 @@ class PromptBatch:
     tokens: torch.Tensor
     selected_semantics: torch.Tensor
     text_owners: torch.Tensor
+    augmix_views: tuple[torch.Tensor, ...] | None = None
 
 
 def semantic_label_matrix(
@@ -182,7 +183,19 @@ class PromptCollator:
         self.stochastic = stochastic
 
     def __call__(self, samples: list[tuple[torch.Tensor, torch.Tensor]]) -> PromptBatch:
-        images = torch.stack([sample[0] for sample in samples])
+        sample_images = [sample[0] for sample in samples]
+        if isinstance(sample_images[0], (tuple, list)):
+            if not all(isinstance(value, (tuple, list)) and len(value) == 3
+                       for value in sample_images):
+                raise ValueError("Multi-view augmentation must return three views per image")
+            images = torch.stack([value[0] for value in sample_images])
+            augmix_views = tuple(
+                torch.stack([value[view_index] for value in sample_images])
+                for view_index in (1, 2)
+            )
+        else:
+            images = torch.stack(sample_images)
+            augmix_views = None
         labels = torch.stack([sample[1] for sample in samples])
         semantic_labels = self.mapper.encode(labels) if self.mapper is not None else labels.bool()
         counts = [
@@ -225,4 +238,7 @@ class PromptCollator:
         )
         selected_semantics[torch.arange(len(texts)), attribute_indices] = True
         text_owners = torch.tensor(owners, dtype=torch.long)
-        return PromptBatch(images, labels, semantic_labels, tokens, selected_semantics, text_owners)
+        return PromptBatch(
+            images, labels, semantic_labels, tokens, selected_semantics, text_owners,
+            augmix_views,
+        )

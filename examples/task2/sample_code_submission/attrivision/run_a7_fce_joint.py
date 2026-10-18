@@ -226,6 +226,7 @@ def _resolved_config(args: argparse.Namespace) -> dict[str, Any]:
         "max_val_samples": args.max_val_samples,
         "seed": args.seed,
         "amp": args.amp,
+        "hard_augmentation": args.hard_augmentation,
     }
     for key, value in overrides.items():
         if value is not None:
@@ -280,7 +281,8 @@ def _train_lambda(
     dataset = AttriVisionDataset(
         train_table,
         train_roots,
-        build_train_transform(config["image_size"], config["rotation"], "resize_pad_crop"),
+        build_train_transform(config["image_size"], config["rotation"], "resize_pad_crop",
+                              hard_augmentation=config.get("hard_augmentation", False)),
         config.get("max_train_samples"),
     )
     loader = _build_loader(config, train_table, dataset, model, stochastic=True)
@@ -437,6 +439,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="one lambda value for this process; run separate processes for each value",
     )
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--hard-augmentation", action="store_true")
     return parser
 
 

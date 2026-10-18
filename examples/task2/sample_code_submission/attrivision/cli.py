@@ -61,6 +61,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--rotation", type=float, default=10.0)
+    parser.add_argument("--hard-augmentation", action="store_true",
+                        help="add mild lighting, camera-quality, and box-geometry changes during training")
     parser.add_argument(
         "--augmentation",
         choices=("current", "rrc_scale_050", "resize_pad_crop", "paper_like"),
@@ -341,7 +343,8 @@ def run_smoke(args: argparse.Namespace) -> None:
     model = AttriVision(pretrained=None, model_name=args.clip_model).to(device)
     batch_size = args.smoke_batch_size
     images = torch.randn(batch_size, 3, args.image_size, args.image_size, device=device)
-    transform = build_train_transform(args.image_size, args.rotation, args.augmentation)
+    transform = build_train_transform(args.image_size, args.rotation, args.augmentation,
+                                      hard_augmentation=args.hard_augmentation)
     transform_names = [type(item).__name__ for item in transform.transforms]
     if args.augmentation == "paper_like" and "RandomResizedCrop" in transform_names:
         raise AssertionError("paper_like augmentation must not use RandomResizedCrop")

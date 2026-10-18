@@ -244,6 +244,7 @@ def evaluate_native52_category_nll_domainwise(
     num_workers: int, amp: bool, max_val_samples: int | None = None,
     attribute_temperature: float = 0.01, distance_chunk_size: int = 256,
     unseen_domain: str | None = None,
+    exclude_domain: str | None = None,
 ) -> dict[str, Any]:
     """Evaluate overall and query-domain metrics.
 
@@ -265,6 +266,26 @@ def evaluate_native52_category_nll_domainwise(
 
     gt_path = find_annotation_file(data_root, "val")
     table = read_gt_csv(gt_path)
+    queries: np.ndarray | None = None
+    ids: np.ndarray | None = None
+    query_names: list[str] | None = None
+    if exclude_domain is not None:
+        queries, ids, query_names = load_retrieval_annotations(gt_path.parent, table)
+        domains = np.asarray(
+            [str(path).split("/", 1)[0] for path in table.image_paths], dtype=object,
+        )
+        keep = domains != exclude_domain
+        if not keep.any():
+            raise ValueError(f"exclude-domain={exclude_domain!r} removed every validation image")
+        table = AnnotationTable(
+            [path for path, selected in zip(table.image_paths, keep) if selected],
+            table.labels[keep], table.attribute_names,
+        )
+        ids = ids[keep]
+        present_queries = np.unique(ids)
+        remap = {int(old): new for new, old in enumerate(present_queries.tolist())}
+        queries = queries[present_queries]
+        ids = np.asarray([remap[int(query_id)] for query_id in ids], dtype=np.int64)
     if max_val_samples is not None:
         count = min(max_val_samples, len(table.image_paths))
         table = AnnotationTable(
@@ -272,8 +293,9 @@ def evaluate_native52_category_nll_domainwise(
         )
         queries, ids = np.unique(table.labels, axis=0, return_inverse=True)
         query_names = table.attribute_names
-    else:
+    elif exclude_domain is None:
         queries, ids, query_names = load_retrieval_annotations(gt_path.parent, table)
+    assert queries is not None and ids is not None and query_names is not None
     queries = reorder_columns(queries, query_names, model_attribute_names)
     labels = reorder_columns(table.labels, table.attribute_names, model_attribute_names)
     domain_names_in_table = np.asarray(
@@ -392,6 +414,8 @@ def evaluate_native52_category_nll_domainwise(
         result["seen_macro_mADM"] = float(
             np.mean([domain_summaries[domain]["mADM"] for domain in source_domains])
         )
+    elif exclude_domain is not None:
+        result["seen_macro_mADM"] = result["domain_macro_mADM"]
     worst_domain = min(domain_summaries, key=lambda name: domain_summaries[name]["mADM"])
     result["worst_domain_mADM"] = float(domain_summaries[worst_domain]["mADM"])
     result["worst_domain"] = worst_domain

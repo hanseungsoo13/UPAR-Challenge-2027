@@ -81,6 +81,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--retrieval-interval", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--deterministic", action="store_true")
+    parser.add_argument("--hard-augmentation", action="store_true",
+                        help="add mild lighting, camera-quality, and box-geometry changes during training")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--max-train-samples", type=int)
     parser.add_argument("--max-val-samples", type=int)

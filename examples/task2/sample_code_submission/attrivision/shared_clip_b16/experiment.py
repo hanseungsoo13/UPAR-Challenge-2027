@@ -241,6 +241,7 @@ def _build_loader(
         build_train_transform(
             int(config["image_size"]), float(config["rotation"]),
             str(config["augmentation"]),
+            hard_augmentation=bool(config.get("hard_augmentation", False)),
         ),
         config.get("max_train_samples"),
     )

@@ -149,9 +149,12 @@ def train_one_epoch_paper(
     teacher_model: AttriVision | None = None, distill_weight: float = 0.0,
     rsc_drop_ratio: float = 0.0,
     grad_cache_steps: int = 1, grad_cache_chunk_size: int | None = None,
+    consistency_groups: list[list[int]] | None = None,
+    augmix_consistency_weight: float = 0.0,
 ) -> dict[str, float]:
     if grad_cache_steps > 1:
-        if binary_criterion is not None or category_mode != "off" or teacher_model is not None or rsc_drop_ratio > 0:
+        if (binary_criterion is not None or category_mode != "off" or teacher_model is not None
+                or rsc_drop_ratio > 0 or augmix_consistency_weight > 0):
             raise ValueError("Gradient Cache requires the plain A7 FCE objective")
         from .gradient_cache import train_cached_epoch
 
@@ -176,9 +179,14 @@ def train_one_epoch_paper(
         raise ValueError("rsc_drop_ratio must be in [0, 1)")
     if rsc_drop_ratio > 0 and category_mode == "only":
         raise ValueError("RSC requires the FCE logits and cannot use category_mode=only")
+    if augmix_consistency_weight < 0:
+        raise ValueError("augmix_consistency_weight cannot be negative")
+    if augmix_consistency_weight > 0 and (not consistency_groups or prototype_tokens is None):
+        raise ValueError("AugMix consistency requires category groups and all prototype tokens")
     if teacher_model is not None:
         teacher_model.eval()
     totals = {"loss": 0.0, "fce": 0.0, "category_ce": 0.0, "bce": 0.0,
+              "augmix_consistency": 0.0,
               "distill": 0.0, "rsc_dropped": 0.0,
               "i2t": 0.0, "t2i": 0.0, "samples": 0.0, "batches": 0.0}
     if device.type == "cuda":
@@ -188,6 +196,11 @@ def train_one_epoch_paper(
             raise TypeError("PromptCollator must return PromptBatch")
         images = batch.images.to(device, non_blocking=True)
         labels = batch.labels.to(device, non_blocking=True)
+        augmix_views = None
+        if batch.augmix_views is not None:
+            augmix_views = [view.to(device, non_blocking=True) for view in batch.augmix_views]
+        if augmix_consistency_weight > 0 and augmix_views is None:
+            raise ValueError("AugMix JS loss requested, but the dataset returned no AugMix views")
         semantic_labels = batch.semantic_labels.to(device, non_blocking=True)
         tokens = batch.tokens.to(device, non_blocking=True)
         selected = batch.selected_semantics.to(device, non_blocking=True)
@@ -243,8 +256,35 @@ def train_one_epoch_paper(
                 )
             else:
                 category_ce = image_features.new_zeros(())
+            consistency = image_features.new_zeros(())
+            if augmix_views is not None and consistency_groups:
+                if prototype_tokens is None:
+                    raise ValueError("AugMix views require prototype tokens")
+                all_text_features = model.encode_text(prototype_tokens)
+                view_features = [image_features]
+                view_features.extend(model.encode_image(view) for view in augmix_views)
+                scale = 1.0 / 0.1
+                group_js: list[torch.Tensor] = []
+                for group in consistency_groups:
+                    index = torch.as_tensor(group, device=device, dtype=torch.long)
+                    distributions = [
+                        torch.softmax(
+                            (features.float() @ all_text_features[index].float().T) * scale,
+                            dim=-1,
+                        )
+                        for features in view_features
+                    ]
+                    mean_distribution = torch.stack(distributions).mean(dim=0)
+                    log_mean = mean_distribution.clamp_min(1e-8).log()
+                    group_js.append(torch.stack([
+                        (probability * (probability.clamp_min(1e-8).log() - log_mean))
+                        .sum(dim=-1).mean()
+                        for probability in distributions
+                    ]).mean())
+                consistency = torch.stack(group_js).mean()
             bce = attr_weight * binary_criterion(model.binary_logits_from_features(image_features), labels.float()) if binary_criterion is not None else image_features.new_zeros(())
-            total = fce + category_weight * category_ce + bce + distill_weight * distill
+            total = (fce + category_weight * category_ce + bce + distill_weight * distill
+                     + augmix_consistency_weight * consistency)
         if diagnostics and batch_index == 0 and category_mode != "only":
             assert logits is not None
             positive_mask = criterion.positive_mask(
@@ -272,6 +312,7 @@ def train_one_epoch_paper(
         totals["fce"] += float(fce.detach()) * count
         totals["category_ce"] += float(category_ce.detach()) * count
         totals["bce"] += float(bce.detach()) * count
+        totals["augmix_consistency"] += float(consistency.detach()) * count
         totals["distill"] += float(distill.detach()) * count
         totals["rsc_dropped"] += rsc_dropped * count
         totals["i2t"] += float(i2t.detach()) * count
@@ -671,6 +712,9 @@ def train(args: Any) -> Path:
         [data_root, train_gt.parent, REPOSITORY_ROOT],
         build_train_transform(
             args.image_size, args.rotation, getattr(args, "augmentation", "current"),
+            hard_augmentation=getattr(args, "hard_augmentation", False),
+            augmentation_policy=getattr(args, "augmentation_policy", "baseline"),
+            augmix_alpha=getattr(args, "augmix_alpha", 1.0),
         ),
         args.max_train_samples,
     )
@@ -843,6 +887,9 @@ def train(args: Any) -> Path:
         "category_temperature": getattr(args, "category_temperature", 0.01),
         "freeze_binary_head": getattr(args, "freeze_binary_head", False),
         "augmentation": getattr(args, "augmentation", "current"),
+        "augmentation_policy": getattr(args, "augmentation_policy", "baseline"),
+        "augmix_alpha": getattr(args, "augmix_alpha", 1.0),
+        "augmix_consistency_weight": getattr(args, "augmix_consistency_weight", 0.0),
         "selection_metric": getattr(args, "selection_metric", "map"),
         "stop_after_epoch": getattr(args, "stop_after_epoch", None),
         "paper_faithful": bool(getattr(args, "paper_faithful", False)),
@@ -1087,6 +1134,9 @@ def train(args: Any) -> Path:
                     ),
                     grad_cache_steps=grad_cache_steps,
                     grad_cache_chunk_size=args.batch_size,
+                    consistency_groups=(mapper.category_indices()
+                                        if isinstance(mapper, CategoryPromptMapper) else None),
+                    augmix_consistency_weight=getattr(args, "augmix_consistency_weight", 0.0),
                 )
             metrics: dict[str, float] = {}
             should_stop = False
@@ -1105,12 +1155,21 @@ def train(args: Any) -> Path:
                     model.load_state_dict(swad_average.state_dict())
                 if getattr(args, "validation_protocol", "binary_head") == "native52_category_nll":
                     if getattr(args, "domain_wise_validation", False):
+                        validation_unseen_domain = getattr(args, "unseen_domain", None)
+                        seen_only_selection = (
+                            getattr(args, "selection_metric", "mADM") == "seen_macro_mADM"
+                        )
                         metrics = evaluate_native52_category_nll_domainwise(
                             evaluation_model, table.attribute_names, data_root,
                             build_eval_transform(args.image_size, getattr(args, "augmentation", "current")), device,
                             args.eval_batch_size, args.num_workers, args.amp,
                             args.max_val_samples, getattr(args, "category_temperature", 0.01),
-                            unseen_domain=getattr(args, "unseen_domain", None),
+                            unseen_domain=(
+                                None if seen_only_selection else validation_unseen_domain
+                            ),
+                            exclude_domain=(
+                                validation_unseen_domain if seen_only_selection else None
+                            ),
                         )
                     else:
                         metrics = evaluate_native52_category_nll(
