@@ -137,6 +137,18 @@ class DomainBalancedSampler(Sampler[int]):
         return len(self.weights)
 
 
+def _encode_image_for_training(
+    model: AttriVision, images: torch.Tensor, activation_checkpointing: bool,
+) -> torch.Tensor:
+    if not activation_checkpointing:
+        return model.encode_image(images)
+    from torch.utils.checkpoint import checkpoint
+
+    return checkpoint(
+        model.encode_image, images, use_reentrant=False, preserve_rng_state=True,
+    )
+
+
 def train_one_epoch_paper(
     model: AttriVision, loader: DataLoader, optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
@@ -151,6 +163,7 @@ def train_one_epoch_paper(
     grad_cache_steps: int = 1, grad_cache_chunk_size: int | None = None,
     consistency_groups: list[list[int]] | None = None,
     augmix_consistency_weight: float = 0.0,
+    activation_checkpointing: bool = False,
 ) -> dict[str, float]:
     if grad_cache_steps > 1:
         if (binary_criterion is not None or category_mode != "off" or teacher_model is not None
@@ -213,14 +226,24 @@ def train_one_epoch_paper(
                 with torch.no_grad():
                     teacher_features = teacher_model.encode_image(images)
             if category_mode == "only":
-                image_features = model.encode_image(images)
+                image_features = _encode_image_for_training(
+                    model, images, activation_checkpointing,
+                )
                 text_features = None
                 logits = None
                 fce = image_features.new_zeros(())
                 i2t = image_features.new_zeros(())
                 t2i = image_features.new_zeros(())
             else:
-                image_features, text_features, logits = model(images, tokens)
+                if activation_checkpointing:
+                    image_features = _encode_image_for_training(
+                        model, images, activation_checkpointing,
+                    )
+                    text_features = model.encode_text(tokens)
+                    scale = model.logit_scale.exp().clamp(max=100.0)
+                    logits = scale * image_features @ text_features.T
+                else:
+                    image_features, text_features, logits = model(images, tokens)
                 result = criterion(logits, semantic_labels, selected, text_owners)
                 if rsc_drop_ratio > 0:
                     feature_grad = torch.autograd.grad(
@@ -262,7 +285,10 @@ def train_one_epoch_paper(
                     raise ValueError("AugMix views require prototype tokens")
                 all_text_features = model.encode_text(prototype_tokens)
                 view_features = [image_features]
-                view_features.extend(model.encode_image(view) for view in augmix_views)
+                view_features.extend(
+                    _encode_image_for_training(model, view, activation_checkpointing)
+                    for view in augmix_views
+                )
                 scale = 1.0 / 0.1
                 group_js: list[torch.Tensor] = []
                 for group in consistency_groups:
@@ -890,6 +916,7 @@ def train(args: Any) -> Path:
         "augmentation_policy": getattr(args, "augmentation_policy", "baseline"),
         "augmix_alpha": getattr(args, "augmix_alpha", 1.0),
         "augmix_consistency_weight": getattr(args, "augmix_consistency_weight", 0.0),
+        "activation_checkpointing": getattr(args, "activation_checkpointing", False),
         "selection_metric": getattr(args, "selection_metric", "map"),
         "stop_after_epoch": getattr(args, "stop_after_epoch", None),
         "paper_faithful": bool(getattr(args, "paper_faithful", False)),
@@ -1137,6 +1164,7 @@ def train(args: Any) -> Path:
                     consistency_groups=(mapper.category_indices()
                                         if isinstance(mapper, CategoryPromptMapper) else None),
                     augmix_consistency_weight=getattr(args, "augmix_consistency_weight", 0.0),
+                    activation_checkpointing=getattr(args, "activation_checkpointing", False),
                 )
             metrics: dict[str, float] = {}
             should_stop = False

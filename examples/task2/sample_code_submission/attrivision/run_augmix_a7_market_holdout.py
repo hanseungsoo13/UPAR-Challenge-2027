@@ -63,6 +63,9 @@ def configure(args: argparse.Namespace) -> None:
     args.hard_augmentation = False
     args.augmentation_policy = policy
     args.augmix_consistency_weight = consistency_weight
+    # Keep the B/32 batch size fixed while reducing saved transformer
+    # activations, especially for Aug3's three differentiable image views.
+    args.activation_checkpointing = True
     args.prompt_mode = "category_complete"
     args.training_objective = "paper_fce"
     args.text_sampling = "single"
