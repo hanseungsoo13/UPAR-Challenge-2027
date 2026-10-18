@@ -572,6 +572,7 @@ CUDA_VISIBLE_DEVICES=6 python \
 | `--batch-size` | 128 | train image batch size |
 | `--learning-rate` | `1e-5` | AdamW learning rate |
 | `--augmentation` | `current` | `current`, `rrc_scale_050`, `resize_pad_crop`, `paper_like` crop policy |
+| `--augmentation-policy` | `baseline` | `baseline` or `aug1` sequential brightness/contrast/gamma augmentation; works with `--clip-model ViT-L-14` too |
 | `--training-objective` | `task2_hybrid` | Task 2 hybrid 또는 논문식 `paper_fce` |
 | `--prototype-loss-weight` | `0.25` | 전체 semantic prototype focal loss 가중치 |
 | `--set-loss-weight` | `1.0` | attribute-set contrastive loss 가중치 |

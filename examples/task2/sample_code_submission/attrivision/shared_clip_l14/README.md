@@ -20,6 +20,8 @@ local FCE, Global/Local fusion(alpha=0.5), validation mADM 선택을 재사용�
 - E1-A/B/C/D는 매 epoch마다 `checkpoint_epoch_001.pth` 형식의 가중치 snapshot을
   저장한다. `checkpoint_last.pth`는 optimizer 상태를 포함한 resume용이며,
   `checkpoint_best.pth`는 validation 선택 결과다.
+- 모든 L/14 학습 단계는 `--augmentation-policy aug1`을 지원한다. Aug1은
+  밝기·대비·감마를 순차적으로 바꾸며, 옵션을 생략하면 기존 baseline transform을 쓴다.
 
 B/16·B/32 체크포인트는 Large 단계 초기화에 사용할 수 없다. A는 OpenAI L/14
 사전학습 가중치에서 시작하고, B는 A-Large, C는 B-Large 결과를 사용한다.
@@ -70,6 +72,10 @@ conda activate rws-upar-challenge && CUDA_VISIBLE_DEVICES=1 python examples/task
   --distill-weight 0 \
   --output-dir outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-A-GC128
 ```
+
+Aug1을 사용하려면 같은 명령에 `--augmentation-policy aug1`을 추가한다.
+`train` 하위 명령(E1-B/C/D)도 동일한 옵션을 지원하며, CLI 값이 설정 파일 값을
+덮어쓴다.
 
 ## E1-B — CLIP 고정, local head 학습
 

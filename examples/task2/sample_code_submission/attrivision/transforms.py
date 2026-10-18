@@ -102,29 +102,35 @@ class PolicyTrainTransform:
     """Apply shared geometry, then one of the controlled photometric policies."""
 
     def __init__(self, geometry: transforms.Compose, policy: str, image_size: int,
-                 alpha: float = 1.0) -> None:
+                 alpha: float = 1.0, hard_augmentation: bool = False) -> None:
         self.geometry = geometry
         self.policy = policy
         self.augmix = AugMixPhoto(alpha=alpha)
+        self.camera_augmentation = CameraAugmentation() if hard_augmentation else None
         self.normalize = transforms.Compose([
             transforms.ToTensor(), transforms.Normalize(CLIP_MEAN, CLIP_STD),
         ])
         if image_size <= 0:
             raise ValueError("image_size must be positive")
 
+    def _normalize(self, image: Image.Image) -> Any:
+        if self.camera_augmentation is not None:
+            image = self.camera_augmentation(image)
+        return self.normalize(image)
+
     def __call__(self, image: Image.Image) -> Any:
         image = self.geometry(image)
-        if self.policy == "sequential":
-            return self.normalize(SequentialPhotoAugmentation()(image))
+        if self.policy in {"aug1", "sequential"}:
+            return self._normalize(SequentialPhotoAugmentation()(image))
         if self.policy == "augmix":
-            return self.normalize(self.augmix(image))
+            return self._normalize(self.augmix(image))
         if self.policy == "augmix_js":
             return (
-                self.normalize(image),
-                self.normalize(self.augmix(image)),
-                self.normalize(self.augmix(image)),
+                self._normalize(image),
+                self._normalize(self.augmix(image)),
+                self._normalize(self.augmix(image)),
             )
-        return self.normalize(image)
+        return self._normalize(image)
 
 
 def build_train_transform(
@@ -134,7 +140,9 @@ def build_train_transform(
     augmentation_policy: str = "baseline",
     augmix_alpha: float = 1.0,
 ) -> Any:
-    policies = {"baseline", "sequential", "augmix", "augmix_js"}
+    # ``aug1`` is the user-facing name for the sequential photo transform.
+    # Keep ``sequential`` as an alias for the existing controlled-runner API.
+    policies = {"baseline", "aug1", "sequential", "augmix", "augmix_js"}
     if augmentation_policy not in policies:
         raise ValueError(f"Unknown augmentation policy: {augmentation_policy}")
     if augmentation == "current":
@@ -162,7 +170,7 @@ def build_train_transform(
         ]
     else:
         raise ValueError(f"Unknown training augmentation: {augmentation}")
-    if hard_augmentation and augmentation_policy == "baseline":
+    if hard_augmentation:
         # A bounded affine change models detector-box scale and offset while
         # keeping the existing full-person crop policy for A7.
         geometry = transforms.RandomApply([
@@ -181,7 +189,10 @@ def build_train_transform(
         transforms.RandomRotation(rotation, interpolation=InterpolationMode.BICUBIC),
     ])
     if augmentation_policy != "baseline":
-        return PolicyTrainTransform(geometry, augmentation_policy, image_size, augmix_alpha)
+        return PolicyTrainTransform(
+            geometry, augmentation_policy, image_size, augmix_alpha,
+            hard_augmentation=hard_augmentation,
+        )
     return transforms.Compose([
         geometry,
         *([CameraAugmentation()] if hard_augmentation else []),

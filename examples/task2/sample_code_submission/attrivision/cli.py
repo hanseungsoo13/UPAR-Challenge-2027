@@ -64,6 +64,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hard-augmentation", action="store_true",
                         help="add mild lighting, camera-quality, and box-geometry changes during training")
     parser.add_argument(
+        "--augmentation-policy", choices=("baseline", "aug1"), default="baseline",
+        help="optional photometric training policy; aug1 applies sequential brightness, contrast, and gamma changes",
+    )
+    parser.add_argument(
         "--augmentation",
         choices=("current", "rrc_scale_050", "resize_pad_crop", "paper_like"),
         default="current",
@@ -344,8 +348,11 @@ def run_smoke(args: argparse.Namespace) -> None:
     batch_size = args.smoke_batch_size
     images = torch.randn(batch_size, 3, args.image_size, args.image_size, device=device)
     transform = build_train_transform(args.image_size, args.rotation, args.augmentation,
-                                      hard_augmentation=args.hard_augmentation)
-    transform_names = [type(item).__name__ for item in transform.transforms]
+                                      hard_augmentation=args.hard_augmentation,
+                                      augmentation_policy=args.augmentation_policy)
+    transform_names = [
+        type(item).__name__ for item in getattr(transform, "transforms", ())
+    ]
     if args.augmentation == "paper_like" and "RandomResizedCrop" in transform_names:
         raise AssertionError("paper_like augmentation must not use RandomResizedCrop")
     if args.augmentation == "resize_pad_crop" and transform_names[:3] != [

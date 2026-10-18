@@ -269,6 +269,7 @@ def _build_loader(
             int(config["image_size"]), float(config["rotation"]),
             str(config["augmentation"]),
             hard_augmentation=bool(config.get("hard_augmentation", False)),
+            augmentation_policy=str(config.get("augmentation_policy", "baseline")),
         ),
         config.get("max_train_samples"),
     )

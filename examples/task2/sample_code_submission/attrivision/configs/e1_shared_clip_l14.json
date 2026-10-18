@@ -9,6 +9,7 @@
   "image_size": 224,
   "rotation": 10.0,
   "augmentation": "resize_pad_crop",
+  "augmentation_policy": "baseline",
   "epochs": 30,
   "batch_size": 16,
   "grad_cache_steps": 8,

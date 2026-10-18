@@ -99,6 +99,10 @@ def _add_training_overrides(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-val-samples", type=int)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--hard-augmentation", action="store_true")
+    parser.add_argument(
+        "--augmentation-policy", choices=("baseline", "aug1"), default=None,
+        help="training image policy for CLIP L/14 stages; aug1 applies sequential photo transforms",
+    )
 
 
 def _training_config(args: argparse.Namespace) -> dict[str, Any]:
@@ -110,6 +114,7 @@ def _training_config(args: argparse.Namespace) -> dict[str, Any]:
         "vision_learning_rate", "text_learning_rate", "global_loss_weight", "local_loss_weight",
         "clip_feature_anchor_weight",
         "max_train_samples", "max_val_samples", "amp", "hard_augmentation",
+        "augmentation_policy",
     ):
         value = getattr(args, key, None)
         if value is not None:
