@@ -19,7 +19,7 @@ from torch.utils.data import DataLoader
 from ..checkpoint import load_model as load_attrivision_checkpoint
 from ..datasets.attribute_prompts import CategoryPromptMapper
 from ..datasets.upar_abpr import AttriVisionDataset, PromptBatch, PromptCollator
-from ..engine.evaluator_abpr import evaluate_native52_category_nll
+from ..engine.evaluator_abpr import evaluate_native52, evaluate_native52_category_nll
 from ..engine.trainer_attrivision import (
     _UniformWeightAverage,
     _grad_scaler,
@@ -34,13 +34,14 @@ from ..attrquery_fromscratch_jointfce import (
     category_names,
     category_nll,
     evaluate_model,
+    fused_category_probabilities,
     restore_rng,
     rng_state,
     valid_category_mask,
 )
 from upar.config import REPOSITORY_ROOT, choose_device, set_seed
 from upar.data import ImagePathDataset, find_annotation_file, read_gt_csv
-from upar.retrieval import autocast, official_retrieval_metrics
+from upar.retrieval import autocast, l1_attribute_distances, official_retrieval_metrics
 from .model import ARCHITECTURE, MODEL_ID, MODEL_NAME, SharedCLIPL14AttrQuery
 
 
@@ -310,6 +311,8 @@ def _style_view(images: torch.Tensor) -> torch.Tensor:
 
 def _domain_retrieval_report(
     details: dict[str, Any], holdout_domain: str | None,
+    fusion_alpha: float = 0.5,
+    distances_override: np.ndarray | None = None,
 ) -> dict[str, Any]:
     table = details["table"]
     queries = details["queries"]
@@ -322,12 +325,16 @@ def _domain_retrieval_report(
             f"holdout-domain={holdout_domain!r} was not found in validation annotations; "
             f"available domains: {domain_names}"
         )
-    fused_log_probabilities = details["fusion_scores"]["alpha_0.500"]
-    fused_probabilities = np.exp(fused_log_probabilities).astype(np.float32)
-    mapper = CategoryPromptMapper(details["model_attribute_names"])
-    groups = details["groups"]
-    queries52 = mapper.encode(torch.from_numpy(queries).float()).numpy()
-    distances = category_nll(queries52, fused_probabilities, groups)
+    if distances_override is None:
+        key = f"alpha_{float(fusion_alpha):.3f}"
+        fused_log_probabilities = details["fusion_scores"][key]
+        fused_probabilities = np.exp(fused_log_probabilities).astype(np.float32)
+        mapper = CategoryPromptMapper(details["model_attribute_names"])
+        groups = details["groups"]
+        queries52 = mapper.encode(torch.from_numpy(queries).float()).numpy()
+        distances = category_nll(queries52, fused_probabilities, groups)
+    else:
+        distances = np.asarray(distances_override, dtype=np.float32)
 
     def summarize(domain: str) -> dict[str, float]:
         gallery_indices = np.flatnonzero(domains == domain).astype(np.int64)
@@ -354,6 +361,10 @@ def _domain_retrieval_report(
     per_domain = {domain: summarize(domain) for domain in domain_names}
     result: dict[str, Any] = {
         "protocol": "domain-query retrieval against the same-domain gallery",
+        "retrieval_scoring": (
+            "expected_hamming_40" if distances_override is not None
+            else "native52_category_nll"
+        ),
         "domains": per_domain,
         "holdout_domain": holdout_domain,
     }
@@ -366,6 +377,66 @@ def _domain_retrieval_report(
                 for key in ("rank1", "mAP", "mADM")
             }
     return result
+
+
+def _expected_hamming_rows(
+    details: dict[str, Any], category_temperature: float, fusion_alpha: float,
+) -> tuple[list[dict[str, Any]], np.ndarray]:
+    """Score global/local/fused 52-state outputs by expected 40-bit Hamming."""
+    groups = details["groups"]
+    global_probabilities, local_probabilities, _ = fused_category_probabilities(
+        details["global_scores"], details["local_scores"], groups,
+        category_temperature, fusion_alpha,
+    )
+    global_log = np.log(np.clip(global_probabilities, 1e-12, 1.0))
+    local_log = np.log(np.clip(local_probabilities, 1e-12, 1.0))
+    fused_log = (1.0 - fusion_alpha) * global_log + fusion_alpha * local_log
+    fused_probabilities = np.zeros_like(global_probabilities, dtype=np.float32)
+    for indices in groups:
+        values = fused_log[:, indices].astype(np.float64)
+        values -= values.max(axis=1, keepdims=True)
+        values = np.exp(values)
+        values /= values.sum(axis=1, keepdims=True)
+        fused_probabilities[:, indices] = values.astype(np.float32)
+
+    mapper = CategoryPromptMapper(details["model_attribute_names"])
+    queries = np.asarray(details["queries"], dtype=np.float32)
+    labels = np.asarray(details["labels"], dtype=np.float32)
+    ids = np.asarray(details["ids"], dtype=np.int64)
+    views = (
+        ("global", global_probabilities, None),
+        ("local", local_probabilities, None),
+        ("fusion", fused_probabilities, float(fusion_alpha)),
+    )
+    rows: list[dict[str, Any]] = []
+    fusion_distances: np.ndarray | None = None
+    for name, probabilities52, alpha in views:
+        probabilities40 = mapper.project_40(probabilities52)
+        distances = l1_attribute_distances(queries, probabilities40)
+        official = official_retrieval_metrics(distances, queries, labels, ids)
+        rank_k = {}
+        for k in (5, 10):
+            order = np.argsort(distances, axis=1, kind="stable")[:, :min(k, distances.shape[1])]
+            rank_k[k] = float(np.mean(np.any(ids[order] == np.arange(len(queries))[:, None], axis=1)))
+        rows.append({
+            "score_type": name,
+            "alpha": "" if alpha is None else alpha,
+            "rank1": float(official["Rank-1"]),
+            "rank5": rank_k[5],
+            "rank10": rank_k[10],
+            "mAP": float(official["mAP"]),
+            "mADM": float(official["mADM"]),
+            "mINP": float(official["mINP"]),
+            "semantic_top1": float(official["semantic_top1"]),
+            "images": len(labels),
+            "queries": len(queries),
+            "retrieval_scoring": "expected_hamming_40",
+        })
+        if name == "fusion":
+            fusion_distances = distances
+    if fusion_distances is None:
+        raise RuntimeError("Expected-hamming fusion distances were not computed")
+    return rows, fusion_distances
 
 
 @torch.inference_mode()
@@ -1241,36 +1312,72 @@ def evaluate_checkpoint(
     batch_size: int = 128,
     num_workers: int = 4,
     amp: bool = True,
-    category_temperature: float = 0.01,
+    category_temperature: float | None = 0.01,
+    fusion_alpha: float | None = 0.5,
+    scoring_method: str = "category_nll",
     max_val_samples: int | None = None,
 ) -> dict[str, Any]:
+    if scoring_method not in {"category_nll", "expected_hamming_40"}:
+        raise ValueError(
+            "scoring_method must be 'category_nll' or 'expected_hamming_40'"
+        )
     device = choose_device(device_name)
     source = Path(checkpoint).resolve()
-    if experiment == "E1-A":
+    if experiment in {"E1-A", "E1-A-VisionOnly"}:
         base, payload = load_attrivision_checkpoint(source, device)
         if payload.get("model_name") != MODEL_NAME:
             raise ValueError("E1-A evaluation requires a CLIP ViT-L/14 checkpoint")
-        metrics = evaluate_native52_category_nll(
-            base,
-            payload["attribute_names"],
-            Path(data_root).resolve(),
-            build_eval_transform(224, "resize_pad_crop"),
-            device,
-            batch_size,
-            num_workers,
-            amp,
-            max_val_samples,
-            category_temperature,
+        training_config = payload.get("training_config", {})
+        if experiment == "E1-A-VisionOnly":
+            vision_only_checks = {
+                "vision_encoder_only": training_config.get("vision_encoder_only") is True,
+                "freeze_text_encoder": training_config.get("freeze_text_encoder") is True,
+                "freeze_logit_scale": training_config.get("freeze_logit_scale") is True,
+                "freeze_binary_head": training_config.get("freeze_binary_head") is True,
+                "all_vision_blocks_trainable": int(
+                    training_config.get("trainable_vision_blocks", -1)
+                ) == 0,
+            }
+            if not all(vision_only_checks.values()):
+                raise ValueError(
+                    "E1-A-VisionOnly evaluation requires a checkpoint trained with only "
+                    f"the CLIP vision tower unfrozen; checks={vision_only_checks}"
+                )
+        resolved_temperature = (
+            float(category_temperature) if category_temperature is not None
+            else float(training_config.get("category_temperature", 0.01))
         )
+        if scoring_method == "expected_hamming_40":
+            metrics = evaluate_native52(
+                base, payload["attribute_names"], Path(data_root).resolve(),
+                build_eval_transform(224, "resize_pad_crop"), device, batch_size,
+                num_workers, amp, max_val_samples, resolved_temperature,
+            )
+            protocol = "native52_expected_hamming_40"
+        else:
+            metrics = evaluate_native52_category_nll(
+                base,
+                payload["attribute_names"],
+                Path(data_root).resolve(),
+                build_eval_transform(224, "resize_pad_crop"),
+                device,
+                batch_size,
+                num_workers,
+                amp,
+                max_val_samples,
+                resolved_temperature,
+            )
+            protocol = "native52_category_nll"
         result: dict[str, Any] = {
-            "experiment": "E1-A",
+            "experiment": experiment,
             "checkpoint": str(source),
             "split": "val",
             "dataset_root": str(Path(data_root).resolve()),
             "validation_annotation": str(find_annotation_file(Path(data_root).resolve(), "val")),
             "descriptor": "global",
-            "validation_protocol": "native52_category_nll",
-            "category_temperature": category_temperature,
+            "validation_protocol": protocol,
+            "scoring_method": scoring_method,
+            "category_temperature": resolved_temperature,
             "metrics": metrics,
         }
     else:
@@ -1279,6 +1386,17 @@ def evaluate_checkpoint(
             raise ValueError(
                 f"Requested {experiment}, checkpoint contains {payload.get('experiment')!r}"
             )
+        training_config = payload.get("training_config", {})
+        resolved_temperature = (
+            float(category_temperature) if category_temperature is not None
+            else float(training_config.get("category_temperature", 0.01))
+        )
+        resolved_alpha = (
+            float(fusion_alpha) if fusion_alpha is not None
+            else float(training_config.get("selection_alpha", 0.5))
+        )
+        if not 0.0 <= resolved_alpha <= 1.0:
+            raise ValueError(f"fusion alpha must be in [0,1], got {resolved_alpha}")
         rows, details = evaluate_model(
             model,
             payload["attribute_names"],
@@ -1287,19 +1405,29 @@ def evaluate_checkpoint(
             batch_size,
             num_workers,
             amp,
-            category_temperature,
+            resolved_temperature,
             max_val_samples,
-            alphas=(0.5,),
+            alphas=(resolved_alpha,),
         )
+        hamming_fusion_distances = None
+        if scoring_method == "expected_hamming_40":
+            rows, hamming_fusion_distances = _expected_hamming_rows(
+                details, resolved_temperature, resolved_alpha,
+            )
         result = {
             "experiment": experiment,
             "checkpoint": str(source),
             "split": "val",
             "dataset_root": str(Path(data_root).resolve()),
             "validation_annotation": str(find_annotation_file(Path(data_root).resolve(), "val")),
-            "validation_protocol": "native52_category_nll",
-            "category_temperature": category_temperature,
-            "selection_alpha": 0.5,
+            "validation_protocol": (
+                "native52_expected_hamming_40"
+                if scoring_method == "expected_hamming_40"
+                else "native52_category_nll"
+            ),
+            "scoring_method": scoring_method,
+            "category_temperature": resolved_temperature,
+            "selection_alpha": resolved_alpha,
             "scores": rows,
             "model_stage": payload["model_stage"],
             "vision_encoder_instances": 1,
@@ -1307,20 +1435,23 @@ def evaluate_checkpoint(
         if experiment in LOCAL_EXPERIMENTS | JOINT_EXPERIMENTS | {"E1-D"}:
             holdout_domain = payload.get("training_config", {}).get("holdout_domain")
             result["domain_retrieval"] = _domain_retrieval_report(
-                details, str(holdout_domain) if holdout_domain else None,
+                details,
+                str(holdout_domain) if holdout_domain else None,
+                resolved_alpha,
+                hamming_fusion_distances,
             )
         if experiment in LOCAL_EXPERIMENTS:
             holdout_domain = payload.get("training_config", {}).get("holdout_domain")
             fused = next(
                 row for row in rows
                 if row.get("score_type") == "fusion"
-                and abs(float(row.get("alpha", -1.0)) - 0.5) < 1e-9
+                and abs(float(row.get("alpha", -1.0)) - resolved_alpha) < 1e-9
             )
             result["official_validation"] = {
                 "mADM": float(fused["mADM"]),
                 "Rank-1": float(fused["rank1"]),
                 "mAP": float(fused["mAP"]),
-                "fusion_alpha": 0.5,
+                "fusion_alpha": resolved_alpha,
             }
             result["attribute_query_stability"] = _attribute_query_stability(
                 model,
@@ -1336,8 +1467,8 @@ def evaluate_checkpoint(
     return result
 
 
-def train_a7_l14(args: Any) -> Path:
-    """Use the established A7 loop with a fresh CLIP L/14 initialization."""
+def train_a7_l14(args: Any, vision_only: bool = False) -> Path:
+    """Use the established A7 loop with fresh CLIP L/14 weights."""
     from ..cli import run as run_attrivision
     from ..cli import validate_args
     from ..engine.trainer_attrivision import train
@@ -1362,32 +1493,40 @@ def train_a7_l14(args: Any) -> Path:
     args.validation_protocol = "native52_category_nll"
     args.selection_metric = "mADM"
     args.retrieval_scoring = "paired_l1"
-    args.freeze_text_encoder = False
-    args.freeze_logit_scale = False
+    args.freeze_text_encoder = vision_only
+    args.freeze_logit_scale = vision_only
+    args.freeze_binary_head = vision_only
     args.trainable_vision_blocks = 0
+    args.vision_encoder_only = vision_only
+    experiment = "E1-A-VisionOnly" if vision_only else "E1-A"
     if args.output_dir == "outputs/attrivision":
-        args.output_dir = "outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-A"
+        args.output_dir = (
+            "outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-A-VisionOnly"
+            if vision_only else "outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-A"
+        )
     validate_args(args)
     output_dir = Path(args.output_dir).resolve()
     if args.resume:
         resume_path = Path(args.resume).resolve()
         if resume_path.parent != output_dir:
-            raise ValueError("E1-A resume must use the same output directory as the original run")
+            raise ValueError(f"{experiment} resume must use the same output directory as the original run")
         if not resume_path.is_file():
             raise FileNotFoundError(f"E1-A resume checkpoint does not exist: {resume_path}")
     elif args.mode != "smoke" and output_dir.exists() and any(output_dir.iterdir()):
         raise FileExistsError(
-            f"Refusing to overwrite existing E1-A output directory: {output_dir}. "
+            f"Refusing to overwrite existing {experiment} output directory: {output_dir}. "
             "Choose a new --output-dir or resume from its checkpoint_last.pth."
         )
     if args.mode != "smoke":
         atomic_json(output_dir / "experiment_config.json", {
             **vars(args),
-            "experiment": "E1-A",
+            "experiment": experiment,
             "model_id": MODEL_ID,
             "initialization": "openai pretrained CLIP ViT-L/14; fresh L/14 initialization; no B/16 or B/32 weights transferred",
             "vision_encoder_instances": 1,
             "training_objective": "A7 paper_fce with category_complete 52-state prompts",
+            "trainable_components": ["clip.visual"] if vision_only else ["clip.visual", "clip.text"],
+            "vision_encoder_only": vision_only,
             "validation_protocol": "native52_category_nll",
             "selection_metric": "mADM",
         })

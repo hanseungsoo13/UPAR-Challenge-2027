@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+import numpy as np
 import torch
 
 
@@ -290,6 +291,23 @@ class CategoryPromptMapper:
             semantic[:, self._semantic_index[positive_key]] = values
             semantic[:, self._semantic_index[negative_key]] = ~values
         return semantic
+
+    def project_40(self, probabilities: np.ndarray) -> np.ndarray:
+        """Project 52 category-state probabilities to positive 40-bit marginals."""
+        if probabilities.ndim != 2 or probabilities.shape[1] != len(self.keys):
+            raise ValueError(
+                f"Expected probabilities [B,{len(self.keys)}], got {probabilities.shape}"
+            )
+        positive_state: dict[str, str] = {}
+        for _, columns, state_keys, _fallback in self._MULTI_GROUPS:
+            positive_state.update(zip(columns, state_keys))
+        for column, positive_key, _negative_key in self._BINARY_GROUPS:
+            positive_state[column] = positive_key
+        if set(positive_state) != set(self.attribute_names):
+            raise RuntimeError("52-state projection does not cover all 40 attributes")
+        state_index = {key: index for index, key in enumerate(self.keys)}
+        indices = [state_index[positive_state[name]] for name in self.attribute_names]
+        return np.asarray(probabilities[:, indices], dtype=np.float32)
 
 
 class MixedCategoryPromptMapper:

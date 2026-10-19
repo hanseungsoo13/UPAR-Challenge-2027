@@ -1,0 +1,13 @@
+experiment: E1-0-C
+checkpoint: outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-0-B0-C-GC128/checkpoint_best.pth
+data_root: data
+device: cuda:0
+eval_batch_size: 32
+num_workers: 4
+amp: true
+scoring_method: expected_hamming_40
+# null means reuse selection_alpha and category_temperature saved in the checkpoint.
+fusion_alpha: null
+category_temperature: null
+max_val_samples: null
+output_path: outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-0-B0-C-GC128/evaluation_expected_hamming_40.json

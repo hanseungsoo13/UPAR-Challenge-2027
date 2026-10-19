@@ -40,6 +40,9 @@ from upar.config import choose_device, set_seed  # noqa: E402
 DEFAULT_CONFIG = (
     Path(__file__).resolve().parents[1] / "configs" / "e1_shared_clip_l14.json"
 )
+DEFAULT_VISION_ONLY_CONFIG = (
+    Path(__file__).resolve().parents[1] / "configs" / "e1_a_vision_only.yaml"
+)
 
 
 def _read_config(path: str | Path) -> dict[str, Any]:
@@ -47,6 +50,19 @@ def _read_config(path: str | Path) -> dict[str, Any]:
         config = json.load(handle)
     if config.get("model_name") != MODEL_NAME:
         raise ValueError(f"E1 config must select {MODEL_NAME}")
+    return config
+
+
+def _read_yaml_mapping(path: str | Path) -> dict[str, Any]:
+    try:
+        import yaml
+    except ImportError as error:
+        raise RuntimeError("This command requires PyYAML in the active environment") from error
+    config_path = Path(path).resolve()
+    with config_path.open(encoding="utf-8") as handle:
+        config = yaml.safe_load(handle)
+    if not isinstance(config, dict):
+        raise ValueError(f"Expected a YAML mapping in {config_path}")
     return config
 
 
@@ -283,7 +299,7 @@ def _run_eval(argv: list[str]) -> None:
     )
     parser.add_argument(
         "--experiment",
-        choices=("E1-A", *sorted(LOCAL_EXPERIMENTS), *sorted(JOINT_EXPERIMENTS), "E1-D", "E1-E"),
+        choices=("E1-A", "E1-A-VisionOnly", *sorted(LOCAL_EXPERIMENTS), *sorted(JOINT_EXPERIMENTS), "E1-D", "E1-E"),
         required=True,
     )
     parser.add_argument("--checkpoint", required=True)
@@ -310,6 +326,131 @@ def _run_eval(argv: list[str]) -> None:
         max_val_samples=args.max_val_samples,
     )
     print(f"Validation result: {output.resolve()}", flush=True)
+
+
+def _run_score_eval(argv: list[str]) -> None:
+    parser = argparse.ArgumentParser(
+        description="Evaluate a saved E1 checkpoint with a YAML-selected scoring method",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--config", required=True, help="YAML evaluation configuration")
+    args = parser.parse_args(argv)
+    config = _read_yaml_mapping(args.config)
+    required = ("experiment", "checkpoint", "scoring_method", "output_path")
+    missing = [key for key in required if key not in config]
+    if missing:
+        raise ValueError(f"Evaluation YAML is missing required keys: {missing}")
+    result = evaluate_checkpoint(
+        checkpoint=config["checkpoint"],
+        experiment=str(config["experiment"]),
+        data_root=config.get("data_root", "data"),
+        output_path=config["output_path"],
+        device_name=str(config.get("device", "auto")),
+        batch_size=int(config.get("eval_batch_size", 32)),
+        num_workers=int(config.get("num_workers", 4)),
+        amp=bool(config.get("amp", True)),
+        category_temperature=config.get("category_temperature"),
+        fusion_alpha=config.get("fusion_alpha"),
+        scoring_method=str(config["scoring_method"]),
+        max_val_samples=config.get("max_val_samples"),
+    )
+    output = Path(config["output_path"]).resolve()
+    print(
+        f"Validation result: {output}; scoring={result['scoring_method']}; "
+        f"alpha={result.get('selection_alpha', 'n/a')}; "
+        f"temperature={result.get('category_temperature')}",
+        flush=True,
+    )
+    for row in result.get("scores", []):
+        print(
+            f"{row['score_type']} alpha={row['alpha']} "
+            f"Rank-1={row['rank1']:.6f} mAP={row['mAP']:.6f} "
+            f"mADM={row['mADM']:.6f}",
+            flush=True,
+        )
+
+
+def _run_a7_vision_only(argv: list[str]) -> None:
+    parser = argparse.ArgumentParser(
+        description="Train E1-A's FCE objective with only the CLIP vision tower unfrozen",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--config", default=str(DEFAULT_VISION_ONLY_CONFIG))
+    args = parser.parse_args(argv)
+    config = _read_yaml_mapping(args.config)
+    if config.get("experiment") != "E1-A-VisionOnly":
+        raise ValueError("The vision-only YAML must set experiment: E1-A-VisionOnly")
+    if config.get("vision_encoder_only") is not True:
+        raise ValueError("The vision-only YAML must set vision_encoder_only: true")
+
+    training_parser = build_a7_parser()
+    training_parser.set_defaults(
+        batch_size=16,
+        eval_batch_size=32,
+        grad_cache_steps=8,
+        clip_model=MODEL_NAME,
+        output_dir="outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-A-VisionOnly-GC128",
+    )
+    train_args = training_parser.parse_args([])
+    configuration = {
+        key: value for key, value in config.items()
+        if key not in {"experiment", "vision_encoder_only"}
+    }
+    unknown = sorted(set(configuration) - set(vars(train_args)))
+    if unknown:
+        raise ValueError(f"Unknown vision-only training YAML keys: {unknown}")
+    fixed_settings = {
+        "clip_model": MODEL_NAME,
+        "pretrained_tag": "openai",
+        "no_pretrained": False,
+        "prompt_mode": "category_complete",
+        "training_objective": "paper_fce",
+        "text_sampling": "single",
+        "multi_attributes": 3,
+        "contrastive_target": "multi_positive",
+        "augmentation": "resize_pad_crop",
+        "use_fce": True,
+        "lambda_attr": 0.0,
+        "category_ce_mode": "off",
+        "category_temperature": 0.01,
+        "distill_weight": 0.0,
+        "validation_protocol": "native52_category_nll",
+        "selection_metric": "mADM",
+        "freeze_text_encoder": True,
+        "freeze_logit_scale": True,
+        "freeze_binary_head": True,
+        "trainable_vision_blocks": 0,
+    }
+    mismatched = {
+        key: {"expected": expected, "actual": config.get(key)}
+        for key, expected in fixed_settings.items()
+        if config.get(key) != expected
+    }
+    if mismatched:
+        raise ValueError(f"The E1-A vision-only recipe has fixed settings: {mismatched}")
+    for key, value in configuration.items():
+        setattr(train_args, key, value)
+    train_args.mode = "train_eval"
+
+    checkpoint = train_a7_l14(train_args, vision_only=True)
+    output_dir = Path(train_args.output_dir).resolve()
+    result = evaluate_checkpoint(
+        checkpoint=checkpoint,
+        experiment="E1-A-VisionOnly",
+        data_root=train_args.data_root,
+        output_path=output_dir / "evaluation_val.json",
+        device_name=train_args.device,
+        batch_size=train_args.eval_batch_size,
+        num_workers=train_args.num_workers,
+        amp=train_args.amp,
+        category_temperature=train_args.category_temperature,
+        max_val_samples=train_args.max_val_samples,
+    )
+    print(
+        f"E1-A-VisionOnly best checkpoint: {checkpoint}; "
+        f"validation mADM={result['metrics'].get('mADM', float('nan')):.6f}",
+        flush=True,
+    )
 
 
 def _smoke(argv: list[str]) -> None:
@@ -402,17 +543,21 @@ def _smoke(argv: list[str]) -> None:
 
 def main() -> None:
     if len(sys.argv) < 2:
-        print("Usage: run.py {a7|train|e1-d|eval|smoke} ...", file=sys.stderr)
+        print("Usage: run.py {a7|vision-only|train|e1-d|eval|score-eval|smoke} ...", file=sys.stderr)
         raise SystemExit(2)
     command, argv = sys.argv[1], sys.argv[2:]
     if command == "a7":
         _run_a7(argv)
+    elif command == "vision-only":
+        _run_a7_vision_only(argv)
     elif command == "train":
         _run_train(argv)
     elif command == "e1-d":
         _run_train(argv, e1_d=True)
     elif command == "eval":
         _run_eval(argv)
+    elif command == "score-eval":
+        _run_score_eval(argv)
     elif command == "smoke":
         _smoke(argv)
     else:

@@ -907,6 +907,7 @@ def train(args: Any) -> Path:
         "text_learning_rate": getattr(args, "text_learning_rate", None),
         "freeze_text_encoder": getattr(args, "freeze_text_encoder", False),
         "freeze_logit_scale": getattr(args, "freeze_logit_scale", False),
+        "vision_encoder_only": getattr(args, "vision_encoder_only", False),
         "trainable_vision_blocks": getattr(args, "trainable_vision_blocks", 0),
         "category_ce_mode": category_mode,
         "category_ce_weight": getattr(args, "category_ce_weight", 1.0),

@@ -77,6 +77,22 @@ Aug1을 사용하려면 같은 명령에 `--augmentation-policy aug1`을 추가�
 `train` 하위 명령(E1-B/C/D)도 동일한 옵션을 지원하며, CLI 값이 설정 파일 값을
 덮어쓴다.
 
+## E1-A-VisionOnly — pretrained CLIP의 Vision Encoder만 학습
+
+E1-A와 같은 category-complete `paper_fce` 목적함수로 OpenAI pretrained ViT-L/14에서
+시작하지만, 학습 가능한 파라미터는 CLIP Vision Encoder 전체뿐이다. Text Encoder,
+`logit_scale`, 미사용 binary head는 고정한다. 설정은 YAML에서 읽으며 Gradient Cache
+기본 유효 배치는 `16 × 8 = 128`이다. E1-A와 별도 체크포인트 및 결과 디렉터리를 사용한다.
+
+```bash
+conda activate rws-upar-challenge && CUDA_VISIBLE_DEVICES=1 python examples/task2/sample_code_submission/attrivision/shared_clip_l14/run.py vision-only \
+  --config examples/task2/sample_code_submission/attrivision/configs/e1_a_vision_only.yaml
+```
+
+검증은 E1-A와 같은 Native52 Category-NLL이며 결과는
+`outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-A-VisionOnly-GC128/evaluation_val.json`에
+저장된다. 이 체크포인트는 E1-A와 다른 학습 설정이므로 E1-B 입력으로 자동 취급하지 않는다.
+
 ## E1-B — CLIP 고정, local head 학습
 
 ```bash

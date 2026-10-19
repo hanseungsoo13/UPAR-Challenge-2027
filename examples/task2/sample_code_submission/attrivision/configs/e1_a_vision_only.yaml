@@ -1,0 +1,59 @@
+experiment: E1-A-VisionOnly
+vision_encoder_only: true
+
+# Data, initialization, and outputs
+data_root: data
+device: cuda:0
+clip_model: ViT-L-14
+pretrained_tag: openai
+no_pretrained: false
+output_dir: outputs/BackboneUpgrade/E1_SharedCLIP_L14/E1-A-VisionOnly-GC128
+resume: null
+init_checkpoint: null
+
+# E1-A category-complete paper-FCE recipe
+prompt_mode: category_complete
+training_objective: paper_fce
+text_sampling: single
+multi_attributes: 3
+contrastive_target: multi_positive
+use_fce: true
+lambda_attr: 0.0
+category_ce_mode: off
+category_temperature: 0.01
+validation_protocol: native52_category_nll
+selection_metric: mADM
+augmentation: resize_pad_crop
+augmentation_policy: baseline
+rotation: 10.0
+
+# Train only the full CLIP vision tower; freeze the text tower and all other parameters.
+freeze_text_encoder: true
+freeze_logit_scale: true
+freeze_binary_head: true
+trainable_vision_blocks: 0
+
+# Optimization
+epochs: 100
+batch_size: 16
+grad_cache_steps: 8
+eval_batch_size: 32
+num_workers: 4
+image_size: 224
+learning_rate: 1.0e-5
+visual_learning_rate: null
+text_learning_rate: null
+weight_decay: 0.01
+warmup_epochs: 5
+min_learning_rate: 1.0e-6
+grad_clip: 1.0
+early_stopping_patience: 20
+retrieval_interval: 1
+distill_weight: 0.0
+amp: true
+
+# Reproducibility and optional data limits
+seed: 42
+deterministic: false
+max_train_samples: null
+max_val_samples: null
