@@ -19,7 +19,7 @@ multi_attributes: 3
 contrastive_target: multi_positive
 use_fce: true
 lambda_attr: 0.0
-category_ce_mode: off
+category_ce_mode: "off"
 category_temperature: 0.01
 validation_protocol: native52_category_nll
 selection_metric: mADM
