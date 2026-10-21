@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import time
+import gc
 from pathlib import Path
 from typing import Any
 
@@ -260,6 +261,9 @@ def load_model(payload: dict[str, Any] | None = None) -> None:
         "num_workers": int(os.environ.get(
             "UPAR_NUM_WORKERS", payload.get("default_num_workers", 0),
         )),
+        "prefetch_factor": int(os.environ.get(
+            "UPAR_PREFETCH_FACTOR", payload.get("default_prefetch_factor", 1),
+        )),
         "amp": os.environ.get("UPAR_AMP", "1").lower() not in {"0", "false", "no"},
         "progress_every": max(1, int(os.environ.get("UPAR_PROGRESS_EVERY", "5"))),
         "augmentation": os.environ.get("UPAR_AUGMENTATION", payload.get("augmentation", "resize_pad_crop")),
@@ -271,12 +275,19 @@ def load_model(payload: dict[str, Any] | None = None) -> None:
             "UPAR_RETRIEVAL_SCORING", payload.get("retrieval_scoring", "native52_joint_fusion"),
         ),
     }
+    if _CONFIG["num_workers"] < 0:
+        raise ValueError("UPAR_NUM_WORKERS cannot be negative")
+    if _CONFIG["prefetch_factor"] < 1:
+        raise ValueError("UPAR_PREFETCH_FACTOR must be at least 1")
     if not 0.0 <= _CONFIG["fusion_alpha"] <= 1.0:
         raise ValueError("UPAR_JOINT_FUSION_ALPHA must be in [0,1]")
     print(
         f"[submission] JointFCE loaded on {device}; batch_size={_CONFIG['batch_size']}; "
         f"num_workers={_CONFIG['num_workers']}; scoring={_CONFIG['retrieval_scoring']}; "
-        f"alpha={_CONFIG['fusion_alpha']}; model_init={time.perf_counter() - started:.1f}s",
+        f"prefetch_factor={_CONFIG['prefetch_factor']}; "
+        f"amp={'fp16' if _CONFIG['amp'] and device.type == 'cuda' else 'off'}; "
+        f"tta=off; alpha={_CONFIG['fusion_alpha']}; "
+        f"model_init={time.perf_counter() - started:.1f}s",
         flush=True,
     )
 
@@ -374,20 +385,10 @@ def rank_gallery(sample: dict[str, Any]) -> dict[str, np.ndarray]:
         load_model()
     assert _MODEL is not None and _DEVICE is not None
     paths = [item["image_path"] for item in sample["gallery"]]
-    loader = DataLoader(
-        ImagePathDataset(
-            paths,
-            [Path.cwd(), SUBMISSION_DIR, REPOSITORY_ROOT, REPOSITORY_ROOT / "data"],
-            _build_eval_transform(_CONFIG["augmentation"]),
-        ),
-        batch_size=_CONFIG["batch_size"],
-        num_workers=_CONFIG["num_workers"],
-        pin_memory=_DEVICE.type == "cuda",
-    )
-    print(
-        f"[submission] JointFCE gallery loader ready; batches={len(loader)}; "
-        f"batch_size={_CONFIG['batch_size']}; num_workers={_CONFIG['num_workers']}",
-        flush=True,
+    dataset = ImagePathDataset(
+        paths,
+        [Path.cwd(), SUBMISSION_DIR, REPOSITORY_ROOT, REPOSITORY_ROOT / "data"],
+        _build_eval_transform(_CONFIG["augmentation"]),
     )
     queries = np.asarray(sample["queries"], dtype=np.float32)
     query_states = _semantic_queries(
@@ -400,21 +401,57 @@ def rank_gallery(sample: dict[str, Any]) -> dict[str, np.ndarray]:
     # and local features to CPU and then back to CUDA created several GB of
     # avoidable traffic and temporary storage for full-gallery retrieval.
     distances = np.empty((len(query_states), len(paths)), dtype=np.float32)
-    offset = 0
     started = time.perf_counter()
-    for index, images in enumerate(loader, start=1):
-        with autocast(_DEVICE, _CONFIG["amp"]):
-            global_features, local_features = _MODEL.forward_features(
-                images.to(_DEVICE, non_blocking=True),
-            )
-        end = offset + len(images)
-        distances[:, offset:end] = _category_nll_distances_from_features(
-            query_weights, global_features.float(), local_features.float(),
+    loader_workers = _CONFIG["num_workers"]
+    while True:
+        loader_kwargs: dict[str, Any] = {
+            "batch_size": _CONFIG["batch_size"],
+            "num_workers": loader_workers,
+            "pin_memory": _DEVICE.type == "cuda",
+        }
+        if loader_workers > 0:
+            loader_kwargs["prefetch_factor"] = _CONFIG["prefetch_factor"]
+        loader = DataLoader(dataset, **loader_kwargs)
+        print(
+            f"[submission] JointFCE gallery loader ready; batches={len(loader)}; "
+            f"batch_size={_CONFIG['batch_size']}; num_workers={loader_workers}; "
+            f"prefetch_factor={_CONFIG['prefetch_factor'] if loader_workers else 0}",
+            flush=True,
         )
-        offset = end
-        del global_features, local_features
-        if index == 1 or index % _CONFIG["progress_every"] == 0 or index == len(loader):
-            print(f"[submission] JointFCE gallery batch {index}/{len(loader)}", flush=True)
+        offset = 0
+        try:
+            for index, images in enumerate(loader, start=1):
+                with autocast(_DEVICE, _CONFIG["amp"]):
+                    global_features, local_features = _MODEL.forward_features(
+                        images.to(_DEVICE, non_blocking=True),
+                    )
+                end = offset + len(images)
+                distances[:, offset:end] = _category_nll_distances_from_features(
+                    query_weights, global_features.float(), local_features.float(),
+                )
+                offset = end
+                del global_features, local_features
+                if index == 1 or index % _CONFIG["progress_every"] == 0 or index == len(loader):
+                    print(f"[submission] JointFCE gallery batch {index}/{len(loader)}", flush=True)
+        except RuntimeError as exc:
+            message = str(exc).lower()
+            worker_failure = any(token in message for token in (
+                "dataloader worker", "shared memory", "bus error",
+            ))
+            if loader_workers == 0 or not worker_failure:
+                raise
+            print(
+                "[submission] JointFCE image-loader worker failed; restarting the gallery "
+                "with num_workers=0. Original error: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            del loader
+            gc.collect()
+            distances.fill(0.0)
+            loader_workers = 0
+            continue
+        break
     if offset != len(paths):
         raise RuntimeError(f"DataLoader returned {offset} images for a gallery of {len(paths)}")
     print(
@@ -431,3 +468,18 @@ def predict_attributes(
         "AttrQuery JointFCE submission exposes retrieval through rank_gallery(); "
         "it does not expose the legacy independent 40-attribute probability head."
     )
+
+
+def reset_model() -> None:
+    """Release the currently loaded member before loading another ensemble model."""
+    global _MODEL, _DEVICE, _TEXT_FEATURES, _ATTRIBUTE_NAMES, _SEMANTIC_KEYS
+    global _GROUPS, _CONFIG
+    _MODEL = None
+    _DEVICE = None
+    _TEXT_FEATURES = None
+    _ATTRIBUTE_NAMES = []
+    _SEMANTIC_KEYS = []
+    _GROUPS = []
+    _CONFIG = {}
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()

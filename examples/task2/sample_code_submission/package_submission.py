@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import tempfile
 import zipfile
 from io import BytesIO
 from datetime import datetime
@@ -77,6 +78,11 @@ def load_checkpoint_metadata(source: Path | BinaryIO) -> dict[str, Any]:
             "visual_state_dict", "local_head_state_dict", "text_features",
             "semantic_keys", "attribute_names", "category_groups",
             "patch_size", "fusion_alpha", "visual_dim", "text_dim",
+        }
+    elif architecture == "attrivision_jointfce_ensemble_v1":
+        required = {
+            "format_version", "model_kind", "ensemble_method",
+            "members", "attribute_names", "shared_config",
         }
     else:
         required = CONVNEXT_CHECKPOINT_KEYS
@@ -484,8 +490,10 @@ def _shared_e1_l14_submission_checkpoint(
         "category_temperature": category_temperature,
         "augmentation": "resize_pad_crop",
         "default_batch_size": int(training_config.get("eval_batch_size", 32)),
-        # Training worker counts are unsafe in the submission container's /dev/shm.
-        "default_num_workers": 0,
+        # One loader worker overlaps image decode with CUDA inference. A single
+        # prefetched batch keeps shared-memory use modest in Codabench Docker.
+        "default_num_workers": 1,
+        "default_prefetch_factor": 1,
         "epoch": payload.get("epoch"),
         "metrics": payload.get("metrics", {}),
         "source_architecture": payload.get("architecture"),
@@ -499,6 +507,15 @@ def _shared_e1_l14_submission_checkpoint(
         "metrics": payload.get("metrics", {}),
         "architecture": payload.get("architecture"),
         "packaged_architecture": converted["architecture"],
+        "attribute_names": attributes,
+        "ensemble_config": {
+            key: converted[key]
+            for key in (
+                "semantic_keys", "category_groups", "retrieval_scoring",
+                "fusion_alpha", "category_temperature", "augmentation",
+                "default_batch_size", "default_num_workers", "default_prefetch_factor",
+            )
+        },
     }
     return stream.getvalue(), metadata
 
@@ -747,9 +764,186 @@ def build_archive(
     print(json.dumps(summary, indent=2, default=str))
 
 
+def build_ensemble_archives(
+    checkpoints: list[Path],
+    output_stem: str,
+    output_dir: Path,
+    methods: list[str],
+) -> list[dict[str, Any]]:
+    """Package shared E1-B L/14 checkpoints into score-averaging submissions."""
+    if len(checkpoints) < 2:
+        raise ValueError("An ensemble needs at least two checkpoints")
+    if len(set(methods)) != len(methods) or not methods:
+        raise ValueError("Ensemble methods must be a non-empty list without duplicates")
+    allowed_methods = {"mean", "query_zscore_mean"}
+    unknown_methods = set(methods) - allowed_methods
+    if unknown_methods:
+        raise ValueError(f"Unknown ensemble methods: {sorted(unknown_methods)}")
+    if Path(output_stem).name != output_stem or output_stem in {"", ".", ".."}:
+        raise ValueError("--ensemble-output-stem must be a simple filename stem")
+
+    checkpoints = [path.resolve() for path in checkpoints]
+    if len(set(checkpoints)) != len(checkpoints):
+        raise ValueError("An ensemble cannot contain the same checkpoint more than once")
+    for checkpoint in checkpoints:
+        if not checkpoint.is_file():
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    staged_metadata: list[dict[str, Any]] = []
+    summaries: list[dict[str, Any]] = []
+    with tempfile.TemporaryDirectory(
+        prefix=".upar_ensemble_payloads_", dir=output_dir,
+    ) as temporary_directory:
+        staging_dir = Path(temporary_directory)
+        staged_payloads: list[Path] = []
+        for index, checkpoint in enumerate(checkpoints, start=1):
+            print(
+                f"[packager] Converting ensemble checkpoint {index}/{len(checkpoints)}: "
+                f"{checkpoint}",
+                flush=True,
+            )
+            converted, metadata = _shared_e1_l14_submission_checkpoint(
+                checkpoint, expected_experiment="E1-B",
+            )
+            stage_path = staging_dir / f"member_{index:02d}.pth"
+            stage_path.write_bytes(converted)
+            del converted
+            config = metadata.get("ensemble_config")
+            if not isinstance(config, dict):
+                raise RuntimeError(f"Converted checkpoint has no ensemble config: {checkpoint}")
+            staged_payloads.append(stage_path)
+            staged_metadata.append({
+                "path": str(checkpoint),
+                "epoch": metadata.get("epoch"),
+                "model_kind": metadata.get("model_kind"),
+                "architecture": metadata.get("packaged_architecture"),
+                "attribute_names": metadata.get("attribute_names"),
+                "config": config,
+            })
+
+        reference_config = staged_metadata[0]["config"]
+        reference_attributes = staged_metadata[0]["attribute_names"]
+        for index, metadata in enumerate(staged_metadata[1:], start=2):
+            if metadata["config"] != reference_config:
+                raise ValueError(
+                    f"Checkpoint {index} has incompatible inference settings or semantic ordering"
+                )
+            if metadata["attribute_names"] != reference_attributes:
+                raise ValueError(f"Checkpoint {index} has a different attribute order")
+
+        for method in methods:
+            output = output_dir / f"{output_stem}_ensemble_{method}.zip"
+            temporary_archive = output.with_suffix(output.suffix + ".tmp")
+            if temporary_archive.exists():
+                temporary_archive.unlink()
+            member_entries = [
+                {
+                    "path": f"assets/ensemble_member_{index:02d}.pth",
+                    "source_checkpoint": metadata["path"],
+                    "epoch": metadata["epoch"],
+                    "model_kind": metadata["model_kind"],
+                    "architecture": metadata["architecture"],
+                }
+                for index, metadata in enumerate(staged_metadata, start=1)
+            ]
+            manifest = {
+                "format_version": 1,
+                "architecture": "attrivision_jointfce_ensemble_v1",
+                "model_kind": "attrivision_e1_b_unseen_l14_ensemble",
+                "ensemble_method": method,
+                "members": member_entries,
+                "attribute_names": reference_attributes,
+                "shared_config": reference_config,
+            }
+            manifest_stream = BytesIO()
+            torch.save(manifest, manifest_stream)
+            human_manifest = {
+                "ensemble_method": method,
+                "member_count": len(member_entries),
+                "members": member_entries,
+                "score_definition": (
+                    "Arithmetic mean of member distance matrices."
+                    if method == "mean"
+                    else "Per-query z-score each member over the gallery, then arithmetic mean."
+                ),
+            }
+
+            print(
+                f"[packager] Building {output.name}; method={method}; "
+                f"members={len(member_entries)}",
+                flush=True,
+            )
+            with zipfile.ZipFile(temporary_archive, "w", allowZip64=True) as archive:
+                for path in source_files():
+                    relative = path.relative_to(SUBMISSION_DIR)
+                    archive.write(path, relative.as_posix(), compress_type=zipfile.ZIP_DEFLATED)
+                archive.writestr(
+                    "assets/model_best.pth",
+                    manifest_stream.getvalue(),
+                    compress_type=zipfile.ZIP_STORED,
+                )
+                archive.writestr(
+                    "assets/ensemble_manifest.json",
+                    json.dumps(human_manifest, indent=2).encode("utf-8"),
+                    compress_type=zipfile.ZIP_DEFLATED,
+                )
+                for entry, stage_path in zip(member_entries, staged_payloads):
+                    archive.write(
+                        stage_path, entry["path"], compress_type=zipfile.ZIP_STORED,
+                    )
+
+            with zipfile.ZipFile(temporary_archive) as archive:
+                names = set(archive.namelist())
+                required = {
+                    "run.py", "metadata.yaml", "assets/model_best.pth",
+                    "assets/ensemble_manifest.json",
+                    *(entry["path"] for entry in member_entries),
+                }
+                missing = required - names
+                if missing:
+                    raise RuntimeError(f"Ensemble archive is missing: {sorted(missing)}")
+                if any(name.startswith("sample_code_submission/") for name in names):
+                    raise RuntimeError("Submission folder was nested instead of placing run.py at the root")
+                corrupt = archive.testzip()
+                if corrupt is not None:
+                    raise RuntimeError(f"Ensemble archive has a corrupt member: {corrupt}")
+                with archive.open("assets/model_best.pth") as manifest_file:
+                    packaged_manifest = load_checkpoint_metadata(manifest_file)
+                if packaged_manifest.get("architecture") != "attrivision_jointfce_ensemble_v1":
+                    raise RuntimeError("Ensemble archive manifest failed metadata validation")
+
+            temporary_archive.replace(output)
+            summary = {
+                "archive": str(output.resolve()),
+                "size_bytes": output.stat().st_size,
+                "sha256": sha256(output),
+                "ensemble_method": method,
+                "members": member_entries,
+                "packaged_manifest": packaged_manifest,
+            }
+            summaries.append(summary)
+            print(json.dumps(summary, indent=2, default=str), flush=True)
+
+    return summaries
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build a UPAR Task 2 Codabench submission zip")
-    parser.add_argument("--checkpoint", required=True, type=Path)
+    parser.add_argument("--checkpoint", type=Path)
+    parser.add_argument(
+        "--ensemble-checkpoint", action="append", type=Path,
+        help="shared E1-B ViT-L/14 checkpoint to include in a score-level ensemble; repeat for each member",
+    )
+    parser.add_argument(
+        "--ensemble-method", action="append",
+        choices=("mean", "query_zscore_mean"),
+        help="ensemble method; repeat to build multiple ZIPs (default: both methods)",
+    )
+    parser.add_argument(
+        "--ensemble-output-stem",
+        help="filename stem used for <stem>_ensemble_<method>.zip under submissions/",
+    )
     parser.add_argument(
         "--output",
         type=Path,
@@ -781,6 +975,20 @@ def main() -> None:
         help="AttriVision submission evaluation geometry",
     )
     args = parser.parse_args()
+    if args.ensemble_checkpoint:
+        if args.checkpoint is not None or args.output is not None:
+            parser.error("Use --ensemble-checkpoint with --ensemble-output-stem, not --checkpoint/--output")
+        if not args.ensemble_output_stem:
+            parser.error("--ensemble-output-stem is required with --ensemble-checkpoint")
+        build_ensemble_archives(
+            args.ensemble_checkpoint,
+            args.ensemble_output_stem,
+            REPOSITORY_ROOT / "submissions",
+            args.ensemble_method or ["mean", "query_zscore_mean"],
+        )
+        return
+    if args.checkpoint is None:
+        parser.error("Either --checkpoint or repeated --ensemble-checkpoint values are required")
     output = args.output or default_output_path()
     if output.suffix.lower() != ".zip":
         raise ValueError("--output must end in .zip")

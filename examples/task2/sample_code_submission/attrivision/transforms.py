@@ -42,6 +42,38 @@ class CameraAugmentation:
         return image
 
 
+class CameraQualityAugmentation:
+    """Apply at most one mild camera-quality corruption, without color shifts."""
+
+    def __call__(self, image: Image.Image) -> Image.Image:
+        # Keep clean examples in every epoch and avoid stacking several quality
+        # losses on the same small accessory or clothing detail.
+        if random.random() >= 0.7:
+            return image
+
+        operation = random.choice(("resolution", "jpeg", "blur", "sensor_noise"))
+        if operation == "resolution":
+            factor = random.uniform(0.65, 0.90)
+            reduced = image.resize(
+                (max(1, round(image.width * factor)), max(1, round(image.height * factor))),
+                Image.Resampling.BICUBIC,
+            )
+            return reduced.resize(image.size, Image.Resampling.BICUBIC)
+        if operation == "jpeg":
+            buffer = io.BytesIO()
+            image.save(buffer, format="JPEG", quality=random.randint(60, 85))
+            buffer.seek(0)
+            with Image.open(buffer) as decoded:
+                return decoded.convert("RGB")
+        if operation == "blur":
+            return image.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.2, 0.7)))
+
+        rgb = np.asarray(image.convert("RGB"), dtype=np.float32)
+        sigma = random.uniform(1.5, 4.0)
+        noise = np.random.normal(0.0, sigma, size=rgb.shape)
+        return Image.fromarray(np.clip(rgb + noise, 0, 255).astype(np.uint8), mode="RGB")
+
+
 class SequentialPhotoAugmentation:
     """Apply several label-preserving illumination transforms in sequence."""
 
@@ -107,6 +139,9 @@ class PolicyTrainTransform:
         self.policy = policy
         self.augmix = AugMixPhoto(alpha=alpha)
         self.camera_augmentation = CameraAugmentation() if hard_augmentation else None
+        self.camera_quality_augmentation = (
+            CameraQualityAugmentation() if policy == "aug1_camera" else None
+        )
         self.normalize = transforms.Compose([
             transforms.ToTensor(), transforms.Normalize(CLIP_MEAN, CLIP_STD),
         ])
@@ -114,13 +149,15 @@ class PolicyTrainTransform:
             raise ValueError("image_size must be positive")
 
     def _normalize(self, image: Image.Image) -> Any:
+        if self.camera_quality_augmentation is not None:
+            image = self.camera_quality_augmentation(image)
         if self.camera_augmentation is not None:
             image = self.camera_augmentation(image)
         return self.normalize(image)
 
     def __call__(self, image: Image.Image) -> Any:
         image = self.geometry(image)
-        if self.policy in {"aug1", "sequential"}:
+        if self.policy in {"aug1", "sequential", "aug1_camera"}:
             return self._normalize(SequentialPhotoAugmentation()(image))
         if self.policy == "augmix":
             return self._normalize(self.augmix(image))
@@ -142,9 +179,14 @@ def build_train_transform(
 ) -> Any:
     # ``aug1`` is the user-facing name for the sequential photo transform.
     # Keep ``sequential`` as an alias for the existing controlled-runner API.
-    policies = {"baseline", "aug1", "sequential", "augmix", "augmix_js"}
+    policies = {"baseline", "aug1", "aug1_camera", "sequential", "augmix", "augmix_js"}
     if augmentation_policy not in policies:
         raise ValueError(f"Unknown augmentation policy: {augmentation_policy}")
+    if augmentation_policy == "aug1_camera" and hard_augmentation:
+        raise ValueError(
+            "aug1_camera already adds camera-quality and box-geometry changes; "
+            "do not combine it with hard_augmentation"
+        )
     if augmentation == "current":
         spatial = [transforms.RandomResizedCrop(
             image_size, scale=(0.08, 1.0), interpolation=InterpolationMode.BICUBIC,
@@ -170,7 +212,7 @@ def build_train_transform(
         ]
     else:
         raise ValueError(f"Unknown training augmentation: {augmentation}")
-    if hard_augmentation:
+    if hard_augmentation or augmentation_policy == "aug1_camera":
         # A bounded affine change models detector-box scale and offset while
         # keeping the existing full-person crop policy for A7.
         geometry = transforms.RandomApply([

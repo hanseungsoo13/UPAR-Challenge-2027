@@ -116,8 +116,11 @@ def _add_training_overrides(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--hard-augmentation", action="store_true")
     parser.add_argument(
-        "--augmentation-policy", choices=("baseline", "aug1"), default=None,
-        help="training image policy for CLIP L/14 stages; aug1 applies sequential photo transforms",
+        "--augmentation-policy", choices=("baseline", "aug1", "aug1_camera"), default=None,
+        help=(
+            "L/14 training photo policy; aug1 applies sequential exposure transforms, "
+            "aug1_camera adds one mild camera-quality corruption and bounded box geometry"
+        ),
     )
 
 

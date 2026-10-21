@@ -64,8 +64,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hard-augmentation", action="store_true",
                         help="add mild lighting, camera-quality, and box-geometry changes during training")
     parser.add_argument(
-        "--augmentation-policy", choices=("baseline", "aug1"), default="baseline",
-        help="optional photometric training policy; aug1 applies sequential brightness, contrast, and gamma changes",
+        "--augmentation-policy", choices=("baseline", "aug1", "aug1_camera"), default="baseline",
+        help=(
+            "training photo policy; aug1 applies sequential brightness/contrast/gamma, "
+            "aug1_camera adds one mild camera-quality corruption and bounded box geometry"
+        ),
     )
     parser.add_argument(
         "--augmentation",
